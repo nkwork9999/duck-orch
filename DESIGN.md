@@ -3,6 +3,23 @@
 DuckDB の中で「DAG オーケストレーション + 自動リネージ + 可視化」を 1 拡張で完結させる。
 SQLMesh 風のファイルフォーマット + Claude エージェント連携前提の CLI を備える。
 
+## 実装ステータス (2026-05-02)
+
+| Phase | 内容 | 状態 |
+|---|---|---|
+| 0 | プロジェクト骨組み(C++薄皮+Rust本体、ducksmiles流) | ✅ 完了 |
+| 1 | タスクパーサ + DAG + 直列実行 | ✅ 完了 |
+| 2 | optimizer フック自動リネージ | ⏸ 延期 (sqlparser-rs で代替可) |
+| 3 | Mermaid 可視化(lineage/dag/combined) | ✅ 完了 |
+| 4 | 失敗時 downstream skip + exp backoff retry | ✅ 完了 |
+| 5 | 並列実行(topo layer + N std::thread) | ✅ 完了 |
+| 6 | duck-orch CLI(register/run/status/graph/test/validate/impact/lineage/schedule)+ --json | ✅ 完了 |
+| 7 | インクリメンタル(Jinja {{ var }} + 動的 watermark)+ @test | ✅ 完了 |
+| 8 | スケジューラ(CLI daemon + cron) | ✅ 完了 |
+| 9 | OpenLineage HTTP 発行(背景 worker、duck_lineage 互換) | ✅ 完了 |
+
+検証済み: 4タスクの DAG パイプラインが PRAGMA / CLI 両方で動作、Mermaid 出力、並列実行、インクリメンタル差分、OL イベント送信、cron 登録すべて確認済み。
+
 ---
 
 ## 目次

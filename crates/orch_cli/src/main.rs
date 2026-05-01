@@ -21,6 +21,10 @@ SUBCOMMANDS:
     validate <file>          Parse and validate one task file (writes JSON to stdout)
     impact <table>           Show downstream tasks/tables affected by changing <table>
     lineage <table>          Show upstream lineage of <table>
+    schedule add <name> <cron>   Register a cron schedule
+    schedule list                List schedules
+    schedule run-due             Run pipelines whose next trigger is due
+    schedule daemon              Long-running loop polling schedules every 30s
     help                     Show this help
 
 GLOBAL FLAGS:
@@ -297,6 +301,111 @@ fn cmd_lineage(args: &Args) -> i32 {
     code
 }
 
+// cron 0.12 wants 6+ fields. If user passes a standard 5-field cron,
+// prepend "0 " for seconds.
+fn normalize_cron(expr: &str) -> String {
+    let n = expr.split_whitespace().count();
+    if n == 5 {
+        format!("0 {}", expr)
+    } else {
+        expr.to_string()
+    }
+}
+
+fn cmd_schedule(args: &Args) -> i32 {
+    let sub = args.rest.first().map(|s| s.as_str()).unwrap_or("list");
+    match sub {
+        "add" => {
+            if args.rest.len() < 3 {
+                eprintln!("schedule add: usage: schedule add <name> <cron>");
+                return 2;
+            }
+            let name = &args.rest[1];
+            let cron = &args.rest[2];
+            // Validate cron expression
+            use std::str::FromStr;
+            if let Err(e) = cron::Schedule::from_str(&normalize_cron(cron)) {
+                eprintln!("invalid cron: {}", e);
+                return 2;
+            }
+            let sql = format!(
+                "INSERT OR REPLACE INTO __orch__.schedules (pipeline_or_task, cron_expr, enabled, next_trigger_at) \
+                 VALUES ({}, {}, true, current_timestamp);",
+                sql_escape(name), sql_escape(cron)
+            );
+            // Need to ensure schedules table exists
+            let setup = "CREATE TABLE IF NOT EXISTS __orch__.schedules (\
+                pipeline_or_task VARCHAR PRIMARY KEY, cron_expr VARCHAR, timezone VARCHAR DEFAULT 'UTC', \
+                enabled BOOLEAN DEFAULT true, last_triggered_at TIMESTAMP, next_trigger_at TIMESTAMP);";
+            let (_, err, code) = run_sql(args, &format!("CREATE SCHEMA IF NOT EXISTS __orch__; {} {}", setup, sql), false)
+                .unwrap_or_default();
+            if !err.is_empty() { eprintln!("{}", err); }
+            code
+        }
+        "list" => {
+            let q = "SELECT pipeline_or_task, cron_expr, enabled, next_trigger_at FROM __orch__.schedules ORDER BY pipeline_or_task;";
+            let (out, _, code) = run_sql(args, q, args.json).unwrap_or_default();
+            print!("{}", out);
+            code
+        }
+        "run-due" => run_schedule_due(args),
+        "daemon" => {
+            eprintln!("[duck-orch] schedule daemon started (poll = 30s)");
+            loop {
+                let _ = run_schedule_due(args);
+                std::thread::sleep(std::time::Duration::from_secs(30));
+            }
+        }
+        other => { eprintln!("unknown schedule subcommand: {}", other); 2 }
+    }
+}
+
+fn run_schedule_due(args: &Args) -> i32 {
+    use std::str::FromStr;
+    use chrono::Utc;
+    let q = "SELECT pipeline_or_task, cron_expr, COALESCE(next_trigger_at, current_timestamp) \
+             FROM __orch__.schedules WHERE enabled = true;";
+    let (_, _, _) = run_sql(args, q, false).unwrap_or_default();
+    // Re-query in JSON to parse
+    let (jout, _, _) = run_sql(args, q, true).unwrap_or_default();
+    let rows: Vec<serde_json::Value> = match serde_json::from_str(&jout) {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    let now = Utc::now();
+    for r in rows {
+        let name = r.get("pipeline_or_task").and_then(|v| v.as_str()).unwrap_or("");
+        let cron_expr = r.get("cron_expr").and_then(|v| v.as_str()).unwrap_or("");
+        let next_str = r.get("next_trigger_at").and_then(|v| v.as_str()).unwrap_or("");
+        // Parse next time. If <= now → run.
+        let next_time = chrono::DateTime::parse_from_rfc3339(next_str)
+            .or_else(|_| chrono::NaiveDateTime::parse_from_str(next_str, "%Y-%m-%dT%H:%M:%S%.f")
+                .map(|t| t.and_utc().fixed_offset()))
+            .unwrap_or_else(|_| now.into());
+        if next_time > now {
+            continue;
+        }
+        eprintln!("[duck-orch] running schedule {} ({})", name, cron_expr);
+        let _ = run_sql(args, "PRAGMA orch_run;", false);
+        // Compute next trigger and update
+        let sched = match cron::Schedule::from_str(&normalize_cron(cron_expr)) {
+            Ok(s) => s,
+            Err(e) => { eprintln!("invalid cron for {}: {}", name, e); continue; }
+        };
+        let next = sched.upcoming(Utc).next();
+        if let Some(nt) = next {
+            let upd = format!(
+                "UPDATE __orch__.schedules SET last_triggered_at = current_timestamp, \
+                 next_trigger_at = '{}' WHERE pipeline_or_task = {};",
+                nt.format("%Y-%m-%d %H:%M:%S"),
+                sql_escape(name)
+            );
+            let _ = run_sql(args, &upd, false);
+        }
+    }
+    0
+}
+
 fn main() {
     let args = match parse_args() {
         Ok(a) => a,
@@ -311,6 +420,7 @@ fn main() {
         "validate" => cmd_validate(&args),
         "impact" => cmd_impact(&args),
         "lineage" => cmd_lineage(&args),
+        "schedule" => cmd_schedule(&args),
         "help" | "" => { print!("{}", HELP); 0 }
         other => { eprintln!("unknown subcommand: {}", other); print!("{}", HELP); 2 }
     };
