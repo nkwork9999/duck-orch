@@ -93,6 +93,7 @@ name = "duckorch_cli"
 version = "0.1.0"
 dependencies = [
  "duckorch_core",
+ "serde_json",
 ]
 
 [[package]]

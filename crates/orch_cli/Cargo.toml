@@ -10,3 +10,4 @@ path = "src/main.rs"
 
 [dependencies]
 duckorch_core = { path = "../orch_core" }
+serde_json = "1"
