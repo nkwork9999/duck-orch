@@ -107,6 +107,51 @@ pub fn build_dag(tasks: &[Task]) -> Result<DagResult, DagBuildError> {
     })
 }
 
+/// Group tasks into "layers" of mutually independent tasks.
+/// Layer N contains tasks whose dependencies are all in layers 0..N.
+pub fn topo_layers(tasks: &[Task]) -> Result<Vec<Vec<String>>, DagBuildError> {
+    let dag = build_dag(tasks)?;
+    let mut indeg: HashMap<String, usize> = HashMap::new();
+    for t in tasks {
+        indeg.insert(t.name.clone(), 0);
+    }
+    for e in &dag.task_edges {
+        *indeg.entry(e.to.clone()).or_insert(0) += 1;
+    }
+    let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+    for e in &dag.task_edges {
+        adj.entry(e.from.clone()).or_default().push(e.to.clone());
+    }
+
+    let mut layers: Vec<Vec<String>> = Vec::new();
+    let mut current: Vec<String> = indeg
+        .iter()
+        .filter(|(_, &d)| d == 0)
+        .map(|(k, _)| k.clone())
+        .collect();
+    current.sort();
+
+    while !current.is_empty() {
+        let mut next: Vec<String> = Vec::new();
+        for n in &current {
+            if let Some(children) = adj.get(n) {
+                for c in children {
+                    if let Some(d) = indeg.get_mut(c) {
+                        *d -= 1;
+                        if *d == 0 {
+                            next.push(c.clone());
+                        }
+                    }
+                }
+            }
+        }
+        layers.push(current);
+        next.sort();
+        current = next;
+    }
+    Ok(layers)
+}
+
 /// Return tasks whose direct or transitive upstream contains `failed`.
 pub fn downstream_of(tasks: &[Task], failed: &str) -> Vec<String> {
     let dag = match build_dag(tasks) {

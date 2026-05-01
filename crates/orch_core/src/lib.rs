@@ -143,6 +143,28 @@ pub extern "C" fn orch_extract_io(
     .unwrap_or(-1)
 }
 
+/// Build topological layers (mutually independent tasks). Returns JSON: [[t1,t2],[t3],...].
+#[unsafe(no_mangle)]
+pub extern "C" fn orch_topo_layers(
+    tasks_json_ptr: *const u8,
+    tasks_json_len: usize,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        let json = unsafe { read_str(tasks_json_ptr, tasks_json_len) };
+        let tasks: Vec<task_parser::Task> = match serde_json::from_str(json) {
+            Ok(t) => t,
+            Err(e) => return err_to_buf(&format!("invalid tasks json: {}", e), out_ptr, out_len),
+        };
+        match dag::topo_layers(&tasks) {
+            Ok(l) => write_out(serde_json::to_string(&l).unwrap_or_default(), out_ptr, out_len),
+            Err(e) => err_to_buf(&e.message, out_ptr, out_len),
+        }
+    }))
+    .unwrap_or(-1)
+}
+
 /// Build a DAG from a JSON array of Tasks. Returns ordered task names + edges.
 #[unsafe(no_mangle)]
 pub extern "C" fn orch_build_dag(

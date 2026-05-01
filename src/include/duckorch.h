@@ -53,4 +53,8 @@ int32_t orch_ol_set_api_key(const uint8_t *ptr, size_t len);
 int32_t orch_ol_set_debug(int32_t d);
 int32_t orch_ol_emit(const uint8_t *ptr, size_t len);
 
+// Topological layers for parallel execution (Phase 5)
+int32_t orch_topo_layers(const uint8_t *tasks_json_ptr, size_t tasks_json_len,
+                          uint8_t **out_ptr, size_t *out_len);
+
 }

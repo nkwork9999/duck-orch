@@ -18,16 +18,20 @@
 #include "duckdb/common/printer.hpp"
 #include "yyjson.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <iomanip>
 #include <map>
+#include <mutex>
 #include <set>
 #include <sstream>
+#include <thread>
 
 namespace duckdb {
 
 // Pipeline namespace, used for OpenLineage events. Set via SET orch_namespace.
 static string g_orch_namespace = "duckdb";
+static std::atomic<int> g_max_parallel{1};
 
 // Forward declarations
 static string OlEventJson(const string &event_type, const string &event_time,
@@ -548,11 +552,111 @@ static string RunTaskTests(Connection &con, const string &task_name) {
 	return "";
 }
 
+// Run a single task in `con`. Updates state tables and emits OL events.
+// Returns true on success, false on failure.
+static bool RunSingleTask(Connection &con, const TaskRow &task, const string &pipeline_run_id,
+                          const string &tasks_json) {
+	auto run_uuid = con.Query("SELECT uuid()::VARCHAR")->GetValue(0, 0).ToString();
+	string started = IsoNow();
+
+	std::vector<string> task_inputs, task_outputs;
+	{
+		auto tr = con.Query("SELECT inputs, outputs FROM __orch__.tasks WHERE name = " +
+		                    SqlEscape(task.name));
+		if (!tr->HasError() && tr->RowCount() > 0) {
+			auto iv = tr->GetValue(0, 0);
+			auto ov = tr->GetValue(1, 0);
+			if (!iv.IsNull()) {
+				for (auto &c : ListValue::GetChildren(iv)) task_inputs.push_back(c.ToString());
+			}
+			if (!ov.IsNull()) {
+				for (auto &c : ListValue::GetChildren(ov)) task_outputs.push_back(c.ToString());
+			}
+		}
+	}
+	EmitOlEvent(OlEventJson("START", started, run_uuid, pipeline_run_id, g_orch_namespace,
+	                         task.name, task_inputs, task_outputs, ""));
+
+	string sql_to_run = task.sql;
+	string last_at = LookupLastProcessedAt(con, task.name);
+	string now_ts;
+	{
+		auto nr = con.Query("SELECT current_timestamp::VARCHAR");
+		now_ts = nr->GetValue(0, 0).ToString();
+	}
+	std::ostringstream vars;
+	vars << "{\"last_processed_at\":" << JsonEscape(last_at) << ",\"now\":" << JsonEscape(now_ts)
+	     << ",\"run_id\":" << JsonEscape(run_uuid) << "}";
+	string vars_json = vars.str();
+	bool sub_ok = false;
+	auto substituted = CallRustString(
+	    [&](uint8_t **op, size_t *ol) {
+		    return orch_substitute_vars(
+		        reinterpret_cast<const uint8_t *>(task.sql.c_str()), task.sql.size(),
+		        reinterpret_cast<const uint8_t *>(vars_json.c_str()), vars_json.size(), op, ol);
+	        },
+	    sub_ok);
+	if (sub_ok) sql_to_run = substituted;
+
+	int retries_left = task.retries;
+	int retry_count = 0;
+	bool success = false;
+	string error_msg;
+	while (true) {
+		auto exec_result = con.Query(sql_to_run);
+		if (!exec_result->HasError()) {
+			success = true;
+			break;
+		}
+		error_msg = exec_result->GetError();
+		if (retries_left <= 0) break;
+		retries_left--;
+		retry_count++;
+	}
+
+	string finished = IsoNow();
+	if (success) {
+		string new_watermark;
+		if (!task.incremental_by.empty()) {
+			auto out_r = con.Query("SELECT outputs[1] FROM __orch__.tasks WHERE name = " +
+			                        SqlEscape(task.name));
+			if (!out_r->HasError() && out_r->RowCount() > 0 && !out_r->GetValue(0, 0).IsNull()) {
+				string out_table = out_r->GetValue(0, 0).ToString();
+				auto wm = con.Query("SELECT max(" + task.incremental_by + ")::VARCHAR FROM " +
+				                     out_table);
+				if (!wm->HasError() && wm->RowCount() > 0 && !wm->GetValue(0, 0).IsNull()) {
+					new_watermark = wm->GetValue(0, 0).ToString();
+				}
+			}
+		}
+		std::ostringstream ins;
+		ins << "INSERT INTO __orch__.runs (run_id, pipeline_run_id, task_name, started_at, "
+		    << "finished_at, status, rows_count, retry_count, last_processed_at) VALUES ("
+		    << SqlEscape(run_uuid) << ", " << SqlEscape(pipeline_run_id) << ", "
+		    << SqlEscape(task.name) << ", '" << started << "', '" << finished
+		    << "', 'success', 0, " << retry_count << ", "
+		    << (new_watermark.empty() ? string("NULL") : ("'" + new_watermark + "'")) << ");";
+		con.Query(ins.str());
+		EmitOlEvent(OlEventJson("COMPLETE", finished, run_uuid, pipeline_run_id, g_orch_namespace,
+		                         task.name, task_inputs, task_outputs, ""));
+	} else {
+		std::ostringstream ins;
+		ins << "INSERT INTO __orch__.runs (run_id, pipeline_run_id, task_name, started_at, "
+		    << "finished_at, status, error_message, retry_count) VALUES ("
+		    << SqlEscape(run_uuid) << ", " << SqlEscape(pipeline_run_id) << ", "
+		    << SqlEscape(task.name) << ", '" << started << "', '" << finished << "', 'failed', "
+		    << SqlEscape(error_msg) << ", " << retry_count << ");";
+		con.Query(ins.str());
+		EmitOlEvent(OlEventJson("FAIL", finished, run_uuid, pipeline_run_id, g_orch_namespace,
+		                         task.name, task_inputs, task_outputs, error_msg));
+	}
+	return success;
+}
+
 static void OrchRunPragma(ClientContext &context, const FunctionParameters &parameters) {
 	Connection con(*context.db);
 	EnsureOrchSchema(con);
 
-	// Build DAG order via Rust
 	auto tasks_json = TasksToJson(con);
 	bool ok = false;
 	auto dag_json = CallRustString(
@@ -565,39 +669,162 @@ static void OrchRunPragma(ClientContext &context, const FunctionParameters &para
 		throw InvalidInputException("DAG build failed: " + dag_json);
 	}
 
-	// Parse order from DAG result
-	auto doc = yyjson_ns::yyjson_read(dag_json.c_str(), dag_json.size(), 0);
-	auto root = yyjson_ns::yyjson_doc_get_root(doc);
-	auto order = yyjson_ns::yyjson_obj_get(root, "order");
-	std::vector<string> ordered_names;
-	if (order && yyjson_ns::yyjson_is_arr(order)) {
-		size_t idx, max;
-		yyjson_ns::yyjson_val *v;
-		yyjson_arr_foreach(order, idx, max, v) {
-			const char *s = yyjson_ns::yyjson_get_str(v);
-			if (s) ordered_names.emplace_back(s);
+	// Build layers for parallel execution
+	auto layers_json = CallRustString(
+	    [&](uint8_t **op, size_t *ol) {
+		    return orch_topo_layers(reinterpret_cast<const uint8_t *>(tasks_json.c_str()),
+		                             tasks_json.size(), op, ol);
+	        },
+	    ok);
+	std::vector<std::vector<string>> layers;
+	if (ok) {
+		auto ld = yyjson_ns::yyjson_read(layers_json.c_str(), layers_json.size(), 0);
+		auto lr = yyjson_ns::yyjson_doc_get_root(ld);
+		if (lr && yyjson_ns::yyjson_is_arr(lr)) {
+			size_t i, m;
+			yyjson_ns::yyjson_val *layer;
+			yyjson_arr_foreach(lr, i, m, layer) {
+				std::vector<string> names;
+				if (yyjson_ns::yyjson_is_arr(layer)) {
+					size_t j, mm;
+					yyjson_ns::yyjson_val *v;
+					yyjson_arr_foreach(layer, j, mm, v) {
+						const char *s = yyjson_ns::yyjson_get_str(v);
+						if (s) names.emplace_back(s);
+					}
+				}
+				layers.push_back(std::move(names));
+			}
 		}
+		yyjson_ns::yyjson_doc_free(ld);
 	}
-	yyjson_ns::yyjson_doc_free(doc);
 
 	auto rows = LoadTaskRows(con);
 	std::map<string, TaskRow> by_name;
 	for (auto &r : rows) by_name[r.name] = r;
 
-	// Generate a single pipeline_run_id
 	auto uuid_result = con.Query("SELECT uuid()::VARCHAR");
 	string pipeline_run_id = uuid_result->GetValue(0, 0).ToString();
 
+	std::mutex sk_mu;
 	std::set<string> failed_tasks;
 	std::set<string> skipped_tasks;
-	std::vector<std::pair<string, string>> statuses; // (name, status)
+	std::vector<std::pair<string, string>> statuses;
 
+	int max_par = g_max_parallel.load();
+
+	for (auto &layer : layers) {
+		// Filter out skipped tasks in this layer
+		std::vector<string> to_run;
+		std::vector<string> to_skip;
+		for (auto &name : layer) {
+			std::lock_guard<std::mutex> lk(sk_mu);
+			if (skipped_tasks.count(name)) {
+				to_skip.push_back(name);
+			} else {
+				to_run.push_back(name);
+			}
+		}
+
+		// Mark skipped tasks
+		for (auto &name : to_skip) {
+			auto run_uuid = con.Query("SELECT uuid()::VARCHAR")->GetValue(0, 0).ToString();
+			std::ostringstream ins;
+			ins << "INSERT INTO __orch__.runs (run_id, pipeline_run_id, task_name, started_at, "
+			    << "finished_at, status, rows_count, retry_count) VALUES ("
+			    << SqlEscape(run_uuid) << ", " << SqlEscape(pipeline_run_id) << ", "
+			    << SqlEscape(name) << ", '" << IsoNow() << "', '" << IsoNow()
+			    << "', 'skipped', 0, 0);";
+			con.Query(ins.str());
+			statuses.push_back({name, "skipped"});
+		}
+
+		// Run layer: parallel if max_par > 1 and layer has > 1 task
+		if (to_run.size() > 1 && max_par > 1) {
+			std::vector<std::thread> threads;
+			std::mutex stat_mu;
+			size_t batch = (size_t)max_par;
+			for (size_t start = 0; start < to_run.size(); start += batch) {
+				size_t end = std::min(start + batch, to_run.size());
+				for (size_t i = start; i < end; i++) {
+					string name = to_run[i];
+					threads.emplace_back([&, name]() {
+						try {
+							Connection thread_con(*context.db);
+							auto it = by_name.find(name);
+							if (it == by_name.end()) return;
+							bool s = RunSingleTask(thread_con, it->second, pipeline_run_id,
+							                        tasks_json);
+							{
+								std::lock_guard<std::mutex> lk(stat_mu);
+								statuses.push_back({name, s ? "success" : "failed"});
+								if (!s) {
+									std::lock_guard<std::mutex> lk2(sk_mu);
+									failed_tasks.insert(name);
+								}
+							}
+						} catch (...) {
+							std::lock_guard<std::mutex> lk(sk_mu);
+							failed_tasks.insert(name);
+						}
+					});
+				}
+				for (auto &t : threads) {
+					if (t.joinable()) t.join();
+				}
+				threads.clear();
+			}
+		} else {
+			for (auto &name : to_run) {
+				auto it = by_name.find(name);
+				if (it == by_name.end()) continue;
+				bool s = RunSingleTask(con, it->second, pipeline_run_id, tasks_json);
+				statuses.push_back({name, s ? "success" : "failed"});
+				if (!s) {
+					std::lock_guard<std::mutex> lk(sk_mu);
+					failed_tasks.insert(name);
+				}
+			}
+		}
+
+		// Compute downstream skips for any failed tasks
+		std::set<string> failed_now;
+		{
+			std::lock_guard<std::mutex> lk(sk_mu);
+			failed_now = failed_tasks;
+		}
+		for (auto &name : failed_now) {
+			bool ok2 = false;
+			auto down_json = CallRustString(
+			    [&](uint8_t **op, size_t *ol) {
+				    return orch_downstream_of(
+				        reinterpret_cast<const uint8_t *>(tasks_json.c_str()), tasks_json.size(),
+				        reinterpret_cast<const uint8_t *>(name.c_str()), name.size(), op, ol);
+			        },
+			    ok2);
+			if (ok2) {
+				auto d = yyjson_ns::yyjson_read(down_json.c_str(), down_json.size(), 0);
+				auto dr = yyjson_ns::yyjson_doc_get_root(d);
+				if (dr && yyjson_ns::yyjson_is_arr(dr)) {
+					size_t idx, m;
+					yyjson_ns::yyjson_val *v;
+					std::lock_guard<std::mutex> lk(sk_mu);
+					yyjson_arr_foreach(dr, idx, m, v) {
+						const char *s = yyjson_ns::yyjson_get_str(v);
+						if (s) skipped_tasks.insert(s);
+					}
+				}
+				yyjson_ns::yyjson_doc_free(d);
+			}
+		}
+	}
+
+	std::vector<string> ordered_names; // unused; old loop removed
 	for (auto &name : ordered_names) {
 		auto it = by_name.find(name);
 		if (it == by_name.end()) continue;
 		auto &task = it->second;
 
-		// Skip if any upstream failed (re-check via downstream_of)
 		if (skipped_tasks.count(name) > 0) {
 			auto run_uuid = con.Query("SELECT uuid()::VARCHAR")->GetValue(0, 0).ToString();
 			std::ostringstream ins;
@@ -965,6 +1192,12 @@ static void SetOrchNamespace(ClientContext &context, SetScope scope, Value &para
 	g_orch_namespace = param.GetValue<string>();
 }
 
+static void SetOrchMaxParallel(ClientContext &context, SetScope scope, Value &param) {
+	int n = (int)param.GetValue<int64_t>();
+	if (n < 1) n = 1;
+	g_max_parallel.store(n);
+}
+
 // ========================================================================
 // OpenLineage event helpers
 // ========================================================================
@@ -1028,6 +1261,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          LogicalType::BOOLEAN, Value(false), SetOlDebug);
 	config.AddExtensionOption("orch_namespace", "Job namespace for OpenLineage events",
 	                          LogicalType::VARCHAR, Value("duckdb"), SetOrchNamespace);
+	config.AddExtensionOption("orch_max_parallel",
+	                          "Maximum parallel tasks per DAG layer",
+	                          LogicalType::BIGINT, Value::BIGINT(1), SetOrchMaxParallel);
 
 	loader.RegisterFunction(
 	    ScalarFunction("orch_hello", {LogicalType::VARCHAR}, LogicalType::VARCHAR, OrchHelloFunc));
