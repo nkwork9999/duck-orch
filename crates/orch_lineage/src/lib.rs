@@ -1,6 +1,8 @@
 // Extract input/output tables from a SQL string using sqlparser-rs.
 // Best-effort: covers INSERT/UPDATE/CREATE TABLE AS / SELECT.
 
+pub mod column;
+
 use sqlparser::ast::{Insert, ObjectName, Query, SetExpr, Statement, TableFactor, TableWithJoins};
 use sqlparser::dialect::DuckDbDialect;
 use sqlparser::parser::Parser;

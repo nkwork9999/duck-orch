@@ -137,6 +137,31 @@ pub extern "C" fn orch_load_directory(
 // Lineage extraction (orch_lineage)
 // ---------------------------------------------------------------------------
 
+/// Extract column-level lineage. `schema_json` is an optional JSON object
+/// mapping table_name -> [column_names], used to resolve `SELECT *`.
+#[unsafe(no_mangle)]
+pub extern "C" fn orch_extract_column_lineage(
+    sql_ptr: *const u8,
+    sql_len: usize,
+    schema_json_ptr: *const u8,
+    schema_json_len: usize,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        let sql = unsafe { read_str(sql_ptr, sql_len) };
+        let schema_json = unsafe { read_str(schema_json_ptr, schema_json_len) };
+        let schema: orch_lineage::column::SchemaMap = if schema_json.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            serde_json::from_str(schema_json).unwrap_or_default()
+        };
+        let result = orch_lineage::column::extract_column_lineage(sql, &schema);
+        write_out(serde_json::to_string(&result).unwrap_or_default(), out_ptr, out_len)
+    }))
+    .unwrap_or(-1)
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn orch_extract_io(
     sql_ptr: *const u8,

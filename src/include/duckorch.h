@@ -27,6 +27,13 @@ int32_t orch_load_directory(const uint8_t *path_ptr, size_t path_len,
 int32_t orch_extract_io(const uint8_t *sql_ptr, size_t sql_len,
                          uint8_t **out_ptr, size_t *out_len);
 
+// Extract column-level lineage. schema_json is optional (empty string ok),
+// used to resolve `SELECT *`. Returns JSON array of ExtractResult.
+int32_t orch_extract_column_lineage(
+    const uint8_t *sql_ptr, size_t sql_len,
+    const uint8_t *schema_json_ptr, size_t schema_json_len,
+    uint8_t **out_ptr, size_t *out_len);
+
 // Build DAG. Input: JSON array of Tasks. Returns DagResult JSON.
 int32_t orch_build_dag(const uint8_t *tasks_json_ptr, size_t tasks_json_len,
                         uint8_t **out_ptr, size_t *out_len);

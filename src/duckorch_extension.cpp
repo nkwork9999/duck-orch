@@ -50,6 +50,9 @@ static string OlEventJson(const string &event_type, const string &event_time,
 static void EmitOlEvent(const string &json);
 static string JsonEscape(const string &s);
 static string ResolveDatasetNamespace(ClientContext &context, const string &table_name);
+static void RecordColumnLineage(Connection &con, const string &task_sql,
+                                 const string &task_name,
+                                 const std::vector<OlDataset> &task_inputs);
 
 // ========================================================================
 // FFI helpers
@@ -259,6 +262,19 @@ CREATE TABLE IF NOT EXISTS __orch__.tests (
     query VARCHAR,
     assertion VARCHAR,
     PRIMARY KEY (task_name, test_idx)
+);
+
+DROP TABLE IF EXISTS __orch__.column_lineage;
+CREATE TABLE __orch__.column_lineage (
+    src_dataset VARCHAR,
+    src_column VARCHAR,
+    dst_dataset VARCHAR,
+    dst_column VARCHAR,
+    via_task VARCHAR,
+    transform_kind VARCHAR,
+    subtype VARCHAR,
+    description VARCHAR,
+    discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 )";
 
@@ -655,6 +671,13 @@ static bool RunSingleTask(Connection &con, const TaskRow &task, const string &pi
 		con.Query(ins.str());
 		EmitOlEvent(OlEventJson("COMPLETE", finished, run_uuid, pipeline_run_id, g_orch_namespace,
 		                         task.name, task_inputs, task_outputs, ""));
+		// Phase column-lineage: extract column-level dependencies from the task SQL
+		// (uses DuckDB's catalog DESCRIBE for SELECT * resolution).
+		try {
+			RecordColumnLineage(con, sql_to_run, task.name, task_inputs);
+		} catch (...) {
+			// best-effort; never let lineage extraction fail the task
+		}
 	} else {
 		std::ostringstream ins;
 		ins << "INSERT INTO __orch__.runs (run_id, pipeline_run_id, task_name, started_at, "
@@ -1104,6 +1127,114 @@ static string OlEventJson(const string &event_type, const string &event_time,
 	o << "]}";
 	(void)error_message;
 	return o.str();
+}
+
+// Build a JSON schema map for the given input tables (table_name -> [columns]).
+// Used by orch_extract_column_lineage to resolve SELECT *.
+static string BuildSchemaJson(Connection &con, const std::vector<OlDataset> &tables) {
+	std::ostringstream o;
+	o << "{";
+	bool first = true;
+	for (const auto &t : tables) {
+		auto r = con.Query("DESCRIBE " + t.name);
+		if (r->HasError()) continue;
+		if (!first) o << ",";
+		first = false;
+		o << JsonEscape(t.name) << ":[";
+		bool first_col = true;
+		for (idx_t i = 0; i < r->RowCount(); i++) {
+			if (!first_col) o << ",";
+			first_col = false;
+			o << JsonEscape(r->GetValue(0, i).ToString());
+		}
+		o << "]";
+	}
+	o << "}";
+	return o.str();
+}
+
+// Insert column lineage rows for a successful task.
+static void RecordColumnLineage(Connection &con, const string &task_sql,
+                                 const string &task_name,
+                                 const std::vector<OlDataset> &task_inputs) {
+	string schema_json = BuildSchemaJson(con, task_inputs);
+	bool ok = false;
+	auto cl_json = CallRustString(
+	    [&](uint8_t **op, size_t *ol) {
+		    return orch_extract_column_lineage(
+		        reinterpret_cast<const uint8_t *>(task_sql.c_str()), task_sql.size(),
+		        reinterpret_cast<const uint8_t *>(schema_json.c_str()), schema_json.size(),
+		        op, ol);
+	        },
+	    ok);
+	if (!ok || cl_json.empty()) return;
+
+	auto doc = yyjson_ns::yyjson_read(cl_json.c_str(), cl_json.size(), 0);
+	if (!doc) return;
+	auto root = yyjson_ns::yyjson_doc_get_root(doc);
+	if (!root || !yyjson_ns::yyjson_is_arr(root)) {
+		yyjson_ns::yyjson_doc_free(doc);
+		return;
+	}
+	con.Query("DELETE FROM __orch__.column_lineage WHERE via_task = " + SqlEscape(task_name));
+
+	std::ostringstream batch;
+	bool any = false;
+	size_t i, m;
+	yyjson_ns::yyjson_val *res;
+	yyjson_arr_foreach(root, i, m, res) {
+		auto out_ds_v = yyjson_ns::yyjson_obj_get(res, "output_dataset");
+		auto cols = yyjson_ns::yyjson_obj_get(res, "columns");
+		if (!out_ds_v || !cols || !yyjson_ns::yyjson_is_arr(cols)) continue;
+		string dst_dataset = yyjson_ns::yyjson_get_str(out_ds_v) ? yyjson_ns::yyjson_get_str(out_ds_v) : "";
+		size_t j, n;
+		yyjson_ns::yyjson_val *col;
+		yyjson_arr_foreach(cols, j, n, col) {
+			auto out_field_v = yyjson_ns::yyjson_obj_get(col, "output_field");
+			auto inputs = yyjson_ns::yyjson_obj_get(col, "inputs");
+			if (!out_field_v || !inputs || !yyjson_ns::yyjson_is_arr(inputs)) continue;
+			string dst_column = yyjson_ns::yyjson_get_str(out_field_v) ? yyjson_ns::yyjson_get_str(out_field_v) : "";
+			size_t k, p;
+			yyjson_ns::yyjson_val *in;
+			yyjson_arr_foreach(inputs, k, p, in) {
+				auto in_ds_v = yyjson_ns::yyjson_obj_get(in, "dataset");
+				auto in_field_v = yyjson_ns::yyjson_obj_get(in, "field");
+				auto trans = yyjson_ns::yyjson_obj_get(in, "transformations");
+				if (!in_ds_v || !in_field_v) continue;
+				string src_dataset = yyjson_ns::yyjson_get_str(in_ds_v) ? yyjson_ns::yyjson_get_str(in_ds_v) : "";
+				string src_column = yyjson_ns::yyjson_get_str(in_field_v) ? yyjson_ns::yyjson_get_str(in_field_v) : "";
+				string kind = "DIRECT", subtype = "IDENTITY", desc;
+				if (trans && yyjson_ns::yyjson_is_arr(trans)) {
+					size_t l, q;
+					yyjson_ns::yyjson_val *t;
+					yyjson_arr_foreach(trans, l, q, t) {
+						auto k_v = yyjson_ns::yyjson_obj_get(t, "type");
+						auto s_v = yyjson_ns::yyjson_obj_get(t, "subtype");
+						auto d_v = yyjson_ns::yyjson_obj_get(t, "description");
+						if (k_v && yyjson_ns::yyjson_get_str(k_v)) kind = yyjson_ns::yyjson_get_str(k_v);
+						if (s_v && yyjson_ns::yyjson_get_str(s_v)) subtype = yyjson_ns::yyjson_get_str(s_v);
+						if (d_v && yyjson_ns::yyjson_get_str(d_v)) desc = yyjson_ns::yyjson_get_str(d_v);
+						break; // first transformation only for the row
+					}
+				}
+				if (any) batch << ",";
+				else batch << "INSERT INTO __orch__.column_lineage (src_dataset, src_column, dst_dataset, dst_column, via_task, transform_kind, subtype, description) VALUES ";
+				batch << "(" << SqlEscape(src_dataset) << ", " << SqlEscape(src_column) << ", "
+				      << SqlEscape(dst_dataset) << ", " << SqlEscape(dst_column) << ", "
+				      << SqlEscape(task_name) << ", " << SqlEscape(kind) << ", " << SqlEscape(subtype)
+				      << ", " << SqlEscape(desc) << ")";
+				any = true;
+			}
+		}
+	}
+	yyjson_ns::yyjson_doc_free(doc);
+	if (any) {
+		batch << ";";
+		auto r = con.Query(batch.str());
+		if (r->HasError()) {
+			Printer::Print("[duckorch] column_lineage insert failed: " + r->GetError());
+		}
+	}
 }
 
 // Phase 9 + DuckLake: resolve OpenLineage `namespace` for a dataset.
