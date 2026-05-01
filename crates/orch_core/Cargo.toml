@@ -1,0 +1,8 @@
+[package]
+name = "duckorch_core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["staticlib", "rlib"]

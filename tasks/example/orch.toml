@@ -1,0 +1,15 @@
+[pipeline]
+name = "daily"
+state_db = "default"
+
+[execution]
+max_parallel = 4
+default_retries = 0
+default_timeout = 600
+
+[lineage]
+emit_openlineage = false
+# openlineage_url = "http://marquez:5000/api/v1/lineage"
+
+[ai]
+emit_explain_on_fail = true
