@@ -16,6 +16,8 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/common/printer.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "yyjson.hpp"
 
 #include <atomic>
@@ -33,15 +35,21 @@ namespace duckdb {
 static string g_orch_namespace = "duckdb";
 static std::atomic<int> g_max_parallel{1};
 
+struct OlDataset {
+	string ns;
+	string name;
+};
+
 // Forward declarations
 static string OlEventJson(const string &event_type, const string &event_time,
                           const string &run_id, const string &pipeline_run_id,
                           const string &job_namespace, const string &job_name,
-                          const std::vector<string> &inputs,
-                          const std::vector<string> &outputs,
+                          const std::vector<OlDataset> &inputs,
+                          const std::vector<OlDataset> &outputs,
                           const string &error_message);
 static void EmitOlEvent(const string &json);
 static string JsonEscape(const string &s);
+static string ResolveDatasetNamespace(ClientContext &context, const string &table_name);
 
 // ========================================================================
 // FFI helpers
@@ -559,7 +567,9 @@ static bool RunSingleTask(Connection &con, const TaskRow &task, const string &pi
 	auto run_uuid = con.Query("SELECT uuid()::VARCHAR")->GetValue(0, 0).ToString();
 	string started = IsoNow();
 
-	std::vector<string> task_inputs, task_outputs;
+	// Phase 9 + DuckLake: lookup task inputs/outputs and resolve per-dataset namespace
+	// (uses Catalog::GetAttached().tags["data_path"] when available).
+	std::vector<OlDataset> task_inputs, task_outputs;
 	{
 		auto tr = con.Query("SELECT inputs, outputs FROM __orch__.tasks WHERE name = " +
 		                    SqlEscape(task.name));
@@ -567,10 +577,16 @@ static bool RunSingleTask(Connection &con, const TaskRow &task, const string &pi
 			auto iv = tr->GetValue(0, 0);
 			auto ov = tr->GetValue(1, 0);
 			if (!iv.IsNull()) {
-				for (auto &c : ListValue::GetChildren(iv)) task_inputs.push_back(c.ToString());
+				for (auto &c : ListValue::GetChildren(iv)) {
+					string nm = c.ToString();
+					task_inputs.push_back({ResolveDatasetNamespace(*con.context, nm), nm});
+				}
 			}
 			if (!ov.IsNull()) {
-				for (auto &c : ListValue::GetChildren(ov)) task_outputs.push_back(c.ToString());
+				for (auto &c : ListValue::GetChildren(ov)) {
+					string nm = c.ToString();
+					task_outputs.push_back({ResolveDatasetNamespace(*con.context, nm), nm});
+				}
 			}
 		}
 	}
@@ -819,158 +835,6 @@ static void OrchRunPragma(ClientContext &context, const FunctionParameters &para
 		}
 	}
 
-	std::vector<string> ordered_names; // unused; old loop removed
-	for (auto &name : ordered_names) {
-		auto it = by_name.find(name);
-		if (it == by_name.end()) continue;
-		auto &task = it->second;
-
-		if (skipped_tasks.count(name) > 0) {
-			auto run_uuid = con.Query("SELECT uuid()::VARCHAR")->GetValue(0, 0).ToString();
-			std::ostringstream ins;
-			ins << "INSERT INTO __orch__.runs (run_id, pipeline_run_id, task_name, started_at, "
-			    << "finished_at, status, rows_count, retry_count) VALUES ("
-			    << SqlEscape(run_uuid) << ", " << SqlEscape(pipeline_run_id) << ", "
-			    << SqlEscape(name) << ", '" << IsoNow() << "', '" << IsoNow()
-			    << "', 'skipped', 0, 0);";
-			con.Query(ins.str());
-			statuses.push_back({name, "skipped"});
-			continue;
-		}
-
-		auto run_uuid = con.Query("SELECT uuid()::VARCHAR")->GetValue(0, 0).ToString();
-		string started = IsoNow();
-
-		// Phase 9: lookup task inputs/outputs for OpenLineage emission
-		std::vector<string> task_inputs, task_outputs;
-		{
-			auto tr = con.Query("SELECT inputs, outputs FROM __orch__.tasks WHERE name = " +
-			                    SqlEscape(name));
-			if (!tr->HasError() && tr->RowCount() > 0) {
-				auto iv = tr->GetValue(0, 0);
-				auto ov = tr->GetValue(1, 0);
-				if (!iv.IsNull()) {
-					for (auto &c : ListValue::GetChildren(iv)) task_inputs.push_back(c.ToString());
-				}
-				if (!ov.IsNull()) {
-					for (auto &c : ListValue::GetChildren(ov)) task_outputs.push_back(c.ToString());
-				}
-			}
-		}
-		EmitOlEvent(OlEventJson("START", started, run_uuid, pipeline_run_id, g_orch_namespace,
-		                         name, task_inputs, task_outputs, ""));
-
-		// Phase 7: substitute Jinja placeholders for incremental tasks.
-		string sql_to_run = task.sql;
-		string last_at = LookupLastProcessedAt(con, name);
-		string now_ts;
-		{
-			auto nr = con.Query("SELECT current_timestamp::VARCHAR");
-			now_ts = nr->GetValue(0, 0).ToString();
-		}
-		std::ostringstream vars;
-		vars << "{\"last_processed_at\":" << JsonEscape(last_at)
-		     << ",\"now\":" << JsonEscape(now_ts)
-		     << ",\"run_id\":" << JsonEscape(run_uuid) << "}";
-		string vars_json = vars.str();
-		bool sub_ok = false;
-		auto substituted = CallRustString(
-		    [&](uint8_t **op, size_t *ol) {
-			    return orch_substitute_vars(
-			        reinterpret_cast<const uint8_t *>(task.sql.c_str()), task.sql.size(),
-			        reinterpret_cast<const uint8_t *>(vars_json.c_str()), vars_json.size(),
-			        op, ol);
-		        },
-		    sub_ok);
-		if (sub_ok) sql_to_run = substituted;
-
-		// Execute with retries
-		int retries_left = task.retries;
-		int retry_count = 0;
-		bool success = false;
-		string error_msg;
-
-		while (true) {
-			auto exec_result = con.Query(sql_to_run);
-			if (!exec_result->HasError()) {
-				success = true;
-				break;
-			}
-			error_msg = exec_result->GetError();
-			if (retries_left <= 0) break;
-			retries_left--;
-			retry_count++;
-		}
-
-		string finished = IsoNow();
-		if (success) {
-			// Phase 7: for incremental tasks, look up max(incremental_by) from first output table.
-			string new_watermark;
-			if (!task.incremental_by.empty()) {
-				// Find first output table
-				auto out_r = con.Query(
-				    "SELECT outputs[1] FROM __orch__.tasks WHERE name = " + SqlEscape(name));
-				if (!out_r->HasError() && out_r->RowCount() > 0 && !out_r->GetValue(0, 0).IsNull()) {
-					string out_table = out_r->GetValue(0, 0).ToString();
-					string q = "SELECT max(" + task.incremental_by + ")::VARCHAR FROM " + out_table;
-					auto wm = con.Query(q);
-					if (!wm->HasError() && wm->RowCount() > 0 && !wm->GetValue(0, 0).IsNull()) {
-						new_watermark = wm->GetValue(0, 0).ToString();
-					}
-				}
-			}
-			std::ostringstream ins;
-			ins << "INSERT INTO __orch__.runs (run_id, pipeline_run_id, task_name, started_at, "
-			    << "finished_at, status, rows_count, retry_count, last_processed_at) VALUES ("
-			    << SqlEscape(run_uuid) << ", " << SqlEscape(pipeline_run_id) << ", "
-			    << SqlEscape(name) << ", '" << started << "', '" << finished
-			    << "', 'success', 0, " << retry_count << ", "
-			    << (new_watermark.empty() ? string("NULL") : ("'" + new_watermark + "'"))
-			    << ");";
-			con.Query(ins.str());
-			statuses.push_back({name, "success"});
-			EmitOlEvent(OlEventJson("COMPLETE", finished, run_uuid, pipeline_run_id,
-			                         g_orch_namespace, name, task_inputs, task_outputs, ""));
-		} else {
-			std::ostringstream ins;
-			ins << "INSERT INTO __orch__.runs (run_id, pipeline_run_id, task_name, started_at, "
-			    << "finished_at, status, error_message, retry_count) VALUES ("
-			    << SqlEscape(run_uuid) << ", " << SqlEscape(pipeline_run_id) << ", "
-			    << SqlEscape(name) << ", '" << started << "', '" << finished
-			    << "', 'failed', " << SqlEscape(error_msg) << ", " << retry_count << ");";
-			con.Query(ins.str());
-			statuses.push_back({name, "failed"});
-			failed_tasks.insert(name);
-			EmitOlEvent(OlEventJson("FAIL", finished, run_uuid, pipeline_run_id, g_orch_namespace,
-			                         name, task_inputs, task_outputs, error_msg));
-
-			// Compute downstream and mark for skipping
-			bool ok2 = false;
-			auto down_json = CallRustString(
-			    [&](uint8_t **op, size_t *ol) {
-				    return orch_downstream_of(
-				        reinterpret_cast<const uint8_t *>(tasks_json.c_str()), tasks_json.size(),
-				        reinterpret_cast<const uint8_t *>(name.c_str()), name.size(), op, ol);
-			        },
-			    ok2);
-			if (ok2) {
-				auto d = yyjson_ns::yyjson_read(down_json.c_str(), down_json.size(), 0);
-				auto dr = yyjson_ns::yyjson_doc_get_root(d);
-				if (dr && yyjson_ns::yyjson_is_arr(dr)) {
-					size_t idx, max;
-					yyjson_ns::yyjson_val *v;
-					yyjson_arr_foreach(dr, idx, max, v) {
-						const char *s = yyjson_ns::yyjson_get_str(v);
-						if (s) skipped_tasks.insert(s);
-					}
-				}
-				yyjson_ns::yyjson_doc_free(d);
-			}
-		}
-
-		// Update lineage_edges from DAG
-		// (handled separately to avoid blowing up size of run_pragma; deferred for MVP)
-	}
 
 	// Update lineage_edges
 	auto doc2 = yyjson_ns::yyjson_read(dag_json.c_str(), dag_json.size(), 0);
@@ -1205,18 +1069,18 @@ static void SetOrchMaxParallel(ClientContext &context, SetScope scope, Value &pa
 static string OlEventJson(const string &event_type, const string &event_time,
                           const string &run_id, const string &pipeline_run_id,
                           const string &job_namespace, const string &job_name,
-                          const std::vector<string> &inputs,
-                          const std::vector<string> &outputs,
+                          const std::vector<OlDataset> &inputs,
+                          const std::vector<OlDataset> &outputs,
                           const string &error_message) {
 	std::ostringstream o;
 	o << "{"
 	  << "\"eventType\":" << JsonEscape(event_type)
 	  << ",\"eventTime\":" << JsonEscape(event_time)
-	  << ",\"producer\":\"https://github.com/ilum-cloud/duckorch\""
+	  << ",\"producer\":\"https://github.com/nkwork9999/duck-orch\""
 	  << ",\"schemaURL\":\"https://openlineage.io/spec/2-0-2/OpenLineage.json\""
 	  << ",\"run\":{\"runId\":" << JsonEscape(run_id) << ",\"facets\":{";
 	if (!pipeline_run_id.empty()) {
-		o << "\"parent\":{\"_producer\":\"https://github.com/ilum-cloud/duckorch\","
+		o << "\"parent\":{\"_producer\":\"https://github.com/nkwork9999/duck-orch\","
 		     "\"_schemaURL\":\"https://openlineage.io/spec/facets/1-0-0/ParentRunFacet.json\","
 		     "\"run\":{\"runId\":" << JsonEscape(pipeline_run_id) << "},"
 		     "\"job\":{\"namespace\":" << JsonEscape(job_namespace)
@@ -1228,18 +1092,45 @@ static string OlEventJson(const string &event_type, const string &event_time,
 	o << ",\"inputs\":[";
 	for (size_t i = 0; i < inputs.size(); i++) {
 		if (i > 0) o << ",";
-		o << "{\"namespace\":" << JsonEscape(job_namespace)
-		  << ",\"name\":" << JsonEscape(inputs[i]) << "}";
+		o << "{\"namespace\":" << JsonEscape(inputs[i].ns)
+		  << ",\"name\":" << JsonEscape(inputs[i].name) << "}";
 	}
 	o << "],\"outputs\":[";
 	for (size_t i = 0; i < outputs.size(); i++) {
 		if (i > 0) o << ",";
-		o << "{\"namespace\":" << JsonEscape(job_namespace)
-		  << ",\"name\":" << JsonEscape(outputs[i]) << "}";
+		o << "{\"namespace\":" << JsonEscape(outputs[i].ns)
+		  << ",\"name\":" << JsonEscape(outputs[i].name) << "}";
 	}
 	o << "]}";
 	(void)error_message;
 	return o.str();
+}
+
+// Phase 9 + DuckLake: resolve OpenLineage `namespace` for a dataset.
+// If the table_name's catalog has a `data_path` tag (DuckLake convention,
+// e.g. "s3://my-bucket/lake"), use that as the namespace so cross-engine
+// observers can correlate events. Otherwise fall back to g_orch_namespace.
+static string ResolveDatasetNamespace(ClientContext &context, const string &table_name) {
+	auto first_dot = table_name.find('.');
+	if (first_dot == string::npos) {
+		return g_orch_namespace;
+	}
+	string maybe_catalog = table_name.substr(0, first_dot);
+	try {
+		auto &catalog = Catalog::GetCatalog(context, maybe_catalog);
+		if (catalog.IsSystemCatalog() || catalog.IsTemporaryCatalog()) {
+			return g_orch_namespace;
+		}
+		auto &attached_db = catalog.GetAttached();
+		if (attached_db.tags.find("data_path") != attached_db.tags.end()) {
+			string path = attached_db.tags["data_path"];
+			if (!path.empty() && path.back() == '/') path.pop_back();
+			if (!path.empty()) return path;
+		}
+	} catch (...) {
+		// catalog lookup failed — fall through to default
+	}
+	return g_orch_namespace;
 }
 
 static void EmitOlEvent(const string &json) {

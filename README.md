@@ -262,12 +262,11 @@ All code in duckOrch is original. Design ideas (only — no code copied)
 were drawn from:
 
 - [ducksmiles](https://github.com/duckdb/community-extensions/tree/main/extensions/ducksmiles) — C++ + Rust hybrid build layout
-- [duck_lineage](https://github.com/ilum-cloud/duck_lineage) — emitting OpenLineage from DuckDB
 - [SQLMesh](https://sqlmesh.readthedocs.io) — comment-header task file format
 - [dbt](https://docs.getdbt.com) — testing, downstream skip, `--full-refresh`
 - [OpenLineage](https://openlineage.io) — event spec (Apache-2.0; compatibility comes from following a public spec, not from any specific implementation)
 
-duckOrch's positioning is "task execution first, lineage as a derivative
-of each task's inputs/outputs". This makes it complementary to
-duck_lineage (which observes arbitrary queries via optimizer hooks).
-You can load both extensions together.
+duckOrch's positioning is "task execution first, lineage (table- and
+column-level) as a derivative of each task's inputs/outputs". Static
+analysis via `sqlparser-rs`, plus `Connection::Prepare()` for wildcard
+expansion and a `ParserExtension` hook for dynamic SQL coverage.
