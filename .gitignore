@@ -1,5 +1,35 @@
+# ----- Build outputs -----
 build/
 target/
+
+# ----- DuckDB runtime artifacts -----
 *.duckdb
 *.duckdb.wal
+*.duckdb.tmp
+.duckdb_history
+.duckdb_extensions/
+
+# ----- IDE / editor caches -----
+.cache/
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+*.swp
+*.swo
+*~
+
+# ----- OS noise -----
 .DS_Store
+Thumbs.db
+
+# ----- Rust extras -----
+**/*.rs.bk
+
+# ----- Node (in case of future docs site) -----
+node_modules/
+
+# ----- Local env / secrets -----
+.env
+.env.local
+*.local
