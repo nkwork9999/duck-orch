@@ -50,9 +50,11 @@ static string OlEventJson(const string &event_type, const string &event_time,
 static void EmitOlEvent(const string &json);
 static string JsonEscape(const string &s);
 static string ResolveDatasetNamespace(ClientContext &context, const string &table_name);
-static void RecordColumnLineage(Connection &con, const string &task_sql,
-                                 const string &task_name,
-                                 const std::vector<OlDataset> &task_inputs);
+static string RecordColumnLineage(Connection &con, const string &task_sql,
+                                   const string &task_name,
+                                   const std::vector<OlDataset> &task_inputs);
+static string BuildColumnLineageFacet(const string &cl_extractor_json,
+                                       const std::vector<OlDataset> &task_inputs);
 
 // ========================================================================
 // FFI helpers
@@ -669,15 +671,36 @@ static bool RunSingleTask(Connection &con, const TaskRow &task, const string &pi
 		    << "', 'success', 0, " << retry_count << ", "
 		    << (new_watermark.empty() ? string("NULL") : ("'" + new_watermark + "'")) << ");";
 		con.Query(ins.str());
-		EmitOlEvent(OlEventJson("COMPLETE", finished, run_uuid, pipeline_run_id, g_orch_namespace,
-		                         task.name, task_inputs, task_outputs, ""));
 		// Phase column-lineage: extract column-level dependencies from the task SQL
 		// (uses DuckDB's catalog DESCRIBE for SELECT * resolution).
+		string cl_json;
 		try {
-			RecordColumnLineage(con, sql_to_run, task.name, task_inputs);
+			cl_json = RecordColumnLineage(con, sql_to_run, task.name, task_inputs);
 		} catch (...) {
 			// best-effort; never let lineage extraction fail the task
 		}
+		// Emit COMPLETE with optional columnLineage facet attached to the first output.
+		string complete_event = OlEventJson("COMPLETE", finished, run_uuid, pipeline_run_id,
+		                                     g_orch_namespace, task.name, task_inputs,
+		                                     task_outputs, "");
+		if (!cl_json.empty() && !task_outputs.empty()) {
+			string facet = BuildColumnLineageFacet(cl_json, task_inputs);
+			if (!facet.empty()) {
+				// Patch the first output to include the columnLineage facet.
+				// OL output JSON shape: {"namespace":...,"name":...} — we add ",facets":{"columnLineage":<facet>}
+				// We do textual splice: replace the closing `}` of the first output dataset.
+				string needle = "{\"namespace\":" + JsonEscape(task_outputs[0].ns) + ",\"name\":" +
+				                 JsonEscape(task_outputs[0].name) + "}";
+				size_t pos = complete_event.find(needle);
+				if (pos != string::npos) {
+					string replacement = "{\"namespace\":" + JsonEscape(task_outputs[0].ns) +
+					                      ",\"name\":" + JsonEscape(task_outputs[0].name) +
+					                      ",\"facets\":{\"columnLineage\":" + facet + "}}";
+					complete_event.replace(pos, needle.length(), replacement);
+				}
+			}
+		}
+		EmitOlEvent(complete_event);
 	} else {
 		std::ostringstream ins;
 		ins << "INSERT INTO __orch__.runs (run_id, pipeline_run_id, task_name, started_at, "
@@ -1153,10 +1176,80 @@ static string BuildSchemaJson(Connection &con, const std::vector<OlDataset> &tab
 	return o.str();
 }
 
-// Insert column lineage rows for a successful task.
-static void RecordColumnLineage(Connection &con, const string &task_sql,
-                                 const string &task_name,
-                                 const std::vector<OlDataset> &task_inputs) {
+// Build the OpenLineage `columnLineage` facet object literal from the
+// raw extractor JSON. Returns the inner facet body (without leading
+// "columnLineage:" key) so callers can splice it into a larger event.
+static string BuildColumnLineageFacet(const string &cl_extractor_json,
+                                       const std::vector<OlDataset> &task_inputs) {
+	// Map dataset name -> resolved namespace (already computed by ResolveDatasetNamespace
+	// at task start, available in task_inputs).
+	std::map<string, string> ns_lookup;
+	for (auto &t : task_inputs) ns_lookup[t.name] = t.ns;
+
+	auto doc = yyjson_ns::yyjson_read(cl_extractor_json.c_str(), cl_extractor_json.size(), 0);
+	if (!doc) return "";
+	auto root = yyjson_ns::yyjson_doc_get_root(doc);
+	std::ostringstream o;
+	o << "{\"_producer\":\"https://github.com/nkwork9999/duck-orch\","
+	     "\"_schemaURL\":\"https://openlineage.io/spec/facets/1-1-0/ColumnLineageDatasetFacet.json\","
+	     "\"fields\":{";
+	bool first_field = true;
+	if (root && yyjson_ns::yyjson_is_arr(root)) {
+		size_t i, m;
+		yyjson_ns::yyjson_val *res;
+		yyjson_arr_foreach(root, i, m, res) {
+			auto cols = yyjson_ns::yyjson_obj_get(res, "columns");
+			if (!cols || !yyjson_ns::yyjson_is_arr(cols)) continue;
+			size_t j, n;
+			yyjson_ns::yyjson_val *col;
+			yyjson_arr_foreach(cols, j, n, col) {
+				auto out_field_v = yyjson_ns::yyjson_obj_get(col, "output_field");
+				auto inputs = yyjson_ns::yyjson_obj_get(col, "inputs");
+				if (!out_field_v || !inputs || !yyjson_ns::yyjson_is_arr(inputs)) continue;
+				if (!first_field) o << ",";
+				first_field = false;
+				const char *of = yyjson_ns::yyjson_get_str(out_field_v);
+				o << JsonEscape(of ? of : "") << ":{\"inputFields\":[";
+				bool first_in = true;
+				size_t k, p;
+				yyjson_ns::yyjson_val *in;
+				yyjson_arr_foreach(inputs, k, p, in) {
+					auto in_ds_v = yyjson_ns::yyjson_obj_get(in, "dataset");
+					auto in_field_v = yyjson_ns::yyjson_obj_get(in, "field");
+					auto trans = yyjson_ns::yyjson_obj_get(in, "transformations");
+					if (!in_ds_v || !in_field_v) continue;
+					if (!first_in) o << ",";
+					first_in = false;
+					const char *ids = yyjson_ns::yyjson_get_str(in_ds_v);
+					const char *fld = yyjson_ns::yyjson_get_str(in_field_v);
+					string ns = "duckdb";
+					auto it = ns_lookup.find(ids ? ids : "");
+					if (it != ns_lookup.end()) ns = it->second;
+					o << "{\"namespace\":" << JsonEscape(ns)
+					  << ",\"name\":" << JsonEscape(ids ? ids : "")
+					  << ",\"field\":" << JsonEscape(fld ? fld : "")
+					  << ",\"transformations\":";
+					if (trans && yyjson_ns::yyjson_is_arr(trans)) {
+						o << yyjson_ns::yyjson_val_write(trans, 0, nullptr);
+					} else {
+						o << "[]";
+					}
+					o << "}";
+				}
+				o << "]}";
+			}
+		}
+	}
+	o << "}}";
+	yyjson_ns::yyjson_doc_free(doc);
+	return o.str();
+}
+
+// Insert column lineage rows for a successful task. Returns the raw extractor
+// JSON so callers (e.g. OpenLineage emitter) can build a facet from it.
+static string RecordColumnLineage(Connection &con, const string &task_sql,
+                                   const string &task_name,
+                                   const std::vector<OlDataset> &task_inputs) {
 	string schema_json = BuildSchemaJson(con, task_inputs);
 	bool ok = false;
 	auto cl_json = CallRustString(
@@ -1167,14 +1260,14 @@ static void RecordColumnLineage(Connection &con, const string &task_sql,
 		        op, ol);
 	        },
 	    ok);
-	if (!ok || cl_json.empty()) return;
+	if (!ok || cl_json.empty()) return string();
 
 	auto doc = yyjson_ns::yyjson_read(cl_json.c_str(), cl_json.size(), 0);
-	if (!doc) return;
+	if (!doc) return string();
 	auto root = yyjson_ns::yyjson_doc_get_root(doc);
 	if (!root || !yyjson_ns::yyjson_is_arr(root)) {
 		yyjson_ns::yyjson_doc_free(doc);
-		return;
+		return string();
 	}
 	con.Query("DELETE FROM __orch__.column_lineage WHERE via_task = " + SqlEscape(task_name));
 
@@ -1235,6 +1328,7 @@ static void RecordColumnLineage(Connection &con, const string &task_sql,
 			Printer::Print("[duckorch] column_lineage insert failed: " + r->GetError());
 		}
 	}
+	return cl_json;
 }
 
 // Phase 9 + DuckLake: resolve OpenLineage `namespace` for a dataset.
