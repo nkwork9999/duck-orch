@@ -1,59 +1,61 @@
 # duckOrch
 
-**DAG オーケストレーション + 副次リネージ** を 1 つの DuckDB 拡張に詰めたもの。
-タスクを書くと依存解決・並列実行・Mermaid 可視化・OpenLineage 発行まで全部出る。
+**DAG orchestration with lineage as a side product**, packaged as a single DuckDB extension.
+Define tasks → automatic dependency resolution, parallel execution, Mermaid visualization,
+and OpenLineage emission, all in one place.
 
 ```sql
 LOAD duckorch;
-PRAGMA orch_register('./tasks/');   -- *.sql を読み込み
-PRAGMA orch_run;                    -- DAG 順に実行
-PRAGMA orch_visualize('lineage');   -- Mermaid を取り出す
+PRAGMA orch_register('./tasks/');   -- load *.sql files
+PRAGMA orch_run;                    -- execute in DAG order
+PRAGMA orch_visualize('lineage');   -- get a Mermaid diagram
 ```
 
 ```bash
 duck-orch register ./tasks/
 duck-orch run --json
-duck-orch graph > pipeline.md       # GitHub PR でそのまま見える
+duck-orch graph > pipeline.md       # renders inline on GitHub PRs
 ```
 
 ---
 
-## できること
+## What it does
 
-| | 内容 |
+| | |
 |---|---|
-| **タスク定義** | 1 SQL ファイル = 1 タスク。先頭に `-- @key value` でメタ情報(SQLMesh 風) |
-| **依存解決** | `inputs`/`outputs` から DAG 自動構築。書かなくても `sqlparser-rs` が SQL から推測 |
-| **実行** | トポロジカル順、レイヤごとに並列(`SET orch_max_parallel = 4`) |
-| **失敗対応** | exponential backoff リトライ → ダメなら downstream を skip |
-| **インクリメンタル** | `@incremental_by ts` + `{{ last_processed_at }}` で差分処理 |
-| **テスト** | `@test "SQL" expect 0` で実行後アサーション |
-| **可視化** | Mermaid (lineage / dag / combined) を `PRAGMA orch_visualize` で取得 |
-| **観測** | OpenLineage 互換イベントを Marquez / DataHub に POST |
-| **スケジュール** | `duck-orch schedule add NAME "0 6 * * *"` + `daemon` で常駐 |
-| **AI連携** | 全 CLI に `--json`、`validate` で構造化エラー、`impact` で影響範囲 |
+| **Task definition** | One SQL file = one task. Metadata lives in `-- @key value` comment headers (SQLMesh-style). |
+| **Dependency resolution** | DAG built from `inputs`/`outputs`. If you don't write them, `sqlparser-rs` infers from the SQL. |
+| **Execution** | Topological order, parallel within a layer (`SET orch_max_parallel = 4`). |
+| **Failure handling** | Exponential backoff retry, then skip downstream tasks. |
+| **Incremental** | `@incremental_by ts` + `{{ last_processed_at }}` for delta processing. |
+| **Tests** | `@test "SQL" expect 0` runs assertions after task completion. |
+| **Visualization** | Mermaid (`lineage` / `dag` / `combined` modes) via `PRAGMA orch_visualize`. |
+| **Observability** | OpenLineage-compatible events POSTed to Marquez / DataHub / etc. |
+| **Scheduling** | `duck-orch schedule add NAME "0 6 * * *"` + `daemon` for a polling loop. |
+| **Agent integration** | `--json` on every CLI subcommand, structured `validate`, `impact` analysis. |
 
-リネージは「タスクの inputs/outputs から自動派生する副産物」という位置づけで、メイン機能は **DAG オーケストレーション** です。
+The lineage table comes for free as a derivative of each task's `inputs`/`outputs`.
+The primary feature is **DAG orchestration**.
 
 ---
 
-## クイックスタート
+## Quick start
 
-### 1. ビルド
+### 1. Build
 
 ```bash
-git clone --recurse-submodules https://github.com/nkwork9999/duckorch.git
-cd duckorch
-make                              # DuckDB 同梱でフルビルド (10〜30分)
-cargo build -p duckorch_cli --release  # CLI バイナリ
+git clone --recurse-submodules https://github.com/nkwork9999/duck-orch.git
+cd duck-orch
+make                                    # full DuckDB-bundled build (~10–30 min)
+cargo build -p duckorch_cli --release  # CLI binary
 ```
 
-成果物:
-- `build/release/duckdb` — duckorch をロード済みの DuckDB CLI
-- `build/release/extension/duckorch/duckorch.duckdb_extension` — 拡張本体
-- `target/release/duck-orch` — 単体 CLI
+Outputs:
+- `build/release/duckdb` — DuckDB CLI with duckorch pre-loaded
+- `build/release/extension/duckorch/duckorch.duckdb_extension` — extension binary
+- `target/release/duck-orch` — standalone CLI
 
-### 2. タスクを書く
+### 2. Define tasks
 
 ```sql
 -- tasks/clean_users.sql
@@ -77,9 +79,9 @@ FROM analytics.clean_users
 GROUP BY country;
 ```
 
-`inputs` は SQL から自動抽出されるので書かなくて OK。
+`inputs` is auto-extracted from the SQL, so you don't have to write it.
 
-### 3. 動かす
+### 3. Run
 
 ```bash
 duck-orch register ./tasks/
@@ -87,7 +89,7 @@ duck-orch run
 duck-orch graph
 ```
 
-または DuckDB の中から:
+Or from inside DuckDB:
 
 ```sql
 LOAD duckorch;
@@ -98,26 +100,26 @@ SELECT task_name, status FROM __orch__.runs ORDER BY started_at;
 
 ---
 
-## タスクファイル仕様
+## Task file format
 
 ```sql
--- @task name=user_stats               必須(または `-- @name user_stats`)
--- @description 国別アクティブユーザー数
+-- @task name=user_stats               required (or `-- @name user_stats`)
+-- @description Active users per country
 -- @owner data-team@example.com
--- @inputs analytics.clean_users       省略可(SQL から自動抽出)
--- @outputs analytics.user_stats        必須(または SQL から自動抽出)
--- @depends_on clean_users              省略可(inputs から推測)
--- @schedule "0 6 * * *"                cron(5フィールド)
+-- @inputs analytics.clean_users        optional (auto-extracted)
+-- @outputs analytics.user_stats         required (or auto-extracted)
+-- @depends_on clean_users               optional (inferred from inputs)
+-- @schedule "0 6 * * *"                 5-field cron
 -- @retries 3
--- @timeout 300                         秒
--- @incremental_by updated_at           インクリメンタル列
+-- @timeout 300                          seconds
+-- @incremental_by updated_at            incremental column
 -- @tags daily, analytics
 -- @test "SELECT COUNT(*) FROM x WHERE y < 0" expect 0
 
-<SQL本体>
+<SQL body>
 ```
 
-### Jinja 風プレースホルダ(インクリメンタル時)
+### Jinja-style placeholders (incremental tasks)
 
 ```sql
 INSERT INTO log
@@ -126,7 +128,7 @@ WHERE event_time > {{ last_processed_at }}
   AND event_time <= {{ now }};
 ```
 
-サポート変数: `{{ last_processed_at }}`, `{{ now }}`, `{{ run_id }}`
+Supported variables: `{{ last_processed_at }}`, `{{ now }}`, `{{ run_id }}`.
 
 ---
 
@@ -135,19 +137,19 @@ WHERE event_time > {{ last_processed_at }}
 ```
 duck-orch [--db <path>] [--ext <path>] <subcommand> [--json]
 
-  register <dir>           タスクファイル一括ロード
-  run                      DAG 実行
-  status                   直近 run 履歴
-  graph [lineage|dag|combined]   Mermaid 出力
-  test                     @test を実行
-  validate <file>          1ファイル検証(構造化 JSON 返却)
-  impact <table>           このテーブルを変更すると何が壊れる?
-  lineage <table>          上流データ系譜
-  schedule add <name> <cron>     cron 登録
-  schedule daemon          常駐ループ(30秒ごとに run-due)
+  register <dir>           Load tasks from a directory of .sql files
+  run                      Execute the DAG
+  status                   Recent run history
+  graph [lineage|dag|combined]   Mermaid output
+  test                     Run @test assertions
+  validate <file>          Validate one file (returns structured JSON)
+  impact <table>           What breaks if I change <table>?
+  lineage <table>          Upstream lineage of <table>
+  schedule add <name> <cron>     Register a cron schedule
+  schedule daemon          Long-running poll loop (run-due every 30s)
 ```
 
-`--json` を付けると Claude / エージェントが parse できる JSON で出力。
+Pass `--json` to any subcommand for Claude / agent-parseable output.
 
 ---
 
@@ -156,24 +158,24 @@ duck-orch [--db <path>] [--ext <path>] <subcommand> [--json]
 ```sql
 LOAD duckorch;
 
--- 設定
+-- Configuration
 SET orch_max_parallel = 4;
 SET orch_openlineage_url = 'http://marquez:5000/api/v1/lineage';
 SET orch_openlineage_debug = true;
 
--- 操作
-PRAGMA orch_init;                       -- __orch__ スキーマ作成
-PRAGMA orch_register('./tasks/');       -- ディレクトリから読み込み
-PRAGMA orch_run;                        -- 実行
-PRAGMA orch_test;                       -- @test 走らせる
+-- Operations
+PRAGMA orch_init;                       -- create __orch__ schema
+PRAGMA orch_register('./tasks/');       -- load directory
+PRAGMA orch_run;                        -- execute
+PRAGMA orch_test;                       -- run @test assertions
 PRAGMA orch_visualize('lineage');       -- Mermaid
 
--- スカラー関数(純粋変換)
+-- Pure scalar functions
 SELECT orch_extract_io('INSERT INTO x SELECT * FROM y');
 -- {"inputs":["y"],"outputs":["x"]}
 SELECT orch_render_mermaid(dag_json, 0, '[]');
 
--- 状態テーブル
+-- State tables
 SELECT * FROM __orch__.tasks;
 SELECT * FROM __orch__.runs WHERE status = 'failed';
 SELECT * FROM __orch__.lineage_edges;
@@ -181,82 +183,91 @@ SELECT * FROM __orch__.lineage_edges;
 
 ---
 
-## アーキテクチャ
+## Architecture
 
-「**C++ 薄皮 + Rust 本体**」のサンドイッチ構成。
+A "**thin C++ shim + Rust core**" sandwich.
 
 ```
-┌─ C++ 拡張 (~700 行) ─────────────────────┐
-│  PRAGMA / Scalar function 登録            │
-│  Connection で SQL 実行 (per-thread)      │
-│  std::thread で並列ディスパッチ          │
+┌─ C++ extension (~700 lines) ─────────────┐
+│  Registers PRAGMA / scalar functions     │
+│  Executes SQL via per-thread Connection  │
+│  std::thread parallel dispatch            │
 └──────────────┬───────────────────────────┘
                ↕ extern "C" FFI
 ┌─ Rust workspace ─────────────────────────┐
-│  orch_common   Task / FFI helpers        │
-│  orch_dag      DAG / topo / Mermaid      │
+│  orch_common   Task type, FFI helpers    │
+│  orch_dag      DAG, topo layers, Mermaid │
 │  orch_lineage  sqlparser-rs              │
-│  orch_runtime  Parser / Templating       │
+│  orch_runtime  Parser, templating        │
 │  orch_ol       OpenLineage HTTP worker   │
 │  orch_core     extern "C" facade         │
-│  orch_cli      duck-orch バイナリ        │
+│  orch_cli      duck-orch binary          │
 └──────────────────────────────────────────┘
 ```
 
-DuckDB の C API には optimizer フックが未公開なので、Rust 単体では「クエリへの自動割り込み」ができない。C++ 薄皮側で必要な DuckDB 機能を呼び、ロジックは全部 Rust に逃がす。
-ducksmiles と同じパターンです。
+Why the C++ layer? DuckDB's stable C extension API does not yet expose
+optimizer / parser hooks, so a pure-Rust extension cannot intercept
+queries. The C++ shim handles DuckDB-internal calls; all logic lives
+in Rust. Same pattern as `ducksmiles`.
 
-詳細は [DESIGN.md](DESIGN.md) 参照。
+See [DESIGN.md](DESIGN.md) for the full design.
 
 ---
 
-## ステータス
+## Status
 
-実装は Phase 1〜9 がすべて完了。Phase 2(optimizer フック経由のクエリ自動傍受)のみ延期(明示登録 + sqlparser-rs 自動抽出で代替可)。
+Phases 1 through 9 are complete. Phase 2 (optimizer-hook based query
+auto-interception) is deferred — explicit task registration plus
+`sqlparser-rs` auto-extraction covers the common case.
 
-| Phase | 内容 | 状態 |
+| Phase | Topic | Status |
 |---|---|---|
-| 0 | プロジェクト骨組み | ✅ |
-| 1 | パーサ + DAG + 実行 | ✅ |
-| 2 | optimizer フック | ⏸ |
-| 3 | Mermaid | ✅ |
-| 4 | リトライ + skip | ✅ |
-| 5 | 並列実行 | ✅ |
+| 0 | Project skeleton | ✅ |
+| 1 | Parser + DAG + execution | ✅ |
+| 2 | Optimizer hook | ⏸ deferred |
+| 3 | Mermaid visualization | ✅ |
+| 4 | Retry + downstream skip | ✅ |
+| 5 | Parallel execution | ✅ |
 | 6 | CLI | ✅ |
-| 7 | インクリメンタル + test | ✅ |
-| 8 | スケジューラ | ✅ |
+| 7 | Incremental + tests | ✅ |
+| 8 | Scheduler | ✅ |
 | 9 | OpenLineage | ✅ |
 
 ---
 
-## 開発
+## Development
 
 ```bash
-cargo test --workspace --release    # Rust ユニットテスト
-make                                # DuckDB ごとフルビルド
-make debug                          # デバッグビルド
+cargo test --workspace --release    # Rust unit tests
+make                                # full DuckDB-bundled build
+make debug                          # debug build
 
-# Rust だけ素早く回す
+# Iterate quickly on Rust only
 cargo build -p duckorch_core --release
 cargo build -p duckorch_cli --release
 ```
 
-DuckDB / extension-ci-tools は `v1.5.1` で固定(submodule)。バージョンを上げる場合は両方揃えて差し替え。
+DuckDB and `extension-ci-tools` are pinned at `v1.5.1` (submodules).
+When upgrading, bump both together.
 
 ---
 
-## ライセンス
+## License
 
-MIT。詳細は [LICENSE](LICENSE)。
+MIT. See [LICENSE](LICENSE).
 
-## クレジット
+## Credits
 
-duckOrch のコードはすべて新規執筆ですが、設計上のアイデアは下記プロジェクトを参考にしました(コードコピーはありません):
+All code in duckOrch is original. Design ideas (only — no code copied)
+were drawn from:
 
-- [ducksmiles](https://github.com/duckdb/community-extensions/tree/main/extensions/ducksmiles) — C++ + Rust ハイブリッドのビルド構成
-- [duck_lineage](https://github.com/ilum-cloud/duck_lineage) — DuckDB から OpenLineage を発行するアイデア
-- [SQLMesh](https://sqlmesh.readthedocs.io) — タスクファイルのコメントヘッダ形式
-- [dbt](https://docs.getdbt.com) — テスト形式・downstream skip・`--full-refresh`
-- [OpenLineage](https://openlineage.io) — イベント仕様(Apache-2.0、互換性は仕様準拠)
+- [ducksmiles](https://github.com/duckdb/community-extensions/tree/main/extensions/ducksmiles) — C++ + Rust hybrid build layout
+- [duck_lineage](https://github.com/ilum-cloud/duck_lineage) — emitting OpenLineage from DuckDB
+- [SQLMesh](https://sqlmesh.readthedocs.io) — comment-header task file format
+- [dbt](https://docs.getdbt.com) — testing, downstream skip, `--full-refresh`
+- [OpenLineage](https://openlineage.io) — event spec (Apache-2.0; compatibility comes from following a public spec, not from any specific implementation)
 
-duckOrch は「タスク実行が主、リネージは inputs/outputs から派生する副産物」という設計思想で、duck_lineage(任意クエリの傍受リネージ)とは補完関係です。両方ロードして併用できます。
+duckOrch's positioning is "task execution first, lineage as a derivative
+of each task's inputs/outputs". This makes it complementary to
+duck_lineage (which observes arbitrary queries via optimizer hooks).
+You can load both extensions together.
