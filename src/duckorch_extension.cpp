@@ -1260,6 +1260,58 @@ static string BuildColumnLineageFacet(const string &cl_extractor_json,
 	return o.str();
 }
 
+// Use DuckDB's binder via Connection::Prepare() to discover the actual output
+// columns of a SQL statement, including those produced by `SELECT *` over
+// subqueries / views / CTEs that pure AST analysis can't expand.
+//
+// Returns an empty vector if Prepare fails (e.g. tables don't exist yet).
+static std::vector<string> PrepareOutputColumns(Connection &con, const string &task_sql) {
+	std::vector<string> names;
+	// CREATE TABLE x AS SELECT ... — strip the prefix and prepare just the SELECT,
+	// because prepare on a CREATE statement returns no result columns.
+	string sql_to_prepare = task_sql;
+	auto skip_ws = [](const string &s, size_t i) {
+		while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r')) i++;
+		return i;
+	};
+	auto starts_with_ci = [](const string &s, size_t i, const char *kw) {
+		size_t j = 0;
+		while (kw[j] && i + j < s.size()) {
+			char c = s[i + j];
+			if (c >= 'a' && c <= 'z') c = (char)(c - 32);
+			if (c != kw[j]) return false;
+			j++;
+		}
+		return kw[j] == '\0';
+	};
+	size_t i = skip_ws(task_sql, 0);
+	if (starts_with_ci(task_sql, i, "CREATE")) {
+		// Skip until "AS" and prepare from there
+		auto pos = task_sql.find(" AS ");
+		if (pos == string::npos) pos = task_sql.find(" as ");
+		if (pos != string::npos) {
+			sql_to_prepare = task_sql.substr(pos + 4);
+		} else {
+			return names; // CREATE TABLE without AS, no columns to derive
+		}
+	} else if (starts_with_ci(task_sql, i, "INSERT")) {
+		// Skip "INSERT INTO <tbl>" and prepare from the SELECT
+		auto pos_select = task_sql.find("SELECT");
+		if (pos_select == string::npos) pos_select = task_sql.find("select");
+		if (pos_select != string::npos) {
+			sql_to_prepare = task_sql.substr(pos_select);
+		}
+	}
+	try {
+		auto stmt = con.Prepare(sql_to_prepare);
+		if (stmt && !stmt->HasError()) {
+			names = stmt->GetNames();
+		}
+	} catch (...) {
+	}
+	return names;
+}
+
 // Insert column lineage rows for a successful task. Returns the raw extractor
 // JSON so callers (e.g. OpenLineage emitter) can build a facet from it.
 static string RecordColumnLineage(Connection &con, const string &task_sql,
@@ -1343,6 +1395,64 @@ static string RecordColumnLineage(Connection &con, const string &task_sql,
 			Printer::Print("[duckorch] column_lineage insert failed: " + r->GetError());
 		}
 	}
+
+	// Prepare-based fallback: discover output columns the AST extractor couldn't
+	// resolve (subquery / view / CTE wildcards). Insert placeholder rows so
+	// downstream consumers at least know the output column names exist.
+	auto prepare_cols = PrepareOutputColumns(con, task_sql);
+	if (!prepare_cols.empty()) {
+		// Find which columns we already have lineage for (per dst_column)
+		std::set<string> already_covered;
+		auto existing = con.Query(
+		    "SELECT DISTINCT dst_column FROM __orch__.column_lineage WHERE via_task = " +
+		    SqlEscape(task_name));
+		if (!existing->HasError()) {
+			for (idx_t i2 = 0; i2 < existing->RowCount(); i2++) {
+				already_covered.insert(existing->GetValue(0, i2).ToString());
+			}
+		}
+		string dst_dataset_for_unresolved;
+		// pull the first output dataset from the extractor JSON for placeholder rows
+		auto doc2 = yyjson_ns::yyjson_read(cl_json.c_str(), cl_json.size(), 0);
+		if (doc2) {
+			auto root2 = yyjson_ns::yyjson_doc_get_root(doc2);
+			if (root2 && yyjson_ns::yyjson_is_arr(root2) && yyjson_ns::yyjson_arr_size(root2) > 0) {
+				auto first = yyjson_ns::yyjson_arr_get(root2, 0);
+				auto dsv = yyjson_ns::yyjson_obj_get(first, "output_dataset");
+				if (dsv && yyjson_ns::yyjson_get_str(dsv)) {
+					dst_dataset_for_unresolved = yyjson_ns::yyjson_get_str(dsv);
+				}
+			}
+			yyjson_ns::yyjson_doc_free(doc2);
+		}
+		std::ostringstream extra;
+		bool any_extra = false;
+		for (auto &col : prepare_cols) {
+			if (already_covered.count(col) > 0) continue;
+			if (!any_extra) {
+				extra << "INSERT INTO __orch__.column_lineage "
+				      << "(src_dataset, src_column, dst_dataset, dst_column, via_task, "
+				      << "transform_kind, subtype, description) VALUES ";
+			} else {
+				extra << ",";
+			}
+			any_extra = true;
+			extra << "(" << SqlEscape("__unresolved__") << ", " << SqlEscape("") << ", "
+			      << SqlEscape(dst_dataset_for_unresolved) << ", " << SqlEscape(col) << ", "
+			      << SqlEscape(task_name) << ", " << SqlEscape("INDIRECT") << ", "
+			      << SqlEscape("TRANSFORMATION") << ", "
+			      << SqlEscape("output column found via Connection::Prepare(); source unresolved by static AST")
+			      << ")";
+		}
+		if (any_extra) {
+			extra << ";";
+			auto rr = con.Query(extra.str());
+			if (rr->HasError()) {
+				Printer::Print("[duckorch] prepare fallback insert failed: " + rr->GetError());
+			}
+		}
+	}
+
 	return cl_json;
 }
 
