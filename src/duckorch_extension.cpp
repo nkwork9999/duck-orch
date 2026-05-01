@@ -26,6 +26,19 @@
 
 namespace duckdb {
 
+// Pipeline namespace, used for OpenLineage events. Set via SET orch_namespace.
+static string g_orch_namespace = "duckdb";
+
+// Forward declarations
+static string OlEventJson(const string &event_type, const string &event_time,
+                          const string &run_id, const string &pipeline_run_id,
+                          const string &job_namespace, const string &job_name,
+                          const std::vector<string> &inputs,
+                          const std::vector<string> &outputs,
+                          const string &error_message);
+static void EmitOlEvent(const string &json);
+static string JsonEscape(const string &s);
+
 // ========================================================================
 // FFI helpers
 // ========================================================================
@@ -601,6 +614,25 @@ static void OrchRunPragma(ClientContext &context, const FunctionParameters &para
 		auto run_uuid = con.Query("SELECT uuid()::VARCHAR")->GetValue(0, 0).ToString();
 		string started = IsoNow();
 
+		// Phase 9: lookup task inputs/outputs for OpenLineage emission
+		std::vector<string> task_inputs, task_outputs;
+		{
+			auto tr = con.Query("SELECT inputs, outputs FROM __orch__.tasks WHERE name = " +
+			                    SqlEscape(name));
+			if (!tr->HasError() && tr->RowCount() > 0) {
+				auto iv = tr->GetValue(0, 0);
+				auto ov = tr->GetValue(1, 0);
+				if (!iv.IsNull()) {
+					for (auto &c : ListValue::GetChildren(iv)) task_inputs.push_back(c.ToString());
+				}
+				if (!ov.IsNull()) {
+					for (auto &c : ListValue::GetChildren(ov)) task_outputs.push_back(c.ToString());
+				}
+			}
+		}
+		EmitOlEvent(OlEventJson("START", started, run_uuid, pipeline_run_id, g_orch_namespace,
+		                         name, task_inputs, task_outputs, ""));
+
 		// Phase 7: substitute Jinja placeholders for incremental tasks.
 		string sql_to_run = task.sql;
 		string last_at = LookupLastProcessedAt(con, name);
@@ -670,6 +702,8 @@ static void OrchRunPragma(ClientContext &context, const FunctionParameters &para
 			    << ");";
 			con.Query(ins.str());
 			statuses.push_back({name, "success"});
+			EmitOlEvent(OlEventJson("COMPLETE", finished, run_uuid, pipeline_run_id,
+			                         g_orch_namespace, name, task_inputs, task_outputs, ""));
 		} else {
 			std::ostringstream ins;
 			ins << "INSERT INTO __orch__.runs (run_id, pipeline_run_id, task_name, started_at, "
@@ -680,6 +714,8 @@ static void OrchRunPragma(ClientContext &context, const FunctionParameters &para
 			con.Query(ins.str());
 			statuses.push_back({name, "failed"});
 			failed_tasks.insert(name);
+			EmitOlEvent(OlEventJson("FAIL", finished, run_uuid, pipeline_run_id, g_orch_namespace,
+			                         name, task_inputs, task_outputs, error_msg));
 
 			// Compute downstream and mark for skipping
 			bool ok2 = false;
@@ -908,10 +944,91 @@ static string OrchVisualizePragma(ClientContext &context, const FunctionParamete
 }
 
 // ========================================================================
+// Configuration callbacks
+// ========================================================================
+
+static void SetOlUrl(ClientContext &context, SetScope scope, Value &param) {
+	auto v = param.GetValue<string>();
+	orch_ol_set_url(reinterpret_cast<const uint8_t *>(v.c_str()), v.size());
+}
+
+static void SetOlApiKey(ClientContext &context, SetScope scope, Value &param) {
+	auto v = param.GetValue<string>();
+	orch_ol_set_api_key(reinterpret_cast<const uint8_t *>(v.c_str()), v.size());
+}
+
+static void SetOlDebug(ClientContext &context, SetScope scope, Value &param) {
+	orch_ol_set_debug(param.GetValue<bool>() ? 1 : 0);
+}
+
+static void SetOrchNamespace(ClientContext &context, SetScope scope, Value &param) {
+	g_orch_namespace = param.GetValue<string>();
+}
+
+// ========================================================================
+// OpenLineage event helpers
+// ========================================================================
+
+static string OlEventJson(const string &event_type, const string &event_time,
+                          const string &run_id, const string &pipeline_run_id,
+                          const string &job_namespace, const string &job_name,
+                          const std::vector<string> &inputs,
+                          const std::vector<string> &outputs,
+                          const string &error_message) {
+	std::ostringstream o;
+	o << "{"
+	  << "\"eventType\":" << JsonEscape(event_type)
+	  << ",\"eventTime\":" << JsonEscape(event_time)
+	  << ",\"producer\":\"https://github.com/ilum-cloud/duckorch\""
+	  << ",\"schemaURL\":\"https://openlineage.io/spec/2-0-2/OpenLineage.json\""
+	  << ",\"run\":{\"runId\":" << JsonEscape(run_id) << ",\"facets\":{";
+	if (!pipeline_run_id.empty()) {
+		o << "\"parent\":{\"_producer\":\"https://github.com/ilum-cloud/duckorch\","
+		     "\"_schemaURL\":\"https://openlineage.io/spec/facets/1-0-0/ParentRunFacet.json\","
+		     "\"run\":{\"runId\":" << JsonEscape(pipeline_run_id) << "},"
+		     "\"job\":{\"namespace\":" << JsonEscape(job_namespace)
+		  << ",\"name\":\"pipeline\"}}";
+	}
+	o << "}}"
+	  << ",\"job\":{\"namespace\":" << JsonEscape(job_namespace)
+	  << ",\"name\":" << JsonEscape(job_name) << ",\"facets\":{}}";
+	o << ",\"inputs\":[";
+	for (size_t i = 0; i < inputs.size(); i++) {
+		if (i > 0) o << ",";
+		o << "{\"namespace\":" << JsonEscape(job_namespace)
+		  << ",\"name\":" << JsonEscape(inputs[i]) << "}";
+	}
+	o << "],\"outputs\":[";
+	for (size_t i = 0; i < outputs.size(); i++) {
+		if (i > 0) o << ",";
+		o << "{\"namespace\":" << JsonEscape(job_namespace)
+		  << ",\"name\":" << JsonEscape(outputs[i]) << "}";
+	}
+	o << "]}";
+	(void)error_message;
+	return o.str();
+}
+
+static void EmitOlEvent(const string &json) {
+	orch_ol_emit(reinterpret_cast<const uint8_t *>(json.c_str()), json.size());
+}
+
+// ========================================================================
 // Extension entry
 // ========================================================================
 
 static void LoadInternal(ExtensionLoader &loader) {
+	auto &config = loader.GetDatabaseInstance().config;
+	config.AddExtensionOption("orch_openlineage_url",
+	                          "OpenLineage backend URL (e.g. http://localhost:5000/api/v1/lineage)",
+	                          LogicalType::VARCHAR, Value(""), SetOlUrl);
+	config.AddExtensionOption("orch_openlineage_api_key", "OpenLineage API key",
+	                          LogicalType::VARCHAR, Value(""), SetOlApiKey);
+	config.AddExtensionOption("orch_openlineage_debug", "Log OpenLineage events to stderr",
+	                          LogicalType::BOOLEAN, Value(false), SetOlDebug);
+	config.AddExtensionOption("orch_namespace", "Job namespace for OpenLineage events",
+	                          LogicalType::VARCHAR, Value("duckdb"), SetOrchNamespace);
+
 	loader.RegisterFunction(
 	    ScalarFunction("orch_hello", {LogicalType::VARCHAR}, LogicalType::VARCHAR, OrchHelloFunc));
 	loader.RegisterFunction(ScalarFunction("orch_extract_io", {LogicalType::VARCHAR},

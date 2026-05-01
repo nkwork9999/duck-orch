@@ -47,4 +47,10 @@ int32_t orch_substitute_vars(const uint8_t *sql_ptr, size_t sql_len,
                               const uint8_t *vars_json_ptr, size_t vars_json_len,
                               uint8_t **out_ptr, size_t *out_len);
 
+// OpenLineage emitter (Phase 9)
+int32_t orch_ol_set_url(const uint8_t *ptr, size_t len);
+int32_t orch_ol_set_api_key(const uint8_t *ptr, size_t len);
+int32_t orch_ol_set_debug(int32_t d);
+int32_t orch_ol_emit(const uint8_t *ptr, size_t len);
+
 }

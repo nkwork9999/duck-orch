@@ -15,6 +15,7 @@ mod dag;
 mod ffi;
 mod lineage;
 mod mermaid;
+mod openlineage;
 mod task_parser;
 mod templating;
 
@@ -196,6 +197,50 @@ pub extern "C" fn orch_render_mermaid(
         };
         let s = mermaid::render(&dag, m, &statuses);
         write_out(s, out_ptr, out_len)
+    }))
+    .unwrap_or(-1)
+}
+
+/// Set OpenLineage backend URL. Empty string = disabled.
+#[unsafe(no_mangle)]
+pub extern "C" fn orch_ol_set_url(ptr: *const u8, len: usize) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        let url = unsafe { read_str(ptr, len) };
+        openlineage::set_url(url);
+        0
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn orch_ol_set_api_key(ptr: *const u8, len: usize) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        let key = unsafe { read_str(ptr, len) };
+        openlineage::set_api_key(key);
+        0
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn orch_ol_set_debug(d: i32) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        openlineage::set_debug(d != 0);
+        0
+    }))
+    .unwrap_or(-1)
+}
+
+/// Enqueue an OpenLineage event for async POST. Returns 0 if queued, 1 if URL not set, -1 on error.
+#[unsafe(no_mangle)]
+pub extern "C" fn orch_ol_emit(ptr: *const u8, len: usize) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        let event = unsafe { read_str(ptr, len) };
+        if openlineage::enqueue(event) {
+            0
+        } else {
+            1
+        }
     }))
     .unwrap_or(-1)
 }
