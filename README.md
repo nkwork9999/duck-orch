@@ -29,13 +29,19 @@ duck-orch graph > pipeline.md       # renders inline on GitHub PRs
 | **Failure handling** | Exponential backoff retry, then skip downstream tasks. |
 | **Incremental** | `@incremental_by ts` + `{{ last_processed_at }}` for delta processing. |
 | **Tests** | `@test "SQL" expect 0` runs assertions after task completion. |
+| **Table-level lineage** | Auto-derived from `inputs`/`outputs` of each task; stored in `__orch__.lineage_edges`. |
+| **Column-level lineage** | Static AST analysis with OpenLineage subtype taxonomy (IDENTITY / TRANSFORMATION / AGGREGATION / WINDOW / FILTER / JOIN_KEY / GROUP_BY / SORT). Stored in `__orch__.column_lineage`. |
+| **Wildcard resolution** | `SELECT *` is expanded via DuckDB `DESCRIBE` against the input tables' schema. |
+| **Dynamic SQL capture (opt-in)** | `SET orch_capture_interactive=true` enables an `OptimizerExtension` hook that captures column lineage for ad-hoc INSERT / CTAS / UPDATE outside `PRAGMA orch_run`. |
+| **DuckLake-aware namespacing** | OpenLineage `dataset.namespace` is auto-resolved from `Catalog::GetAttached().tags["data_path"]` (e.g. `s3://bucket/lake`) so events correlate with other engines. |
 | **Visualization** | Mermaid (`lineage` / `dag` / `combined` modes) via `PRAGMA orch_visualize`. |
-| **Observability** | OpenLineage-compatible events POSTed to Marquez / DataHub / etc. |
+| **Observability** | OpenLineage-compatible events POSTed to Marquez / DataHub / etc. — START / COMPLETE / FAIL with `parent` and `columnLineage` facets. |
 | **Scheduling** | `duck-orch schedule add NAME "0 6 * * *"` + `daemon` for a polling loop. |
 | **Agent integration** | `--json` on every CLI subcommand, structured `validate`, `impact` analysis. |
 
-The lineage table comes for free as a derivative of each task's `inputs`/`outputs`.
-The primary feature is **DAG orchestration**.
+The primary feature is **DAG orchestration**. Column lineage emerges as a
+derivative of each task's `inputs` / `outputs` and is also captured for ad-hoc
+queries when `orch_capture_interactive` is enabled.
 
 ---
 
@@ -162,6 +168,8 @@ LOAD duckorch;
 SET orch_max_parallel = 4;
 SET orch_openlineage_url = 'http://marquez:5000/api/v1/lineage';
 SET orch_openlineage_debug = true;
+SET orch_namespace = 'my-warehouse';        -- OL job namespace
+SET orch_capture_interactive = true;        -- capture ad-hoc CTAS/INSERT
 
 -- Operations
 PRAGMA orch_init;                       -- create __orch__ schema
@@ -173,12 +181,16 @@ PRAGMA orch_visualize('lineage');       -- Mermaid
 -- Pure scalar functions
 SELECT orch_extract_io('INSERT INTO x SELECT * FROM y');
 -- {"inputs":["y"],"outputs":["x"]}
-SELECT orch_render_mermaid(dag_json, 0, '[]');
+SELECT orch_extract_column_lineage(
+  'CREATE TABLE z AS SELECT a, UPPER(b) AS B_UP FROM t', '');
+-- column-level dependencies as JSON
 
 -- State tables
 SELECT * FROM __orch__.tasks;
 SELECT * FROM __orch__.runs WHERE status = 'failed';
 SELECT * FROM __orch__.lineage_edges;
+SELECT * FROM __orch__.column_lineage WHERE via_task = 'my_task';
+SELECT * FROM __orch__.column_lineage WHERE via_task = '__interactive__';  -- ad-hoc captures
 ```
 
 ---
@@ -188,16 +200,22 @@ SELECT * FROM __orch__.lineage_edges;
 A "**thin C++ shim + Rust core**" sandwich.
 
 ```
-┌─ C++ extension (~700 lines) ─────────────┐
+┌─ C++ extension (~1100 lines) ────────────┐
 │  Registers PRAGMA / scalar functions     │
 │  Executes SQL via per-thread Connection  │
-│  std::thread parallel dispatch            │
+│  std::thread parallel dispatch           │
+│  OptimizerExtension hook for ad-hoc      │
+│    column-lineage capture (opt-in)       │
+│  Catalog API for DuckLake namespace      │
 └──────────────┬───────────────────────────┘
                ↕ extern "C" FFI
 ┌─ Rust workspace ─────────────────────────┐
 │  orch_common   Task type, FFI helpers    │
 │  orch_dag      DAG, topo layers, Mermaid │
 │  orch_lineage  sqlparser-rs              │
+│                + column module           │
+│                  (Scope-based AST walker,│
+│                   OpenLineage subtypes)  │
 │  orch_runtime  Parser, templating        │
 │  orch_ol       OpenLineage HTTP worker   │
 │  orch_core     extern "C" facade         │
@@ -205,10 +223,10 @@ A "**thin C++ shim + Rust core**" sandwich.
 └──────────────────────────────────────────┘
 ```
 
-Why the C++ layer? DuckDB's stable C extension API does not yet expose
-optimizer / parser hooks, so a pure-Rust extension cannot intercept
-queries. The C++ shim handles DuckDB-internal calls; all logic lives
-in Rust. Same pattern as `ducksmiles`.
+Why the C++ layer? DuckDB's stable C extension API doesn't yet expose
+optimizer / parser hooks, so a pure-Rust extension can't observe queries.
+The C++ shim handles DuckDB-internal calls; all logic lives in Rust.
+Same pattern as `ducksmiles`.
 
 See [DESIGN.md](DESIGN.md) for the full design.
 
@@ -216,22 +234,24 @@ See [DESIGN.md](DESIGN.md) for the full design.
 
 ## Status
 
-Phases 1 through 9 are complete. Phase 2 (optimizer-hook based query
-auto-interception) is deferred — explicit task registration plus
-`sqlparser-rs` auto-extraction covers the common case.
+All originally-planned phases are complete plus extra work on column lineage
+and DuckLake integration.
 
 | Phase | Topic | Status |
 |---|---|---|
 | 0 | Project skeleton | ✅ |
 | 1 | Parser + DAG + execution | ✅ |
-| 2 | Optimizer hook | ⏸ deferred |
+| 2 | Optimizer hook (auto-interception) | ✅ (opt-in, `orch_capture_interactive`) |
 | 3 | Mermaid visualization | ✅ |
 | 4 | Retry + downstream skip | ✅ |
 | 5 | Parallel execution | ✅ |
 | 6 | CLI | ✅ |
 | 7 | Incremental + tests | ✅ |
 | 8 | Scheduler | ✅ |
-| 9 | OpenLineage | ✅ |
+| 9 | OpenLineage events | ✅ |
+| + | Column-level lineage with subtype taxonomy | ✅ |
+| + | DuckLake-aware OL namespace resolution | ✅ |
+| + | OpenLineage `columnLineage` facet emission | ✅ |
 
 ---
 
