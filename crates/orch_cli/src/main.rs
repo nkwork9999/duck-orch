@@ -363,7 +363,8 @@ fn cmd_schedule(args: &Args) -> i32 {
 fn run_schedule_due(args: &Args) -> i32 {
     use std::str::FromStr;
     use chrono::Utc;
-    let q = "SELECT pipeline_or_task, cron_expr, COALESCE(next_trigger_at, current_timestamp) \
+    let q = "SELECT pipeline_or_task, cron_expr, \
+             (COALESCE(next_trigger_at, current_timestamp)::TIMESTAMP)::VARCHAR AS next_trigger_at \
              FROM __orch__.schedules WHERE enabled = true;";
     let (_, _, _) = run_sql(args, q, false).unwrap_or_default();
     // Re-query in JSON to parse
@@ -378,10 +379,19 @@ fn run_schedule_due(args: &Args) -> i32 {
         let cron_expr = r.get("cron_expr").and_then(|v| v.as_str()).unwrap_or("");
         let next_str = r.get("next_trigger_at").and_then(|v| v.as_str()).unwrap_or("");
         // Parse next time. If <= now → run.
+        // DuckDB timestamps come back like "2026-05-01 18:31:36.518224" (space, no Z).
+        // Try every plausible format; only fall back to `now` if everything fails.
         let next_time = chrono::DateTime::parse_from_rfc3339(next_str)
             .or_else(|_| chrono::NaiveDateTime::parse_from_str(next_str, "%Y-%m-%dT%H:%M:%S%.f")
                 .map(|t| t.and_utc().fixed_offset()))
-            .unwrap_or_else(|_| now.into());
+            .or_else(|_| chrono::NaiveDateTime::parse_from_str(next_str, "%Y-%m-%d %H:%M:%S%.f")
+                .map(|t| t.and_utc().fixed_offset()))
+            .or_else(|_| chrono::NaiveDateTime::parse_from_str(next_str, "%Y-%m-%d %H:%M:%S")
+                .map(|t| t.and_utc().fixed_offset()))
+            .unwrap_or_else(|_| {
+                eprintln!("[duck-orch] WARN: could not parse next_trigger_at='{}', firing now", next_str);
+                now.into()
+            });
         if next_time > now {
             continue;
         }
