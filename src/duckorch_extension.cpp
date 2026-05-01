@@ -18,6 +18,7 @@
 #include "duckdb/common/printer.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/main/attached_database.hpp"
+#include "duckdb/optimizer/optimizer_extension.hpp"
 #include "yyjson.hpp"
 
 #include <atomic>
@@ -34,6 +35,16 @@ namespace duckdb {
 // Pipeline namespace, used for OpenLineage events. Set via SET orch_namespace.
 static string g_orch_namespace = "duckdb";
 static std::atomic<int> g_max_parallel{1};
+
+// ParserExtension: capture column lineage for queries that don't go through
+// PRAGMA orch_run (PreparedStatements, ad-hoc INSERT/CTAS, dynamic SQL).
+// Disabled by default. Toggled via SET orch_capture_interactive=true.
+static std::atomic<bool> g_capture_interactive{false};
+// Database pointer stashed at LoadInternal time so the parser callback (which
+// runs without a ClientContext) can open its own Connection.
+static DatabaseInstance *g_db_for_capture = nullptr;
+// Thread-local recursion guard so internal con.Query() calls don't loop.
+static thread_local bool g_inside_capture = false;
 
 struct OlDataset {
 	string ns;
@@ -1108,6 +1119,10 @@ static void SetOrchMaxParallel(ClientContext &context, SetScope scope, Value &pa
 	g_max_parallel.store(n);
 }
 
+static void SetOrchCaptureInteractive(ClientContext &context, SetScope scope, Value &param) {
+	g_capture_interactive.store(param.GetValue<bool>());
+}
+
 // ========================================================================
 // OpenLineage event helpers
 // ========================================================================
@@ -1363,6 +1378,60 @@ static void EmitOlEvent(const string &json) {
 }
 
 // ========================================================================
+// OptimizerExtension: capture column lineage for ad-hoc / dynamic SQL
+// ========================================================================
+//
+// pre_optimize_function fires for every successfully-parsed query. We use
+// ClientContext::GetCurrentQuery() to retrieve the original SQL text, then
+// reuse our sqlparser-rs based extractor. Disabled by default; toggled via
+// SET orch_capture_interactive=true.
+//
+// PreparedStatements have no original SQL at execute-time, so they fall back
+// to "no lineage emitted" (same limitation as plan-only observers).
+
+static void OrchPreOptimize(OptimizerExtensionInput &input,
+                             unique_ptr<LogicalOperator> &plan) {
+	if (!g_capture_interactive.load() || g_inside_capture) return;
+	if (!plan) return;
+	string query;
+	try {
+		query = input.context.GetCurrentQuery();
+	} catch (...) {
+		return; // PreparedStatement etc.
+	}
+	if (query.empty()) return;
+	if (query.size() < 20) return;
+	if (query.find("__orch__") != string::npos) return;
+
+	auto is_writeish = [](const string &q) {
+		size_t i = 0;
+		while (i < q.size() && (q[i] == ' ' || q[i] == '\t' || q[i] == '\n' || q[i] == '\r')) i++;
+		auto starts_with = [&](const char *kw) {
+			size_t j = 0;
+			while (kw[j] && i + j < q.size()) {
+				char c = q[i + j];
+				if (c >= 'a' && c <= 'z') c = (char)(c - 32);
+				if (c != kw[j]) return false;
+				j++;
+			}
+			return kw[j] == '\0';
+		};
+		return starts_with("INSERT") || starts_with("CREATE") || starts_with("UPDATE")
+		       || starts_with("REPLACE");
+	};
+	if (!is_writeish(query)) return;
+
+	g_inside_capture = true;
+	try {
+		Connection con(*input.context.db);
+		std::vector<OlDataset> empty_inputs;
+		(void)RecordColumnLineage(con, query, "__interactive__", empty_inputs);
+	} catch (...) {
+	}
+	g_inside_capture = false;
+}
+
+// ========================================================================
 // Extension entry
 // ========================================================================
 
@@ -1380,6 +1449,16 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("orch_max_parallel",
 	                          "Maximum parallel tasks per DAG layer",
 	                          LogicalType::BIGINT, Value::BIGINT(1), SetOrchMaxParallel);
+	config.AddExtensionOption(
+	    "orch_capture_interactive",
+	    "Capture column lineage for ad-hoc INSERT/CTAS queries via ParserExtension",
+	    LogicalType::BOOLEAN, Value(false), SetOrchCaptureInteractive);
+
+	// OptimizerExtension hook for ad-hoc query column lineage capture.
+	g_db_for_capture = &loader.GetDatabaseInstance();
+	OptimizerExtension oext;
+	oext.pre_optimize_function = OrchPreOptimize;
+	OptimizerExtension::Register(config, std::move(oext));
 
 	loader.RegisterFunction(
 	    ScalarFunction("orch_hello", {LogicalType::VARCHAR}, LogicalType::VARCHAR, OrchHelloFunc));
