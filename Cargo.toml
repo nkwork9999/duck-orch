@@ -1,5 +1,10 @@
 [workspace]
 members = [
+    "crates/orch_common",
+    "crates/orch_dag",
+    "crates/orch_lineage",
+    "crates/orch_runtime",
+    "crates/orch_ol",
     "crates/orch_core",
     "crates/orch_cli",
 ]

@@ -1,47 +1,7 @@
 // Parses SQL files with `-- @key value` header comments into Task structs.
-//
-// Format:
-//   -- @task name=user_stats
-//   -- @description some text
-//   -- @inputs analytics.clean_users, raw.events
-//   -- @outputs analytics.user_stats
-//   -- @depends_on clean_users
-//   -- @schedule "0 6 * * *"
-//   -- @retries 3
-//   -- @timeout 300
-//   -- @incremental_by updated_at
-//   -- @tags daily, analytics
-//   -- @test "SELECT COUNT(*) FROM x" expect 0
-//
-//   <SQL body>
 
-use serde::{Deserialize, Serialize};
+use orch_common::{Task, TaskTest};
 use std::path::Path;
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
-pub struct Task {
-    pub name: String,
-    pub description: Option<String>,
-    pub owner: Option<String>,
-    pub sql: String,
-    pub inputs: Vec<String>,
-    pub outputs: Vec<String>,
-    pub depends_on: Vec<String>,
-    pub schedule: Option<String>,
-    pub retries: u32,
-    pub timeout_seconds: Option<u64>,
-    pub incremental_by: Option<String>,
-    pub tags: Vec<String>,
-    pub tests: Vec<TaskTest>,
-    pub file_path: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskTest {
-    pub query: String,
-    pub assertion: String,
-}
 
 #[derive(Debug)]
 pub struct ParseError {
@@ -101,8 +61,7 @@ pub fn parse_sql_file(content: &str, file_path: Option<&str>) -> Result<Task, Pa
     }
 
     if task.outputs.is_empty() {
-        // Try auto-extract from SQL
-        let (inputs_auto, outputs_auto) = crate::lineage::extract_io(&task.sql);
+        let (inputs_auto, outputs_auto) = orch_lineage::extract_io(&task.sql);
         if task.inputs.is_empty() {
             task.inputs = inputs_auto;
         }
@@ -110,7 +69,7 @@ pub fn parse_sql_file(content: &str, file_path: Option<&str>) -> Result<Task, Pa
             task.outputs = outputs_auto;
         }
     } else if task.inputs.is_empty() {
-        let (inputs_auto, _) = crate::lineage::extract_io(&task.sql);
+        let (inputs_auto, _) = orch_lineage::extract_io(&task.sql);
         task.inputs = inputs_auto;
     }
 
@@ -118,7 +77,6 @@ pub fn parse_sql_file(content: &str, file_path: Option<&str>) -> Result<Task, Pa
 }
 
 fn parse_header_line(line: &str) -> Option<&str> {
-    // Strip "--" prefix and whitespace, look for "@..."
     let s = line.strip_prefix("--")?.trim_start();
     if s.starts_with('@') {
         Some(&s[1..])
@@ -128,15 +86,13 @@ fn parse_header_line(line: &str) -> Option<&str> {
 }
 
 fn apply_header(task: &mut Task, content: &str, line: usize) -> Result<(), ParseError> {
-    // Format: "key value" or "key=value" or "task name=foo bar=baz"
     let (key, rest) = split_first_word(content);
 
     match key {
         "task" => {
             for kv in parse_inline_kv(rest) {
-                match kv.0 {
-                    "name" => task.name = kv.1.to_string(),
-                    _ => {}
+                if kv.0 == "name" {
+                    task.name = kv.1.to_string();
                 }
             }
         }
@@ -162,7 +118,7 @@ fn apply_header(task: &mut Task, content: &str, line: usize) -> Result<(), Parse
         "incremental_by" => task.incremental_by = Some(rest.trim().to_string()),
         "tags" => task.tags = split_csv(rest),
         "test" => task.tests.push(parse_test(rest, line)?),
-        _ => {} // Unknown @keys are ignored to allow forward compat
+        _ => {}
     }
 
     Ok(())
@@ -198,7 +154,6 @@ fn split_csv(s: &str) -> Vec<String> {
 }
 
 fn parse_test(rest: &str, line: usize) -> Result<TaskTest, ParseError> {
-    // Format: "<quoted-sql>" <assertion>
     let s = rest.trim_start();
     if !s.starts_with('"') {
         return Err(ParseError {

@@ -1,10 +1,4 @@
 // Jinja-style {{ key }} placeholder substitution.
-//
-// Variables supported by Phase 7:
-//   {{ last_processed_at }}
-//   {{ now }}
-//   {{ run_id }}
-// Anything else is passed through (with a warning logged elsewhere).
 
 use std::collections::HashMap;
 
@@ -14,12 +8,10 @@ pub fn substitute(sql: &str, vars: &HashMap<String, String>) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if i + 1 < bytes.len() && bytes[i] == b'{' && bytes[i + 1] == b'{' {
-            // find closing "}}"
             if let Some(close) = find_subseq(&bytes[i + 2..], b"}}") {
                 let end = i + 2 + close;
                 let key = std::str::from_utf8(&bytes[i + 2..end]).unwrap_or("").trim();
                 if let Some(v) = vars.get(key) {
-                    // Quote if value looks like a timestamp/string (contains "-" or ":" or no quote)
                     if v.starts_with('\'') || v.parse::<f64>().is_ok() {
                         out.push_str(v);
                     } else {

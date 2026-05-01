@@ -1,6 +1,4 @@
 // OpenLineage HTTP emitter. Background worker thread + bounded queue.
-//
-// Compatible with duck_lineage so Marquez/DataHub can consume both event streams.
 
 use once_cell::sync::Lazy;
 use std::sync::mpsc::{sync_channel, SyncSender};
@@ -75,7 +73,6 @@ fn send_event(event: &str) {
     if debug {
         eprintln!("[duckorch OL] -> {}: {}", url, event);
     }
-    // Try a few times with exponential backoff
     let mut attempt = 0;
     loop {
         let mut req = ureq::post(&url)

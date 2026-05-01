@@ -1,0 +1,13 @@
+[package]
+name = "orch_runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+orch_common = { path = "../orch_common" }
+orch_lineage = { path = "../orch_lineage" }
+serde = { version = "1", features = ["derive"] }

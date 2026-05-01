@@ -20,8 +20,7 @@ pub fn leak_vec(v: Vec<u8>) -> (*mut u8, usize) {
 /// # Safety
 /// `ptr` must be a pointer previously returned by `leak_vec`, and `len` must
 /// match. After this call the pointer is invalid.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn orch_string_free(ptr: *mut u8, len: usize) {
+pub unsafe fn free_vec(ptr: *mut u8, len: usize) {
     if !ptr.is_null() && len > 0 {
         let _ = unsafe { Vec::from_raw_parts(ptr, len, len) };
     }
@@ -42,4 +41,13 @@ pub unsafe fn read_cstr<'a>(ptr: *const c_char) -> &'a str {
     }
     let cstr = unsafe { std::ffi::CStr::from_ptr(ptr) };
     cstr.to_str().unwrap_or("")
+}
+
+/// Build a small JSON {"error": "..."} payload as bytes.
+pub fn error_json(msg: &str) -> Vec<u8> {
+    format!(
+        "{{\"error\":{}}}",
+        serde_json::to_string(msg).unwrap_or_else(|_| "\"\"".into())
+    )
+    .into_bytes()
 }

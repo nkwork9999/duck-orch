@@ -1,6 +1,5 @@
 // Extract input/output tables from a SQL string using sqlparser-rs.
-// Best-effort: covers INSERT/UPDATE/DELETE/CREATE TABLE AS/CREATE OR REPLACE.
-// Anything we can't parse cleanly returns empty lists.
+// Best-effort: covers INSERT/UPDATE/CREATE TABLE AS / SELECT.
 
 use sqlparser::ast::{Insert, ObjectName, Query, SetExpr, Statement, TableFactor, TableWithJoins};
 use sqlparser::dialect::DuckDbDialect;
@@ -21,12 +20,7 @@ pub fn extract_io(sql: &str) -> (Vec<String>, Vec<String>) {
         walk_stmt(stmt, &mut inputs, &mut outputs);
     }
 
-    // Outputs that are also "read first" (e.g., INSERT INTO x SELECT FROM x)
-    // should still appear as inputs. Don't subtract.
-    (
-        inputs.into_iter().collect(),
-        outputs.into_iter().collect(),
-    )
+    (inputs.into_iter().collect(), outputs.into_iter().collect())
 }
 
 fn walk_stmt(stmt: &Statement, ins: &mut BTreeSet<String>, outs: &mut BTreeSet<String>) {
@@ -104,7 +98,6 @@ fn walk_set_expr(s: &SetExpr, ins: &mut BTreeSet<String>) {
                 ins.insert(name.clone());
             }
         }
-        _ => {}
     }
 }
 
@@ -130,7 +123,6 @@ fn walk_table_factor(tf: &TableFactor, ins: &mut BTreeSet<String>) {
 }
 
 fn name_to_string(n: &ObjectName) -> String {
-    // sqlparser 0.52: ObjectName.0 is Vec<Ident>
     n.0.iter().map(|id| id.value.clone()).collect::<Vec<_>>().join(".")
 }
 
@@ -157,9 +149,7 @@ mod tests {
 
     #[test]
     fn extract_join() {
-        let (i, _) = extract_io(
-            "INSERT INTO x SELECT * FROM a JOIN b ON a.id = b.id",
-        );
+        let (i, _) = extract_io("INSERT INTO x SELECT * FROM a JOIN b ON a.id = b.id");
         assert_eq!(i, vec!["a", "b"]);
     }
 }

@@ -1,7 +1,8 @@
-// DAG topological sort over Tasks. Edge = "B's inputs ∩ A's outputs ≠ ∅".
-// Also captures task-to-task lineage edges for visualization.
+// DAG construction, topological ordering, downstream propagation, Mermaid rendering.
 
-use crate::task_parser::Task;
+pub mod mermaid;
+
+use orch_common::Task;
 use petgraph::algo::{is_cyclic_directed, toposort};
 use petgraph::graph::{DiGraph, NodeIndex};
 use serde::{Deserialize, Serialize};
@@ -52,7 +53,6 @@ pub fn build_dag(tasks: &[Task]) -> Result<DagResult, DagBuildError> {
     let mut lineage_edges = Vec::new();
 
     for t in tasks {
-        // explicit depends_on
         for dep in &t.depends_on {
             if let (Some(&from), Some(&to)) = (idx.get(dep), idx.get(&t.name)) {
                 graph.update_edge(from, to, ());
@@ -62,7 +62,6 @@ pub fn build_dag(tasks: &[Task]) -> Result<DagResult, DagBuildError> {
                 });
             }
         }
-        // input-derived edges
         for inp in &t.inputs {
             if let Some(prod) = producer.get(inp) {
                 if prod != &t.name {
@@ -96,7 +95,6 @@ pub fn build_dag(tasks: &[Task]) -> Result<DagResult, DagBuildError> {
     })?;
     let order: Vec<String> = topo.into_iter().map(|n| graph[n].clone()).collect();
 
-    // Dedup edges
     task_edges.sort_by(|a, b| (a.from.clone(), a.to.clone()).cmp(&(b.from.clone(), b.to.clone())));
     task_edges.dedup_by(|a, b| a.from == b.from && a.to == b.to);
 
@@ -108,7 +106,6 @@ pub fn build_dag(tasks: &[Task]) -> Result<DagResult, DagBuildError> {
 }
 
 /// Group tasks into "layers" of mutually independent tasks.
-/// Layer N contains tasks whose dependencies are all in layers 0..N.
 pub fn topo_layers(tasks: &[Task]) -> Result<Vec<Vec<String>>, DagBuildError> {
     let dag = build_dag(tasks)?;
     let mut indeg: HashMap<String, usize> = HashMap::new();
@@ -152,7 +149,6 @@ pub fn topo_layers(tasks: &[Task]) -> Result<Vec<Vec<String>>, DagBuildError> {
     Ok(layers)
 }
 
-/// Return tasks whose direct or transitive upstream contains `failed`.
 pub fn downstream_of(tasks: &[Task], failed: &str) -> Vec<String> {
     let dag = match build_dag(tasks) {
         Ok(d) => d,
@@ -179,7 +175,6 @@ pub fn downstream_of(tasks: &[Task], failed: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::task_parser::Task;
 
     fn t(name: &str, ins: &[&str], outs: &[&str]) -> Task {
         Task {
@@ -192,11 +187,7 @@ mod tests {
 
     #[test]
     fn linear_chain() {
-        let tasks = vec![
-            t("a", &[], &["X"]),
-            t("b", &["X"], &["Y"]),
-            t("c", &["Y"], &["Z"]),
-        ];
+        let tasks = vec![t("a", &[], &["X"]), t("b", &["X"], &["Y"]), t("c", &["Y"], &["Z"])];
         let r = build_dag(&tasks).unwrap();
         assert_eq!(r.order, vec!["a", "b", "c"]);
     }
