@@ -16,6 +16,7 @@ mod ffi;
 mod lineage;
 mod mermaid;
 mod task_parser;
+mod templating;
 
 use ffi::{leak_vec, read_str};
 
@@ -194,6 +195,30 @@ pub extern "C" fn orch_render_mermaid(
             _ => mermaid::Mode::Combined,
         };
         let s = mermaid::render(&dag, m, &statuses);
+        write_out(s, out_ptr, out_len)
+    }))
+    .unwrap_or(-1)
+}
+
+/// Substitute Jinja-style {{ key }} placeholders. `vars_json` is a JSON object {key: value}.
+#[unsafe(no_mangle)]
+pub extern "C" fn orch_substitute_vars(
+    sql_ptr: *const u8,
+    sql_len: usize,
+    vars_json_ptr: *const u8,
+    vars_json_len: usize,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        let sql = unsafe { read_str(sql_ptr, sql_len) };
+        let vars_json = unsafe { read_str(vars_json_ptr, vars_json_len) };
+        let vars: std::collections::HashMap<String, String> = if vars_json.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            serde_json::from_str(vars_json).unwrap_or_default()
+        };
+        let s = templating::substitute(sql, &vars);
         write_out(s, out_ptr, out_len)
     }))
     .unwrap_or(-1)

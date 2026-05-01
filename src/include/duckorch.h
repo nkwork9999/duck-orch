@@ -42,4 +42,9 @@ int32_t orch_downstream_of(const uint8_t *tasks_json_ptr, size_t tasks_json_len,
                             const uint8_t *failed_ptr, size_t failed_len,
                             uint8_t **out_ptr, size_t *out_len);
 
+// Replace {{ var }} placeholders. vars_json: {"key":"value", ...}.
+int32_t orch_substitute_vars(const uint8_t *sql_ptr, size_t sql_len,
+                              const uint8_t *vars_json_ptr, size_t vars_json_len,
+                              uint8_t **out_ptr, size_t *out_len);
+
 }

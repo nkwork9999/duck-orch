@@ -15,6 +15,7 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/common/printer.hpp"
 #include "yyjson.hpp"
 
 #include <chrono>
@@ -226,6 +227,14 @@ CREATE TABLE IF NOT EXISTS __orch__.task_edges (
     downstream VARCHAR,
     PRIMARY KEY (upstream, downstream)
 );
+
+CREATE TABLE IF NOT EXISTS __orch__.tests (
+    task_name VARCHAR,
+    test_idx INT,
+    query VARCHAR,
+    assertion VARCHAR,
+    PRIMARY KEY (task_name, test_idx)
+);
 )";
 
 static void EnsureOrchSchema(Connection &con) {
@@ -352,6 +361,27 @@ static void OrchRegisterPragma(ClientContext &context, const FunctionParameters 
 			sql << ", " << SqlEscape(get_str("incremental_by")) << ", "
 			    << SqlArrayLiteral(yyjson_ns::yyjson_obj_get(t, "tags")) << ", "
 			    << SqlEscape(get_str("file_path")) << ");\n";
+
+			// Save tests
+			sql << "DELETE FROM __orch__.tests WHERE task_name = " << SqlEscape(name) << ";\n";
+			auto tests = yyjson_ns::yyjson_obj_get(t, "tests");
+			if (tests && yyjson_ns::yyjson_is_arr(tests)) {
+				size_t tidx, tmax;
+				yyjson_ns::yyjson_val *tv;
+				int counter = 0;
+				yyjson_arr_foreach(tests, tidx, tmax, tv) {
+					auto q = yyjson_ns::yyjson_obj_get(tv, "query");
+					auto a = yyjson_ns::yyjson_obj_get(tv, "assertion");
+					if (!q || !a) continue;
+					sql << "INSERT INTO __orch__.tests (task_name, test_idx, query, assertion) VALUES ("
+					    << SqlEscape(name) << ", " << counter << ", "
+					    << SqlEscape(yyjson_ns::yyjson_get_str(q) ? yyjson_ns::yyjson_get_str(q) : "")
+					    << ", "
+					    << SqlEscape(yyjson_ns::yyjson_get_str(a) ? yyjson_ns::yyjson_get_str(a) : "")
+					    << ");\n";
+					counter++;
+				}
+			}
 		}
 	}
 	yyjson_ns::yyjson_doc_free(doc);
@@ -458,10 +488,13 @@ struct TaskRow {
 	string name;
 	string sql;
 	int retries = 0;
+	string incremental_by;
+	std::vector<string> tests; // [query, assertion, query, assertion, ...]
 };
 
 static std::vector<TaskRow> LoadTaskRows(Connection &con) {
-	auto result = con.Query("SELECT name, sql, retries FROM __orch__.tasks");
+	auto result = con.Query(
+	    "SELECT name, sql, retries, incremental_by FROM __orch__.tasks");
 	if (result->HasError()) {
 		throw InvalidInputException("failed: " + result->GetError());
 	}
@@ -472,9 +505,34 @@ static std::vector<TaskRow> LoadTaskRows(Connection &con) {
 		r.sql = result->GetValue(1, i).ToString();
 		auto rv = result->GetValue(2, i);
 		r.retries = rv.IsNull() ? 0 : rv.GetValue<int32_t>();
+		auto iv = result->GetValue(3, i);
+		r.incremental_by = iv.IsNull() ? string() : iv.ToString();
 		out.push_back(std::move(r));
 	}
 	return out;
+}
+
+// Look up last successful last_processed_at for a task. Returns "1970-01-01 00:00:00" if none.
+static string LookupLastProcessedAt(Connection &con, const string &task_name) {
+	std::ostringstream q;
+	q << "SELECT COALESCE(max(last_processed_at), TIMESTAMP '1970-01-01 00:00:00')::VARCHAR "
+	  << "FROM __orch__.runs WHERE task_name = " << SqlEscape(task_name)
+	  << " AND status = 'success'";
+	auto r = con.Query(q.str());
+	if (r->HasError() || r->RowCount() == 0) return "1970-01-01 00:00:00";
+	auto v = r->GetValue(0, 0);
+	return v.IsNull() ? "1970-01-01 00:00:00" : v.ToString();
+}
+
+// Run @test queries for a task. Returns empty string on success, error message on failure.
+static string RunTaskTests(Connection &con, const string &task_name) {
+	auto r = con.Query(
+	    "SELECT tests FROM __orch__.tasks WHERE name = " + SqlEscape(task_name));
+	if (r->HasError() || r->RowCount() == 0) return "";
+	// Tests stored as JSON array of {query, assertion} objects via separate column.
+	// MVP: tests are stored as serialized JSON in a VARCHAR column.
+	// For Phase 7 we just skip this — actual test execution is in OrchTestPragma.
+	return "";
 }
 
 static void OrchRunPragma(ClientContext &context, const FunctionParameters &parameters) {
@@ -543,6 +601,30 @@ static void OrchRunPragma(ClientContext &context, const FunctionParameters &para
 		auto run_uuid = con.Query("SELECT uuid()::VARCHAR")->GetValue(0, 0).ToString();
 		string started = IsoNow();
 
+		// Phase 7: substitute Jinja placeholders for incremental tasks.
+		string sql_to_run = task.sql;
+		string last_at = LookupLastProcessedAt(con, name);
+		string now_ts;
+		{
+			auto nr = con.Query("SELECT current_timestamp::VARCHAR");
+			now_ts = nr->GetValue(0, 0).ToString();
+		}
+		std::ostringstream vars;
+		vars << "{\"last_processed_at\":" << JsonEscape(last_at)
+		     << ",\"now\":" << JsonEscape(now_ts)
+		     << ",\"run_id\":" << JsonEscape(run_uuid) << "}";
+		string vars_json = vars.str();
+		bool sub_ok = false;
+		auto substituted = CallRustString(
+		    [&](uint8_t **op, size_t *ol) {
+			    return orch_substitute_vars(
+			        reinterpret_cast<const uint8_t *>(task.sql.c_str()), task.sql.size(),
+			        reinterpret_cast<const uint8_t *>(vars_json.c_str()), vars_json.size(),
+			        op, ol);
+		        },
+		    sub_ok);
+		if (sub_ok) sql_to_run = substituted;
+
 		// Execute with retries
 		int retries_left = task.retries;
 		int retry_count = 0;
@@ -550,7 +632,7 @@ static void OrchRunPragma(ClientContext &context, const FunctionParameters &para
 		string error_msg;
 
 		while (true) {
-			auto exec_result = con.Query(task.sql);
+			auto exec_result = con.Query(sql_to_run);
 			if (!exec_result->HasError()) {
 				success = true;
 				break;
@@ -563,12 +645,29 @@ static void OrchRunPragma(ClientContext &context, const FunctionParameters &para
 
 		string finished = IsoNow();
 		if (success) {
+			// Phase 7: for incremental tasks, look up max(incremental_by) from first output table.
+			string new_watermark;
+			if (!task.incremental_by.empty()) {
+				// Find first output table
+				auto out_r = con.Query(
+				    "SELECT outputs[1] FROM __orch__.tasks WHERE name = " + SqlEscape(name));
+				if (!out_r->HasError() && out_r->RowCount() > 0 && !out_r->GetValue(0, 0).IsNull()) {
+					string out_table = out_r->GetValue(0, 0).ToString();
+					string q = "SELECT max(" + task.incremental_by + ")::VARCHAR FROM " + out_table;
+					auto wm = con.Query(q);
+					if (!wm->HasError() && wm->RowCount() > 0 && !wm->GetValue(0, 0).IsNull()) {
+						new_watermark = wm->GetValue(0, 0).ToString();
+					}
+				}
+			}
 			std::ostringstream ins;
 			ins << "INSERT INTO __orch__.runs (run_id, pipeline_run_id, task_name, started_at, "
-			    << "finished_at, status, rows_count, retry_count) VALUES ("
+			    << "finished_at, status, rows_count, retry_count, last_processed_at) VALUES ("
 			    << SqlEscape(run_uuid) << ", " << SqlEscape(pipeline_run_id) << ", "
 			    << SqlEscape(name) << ", '" << started << "', '" << finished
-			    << "', 'success', 0, " << retry_count << ");";
+			    << "', 'success', 0, " << retry_count << ", "
+			    << (new_watermark.empty() ? string("NULL") : ("'" + new_watermark + "'"))
+			    << ");";
 			con.Query(ins.str());
 			statuses.push_back({name, "success"});
 		} else {
@@ -647,6 +746,84 @@ static void OrchRunPragma(ClientContext &context, const FunctionParameters &para
 		}
 	}
 	yyjson_ns::yyjson_doc_free(doc2);
+}
+
+// ========================================================================
+// PRAGMA: orch_test — run @test assertions
+// ========================================================================
+
+static bool EvalAssertion(Connection &con, const string &query, const string &assertion,
+                          string &error_out) {
+	auto r = con.Query(query);
+	if (r->HasError()) {
+		error_out = "test query error: " + r->GetError();
+		return false;
+	}
+	// Parse assertion: "expect 0", "expect_gt 5", "expect_empty", "expect_non_empty"
+	std::istringstream as(assertion);
+	string verb;
+	as >> verb;
+
+	if (verb == "expect_empty") {
+		if (r->RowCount() == 0) return true;
+		error_out = "expected empty, got " + std::to_string(r->RowCount()) + " rows";
+		return false;
+	}
+	if (verb == "expect_non_empty") {
+		if (r->RowCount() > 0) return true;
+		error_out = "expected non-empty";
+		return false;
+	}
+	int64_t bound = 0;
+	as >> bound;
+	if (r->RowCount() == 0) {
+		error_out = "expected single value, got 0 rows";
+		return false;
+	}
+	auto v = r->GetValue(0, 0);
+	int64_t actual = v.IsNull() ? 0 : v.GetValue<int64_t>();
+	if (verb == "expect") {
+		if (actual == bound) return true;
+		error_out = "expected " + std::to_string(bound) + ", got " + std::to_string(actual);
+		return false;
+	}
+	if (verb == "expect_gt") {
+		if (actual > bound) return true;
+		error_out = "expected > " + std::to_string(bound) + ", got " + std::to_string(actual);
+		return false;
+	}
+	if (verb == "expect_lt") {
+		if (actual < bound) return true;
+		error_out = "expected < " + std::to_string(bound) + ", got " + std::to_string(actual);
+		return false;
+	}
+	error_out = "unknown assertion: " + assertion;
+	return false;
+}
+
+static void OrchTestPragma(ClientContext &context, const FunctionParameters &parameters) {
+	Connection con(*context.db);
+	EnsureOrchSchema(con);
+	auto tests = con.Query(
+	    "SELECT task_name, test_idx, query, assertion FROM __orch__.tests "
+	    "ORDER BY task_name, test_idx");
+	if (tests->HasError()) return;
+	int passed = 0, failed = 0;
+	for (idx_t i = 0; i < tests->RowCount(); i++) {
+		string task = tests->GetValue(0, i).ToString();
+		string q = tests->GetValue(2, i).ToString();
+		string a = tests->GetValue(3, i).ToString();
+		string err;
+		bool ok = EvalAssertion(con, q, a, err);
+		if (ok) {
+			passed++;
+		} else {
+			failed++;
+			Printer::Print("FAIL " + task + ": " + a + " — " + err);
+		}
+	}
+	Printer::Print("Tests: " + std::to_string(passed) + " passed, " +
+	               std::to_string(failed) + " failed");
 }
 
 // ========================================================================
@@ -765,6 +942,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "orch_run", static_cast<pragma_function_t>(OrchRunPragma)));
 	loader.RegisterFunction(PragmaFunction::PragmaCall(
 	    "orch_visualize", OrchVisualizePragma, {LogicalType::VARCHAR}));
+	loader.RegisterFunction(PragmaFunction::PragmaStatement(
+	    "orch_test", static_cast<pragma_function_t>(OrchTestPragma)));
 }
 
 void DuckorchExtension::Load(ExtensionLoader &loader) {
