@@ -7,6 +7,7 @@ members = [
     "crates/orch_ol",
     "crates/orch_core",
     "crates/orch_cli",
+    "crates/orch_mcp",
 ]
 resolver = "2"
 
