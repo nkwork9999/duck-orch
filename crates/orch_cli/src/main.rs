@@ -41,6 +41,12 @@ SUBCOMMANDS:
     sensor stop                                 Stop the automation sensor thread
     sensor status                               Show running flag + last tick stats
     sensor set-interval <seconds>               Change the sensor polling interval
+    dynamic list [--json]                       List dynamic assets (Snowflake-style)
+    dynamic refresh <asset> [--json]            Force-run the defining task immediately
+    dynamic create <name> --target-lag <dur> --sql <inline>
+                                                Register one dynamic asset from inline SQL
+    dynamic create-from-sql <file>              Parse Snowflake-style file, register each block
+    dynamic migrate-from-snowflake <file>       Alias of create-from-sql
     help                     Show this help
 
 GLOBAL FLAGS:
@@ -808,6 +814,169 @@ fn cmd_sensor(args: &Args) -> i32 {
     }
 }
 
+// Phase 17: `duck-orch dynamic ...` — Snowflake-compatible Dynamic Asset
+// surface. All subcommands shell into the corresponding `PRAGMA orch_*`
+// implementations; `create-from-sql` / `migrate-from-snowflake` additionally
+// pre-parse the source file via `orch_common::snowflake::parse_snowflake_dump`.
+fn cmd_dynamic(args: &Args) -> i32 {
+    let sub = args.rest.first().map(|s| s.as_str()).unwrap_or("");
+    match sub {
+        "list" => {
+            let (out, err, code) = match run_sql(args, "PRAGMA orch_dynamic_list;", args.json) {
+                Ok(r) => r,
+                Err(e) => { eprintln!("{}", e); return 2; }
+            };
+            if !err.is_empty() { eprintln!("{}", err); }
+            print!("{}", out);
+            code
+        }
+        "refresh" => {
+            if args.rest.len() < 2 {
+                eprintln!("dynamic refresh: missing <asset>");
+                return 2;
+            }
+            let asset = &args.rest[1];
+            let sql = format!("PRAGMA orch_dynamic_refresh({});", sql_escape(asset));
+            let (out, err, code) = match run_sql(args, &sql, args.json) {
+                Ok(r) => r,
+                Err(e) => { eprintln!("{}", e); return 2; }
+            };
+            if !err.is_empty() { eprintln!("{}", err); }
+            print!("{}", out);
+            code
+        }
+        "create" => cmd_dynamic_create(args),
+        "create-from-sql" | "migrate-from-snowflake" => cmd_dynamic_create_from_sql(args),
+        "" => {
+            eprintln!(
+                "dynamic: missing subcommand (list|refresh|create|create-from-sql|migrate-from-snowflake)"
+            );
+            2
+        }
+        other => {
+            eprintln!("unknown dynamic subcommand: {}", other);
+            2
+        }
+    }
+}
+
+fn cmd_dynamic_create(args: &Args) -> i32 {
+    // `duck-orch dynamic create <name> --target-lag <dur> --sql <inline>`
+    let mut rest: Vec<String> = args.rest.iter().skip(1).cloned().collect();
+    let target_lag = match extract_flag_value(&mut rest, "--target-lag") {
+        Some(v) => v,
+        None => { eprintln!("dynamic create: missing --target-lag"); return 2; }
+    };
+    let inline_sql = match extract_flag_value(&mut rest, "--sql") {
+        Some(v) => v,
+        None => { eprintln!("dynamic create: missing --sql"); return 2; }
+    };
+    if rest.is_empty() {
+        eprintln!("dynamic create: missing <name>");
+        return 2;
+    }
+    let name = &rest[0];
+    let sql = format!(
+        "PRAGMA orch_create_dynamic_asset({}, {}, {});",
+        sql_escape(name),
+        sql_escape(&target_lag),
+        sql_escape(&inline_sql)
+    );
+    let (out, err, code) = match run_sql(args, &sql, args.json) {
+        Ok(r) => r,
+        Err(e) => { eprintln!("{}", e); return 2; }
+    };
+    if !err.is_empty() { eprintln!("{}", err); }
+    print!("{}", out);
+    code
+}
+
+fn cmd_dynamic_create_from_sql(args: &Args) -> i32 {
+    if args.rest.len() < 2 {
+        eprintln!("dynamic create-from-sql: missing <file>");
+        return 2;
+    }
+    let path = &args.rest[1];
+    let src = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("dynamic create-from-sql: cannot read {}: {}", path, e);
+            return 2;
+        }
+    };
+    let blocks = orch_common::parse_snowflake_dump(&src);
+    if blocks.is_empty() {
+        if args.json {
+            println!("{{\"created\":0,\"skipped\":0,\"errors\":[],\"results\":[]}}");
+        } else {
+            println!("no CREATE DYNAMIC TABLE/ASSET blocks found in {}", path);
+        }
+        return 0;
+    }
+
+    let mut created = 0usize;
+    let mut skipped = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+    let mut results: Vec<serde_json::Value> = Vec::new();
+    for blk in &blocks {
+        // Default target_lag when omitted: 5 minutes (Snowflake-ish default).
+        let lag = blk.target_lag.clone().unwrap_or_else(|| "5min".to_string());
+        if blk.sql_body.is_empty() {
+            skipped += 1;
+            continue;
+        }
+        let sql = format!(
+            "PRAGMA orch_create_dynamic_asset({}, {}, {});",
+            sql_escape(&blk.name),
+            sql_escape(&lag),
+            sql_escape(&blk.sql_body)
+        );
+        match run_sql(args, &sql, false) {
+            Ok((stdout, stderr, code)) => {
+                if code == 0 {
+                    created += 1;
+                    if args.json {
+                        results.push(serde_json::json!({
+                            "name": blk.name,
+                            "target_lag": lag,
+                            "status": "created",
+                        }));
+                    } else {
+                        println!("created  {}  target_lag={}", blk.name, lag);
+                    }
+                    if !stderr.is_empty() {
+                        eprintln!("{}", stderr);
+                    }
+                    let _ = stdout;
+                } else {
+                    skipped += 1;
+                    let msg = format!("{} failed: {}", blk.name, stderr.trim());
+                    errors.push(msg.clone());
+                    if !args.json {
+                        eprintln!("{}", msg);
+                    }
+                }
+            }
+            Err(e) => {
+                skipped += 1;
+                errors.push(format!("{} spawn-error: {}", blk.name, e));
+            }
+        }
+    }
+    if args.json {
+        let body = serde_json::json!({
+            "created": created,
+            "skipped": skipped,
+            "errors": errors,
+            "results": results,
+        });
+        println!("{}", body);
+    } else {
+        println!("done: {} created, {} skipped, {} errors", created, skipped, errors.len());
+    }
+    if errors.is_empty() { 0 } else { 1 }
+}
+
 fn main() {
     let args = match parse_args() {
         Ok(a) => a,
@@ -827,6 +996,7 @@ fn main() {
         "schedule" => cmd_schedule(&args),
         "automation" => cmd_automation(&args),
         "sensor" => cmd_sensor(&args),
+        "dynamic" => cmd_dynamic(&args),
         "help" | "" => { print!("{}", HELP); 0 }
         other => { eprintln!("unknown subcommand: {}", other); print!("{}", HELP); 2 }
     };
@@ -875,5 +1045,16 @@ mod tests {
     fn sql_escape_quotes() {
         assert_eq!(sql_escape("o'brien"), "'o''brien'");
         assert_eq!(sql_escape("plain"), "'plain'");
+    }
+
+    // Phase 17: regression test for the snowflake re-export through the CLI.
+    // The CLI calls `orch_common::parse_snowflake_dump` in `cmd_dynamic_create_from_sql`
+    // — keep the dependency wired by exercising the symbol here too.
+    #[test]
+    fn dynamic_create_from_sql_reexport_works() {
+        let src = "CREATE DYNAMIC TABLE a TARGET_LAG = '5m' AS SELECT 1;";
+        let blocks = orch_common::parse_snowflake_dump(src);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].name, "a");
     }
 }

@@ -2428,6 +2428,296 @@ static void OrchSensorSetIntervalPragma(ClientContext &context,
 }
 
 // ========================================================================
+// Phase 17: `CREATE DYNAMIC ASSET` SQL surface (Snowflake compatibility)
+//
+// SQL surface is **Option B** (pragma) — DuckDB's ParserExtension API is
+// painful to ship cleanly inside a community extension. The Snowflake
+// `CREATE DYNAMIC TABLE ... AS ...` syntax is reachable via the CLI
+// `duck-orch dynamic create-from-sql <file>`, which regex-scans the file
+// and calls `PRAGMA orch_create_dynamic_asset(...)` per block.
+//
+// Pragmas:
+//   * orch_create_dynamic_asset(name, target_lag, sql)
+//       Insert a synthesized __orch__.tasks + __orch__.assets row pair so
+//       the Phase 15 sensor picks the asset up (automation_condition='eager').
+//   * orch_dynamic_list
+//       List all dynamic-asset rows (the subset of __orch__.assets where
+//       automation_condition IS NOT NULL).
+//   * orch_dynamic_refresh(asset)
+//       Run the defining task right now, bypassing the sensor's throttle.
+// ========================================================================
+
+// Replace `.` with `_` so a dotted asset name like `analytics.user_stats`
+// becomes a safe task identifier (`analytics_user_stats`). Other characters
+// are left alone — the asset name is still SQL-escaped at insert time.
+static string SanitizeTaskName(const string &asset_name) {
+	string out;
+	out.reserve(asset_name.size());
+	for (char c : asset_name) {
+		out.push_back(c == '.' ? '_' : c);
+	}
+	return out;
+}
+
+// Lower-case prefix probe. Used to decide whether to wrap a user SQL body
+// in `CREATE OR REPLACE TABLE <asset> AS ...` or leave it as-is.
+static bool StartsWithKeywordCi(const string &s, const char *kw) {
+	size_t i = 0;
+	while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r')) {
+		i++;
+	}
+	size_t k = 0;
+	while (kw[k] && i + k < s.size()) {
+		char c = s[i + k];
+		if (c >= 'a' && c <= 'z') c = (char)(c - 32);
+		if (c != kw[k]) return false;
+		k++;
+	}
+	return kw[k] == '\0';
+}
+
+// Wrap a bare `SELECT`/`WITH` body in `CREATE OR REPLACE TABLE <asset> AS ...`.
+// If the body already starts with CREATE/INSERT/UPDATE we leave it intact —
+// the user opted out of the auto-wrap.
+static string WrapDynamicSql(const string &asset_name, const string &user_sql) {
+	string body = user_sql;
+	// strip leading whitespace for prefix probe; keep trailing semicolon.
+	if (StartsWithKeywordCi(body, "SELECT") || StartsWithKeywordCi(body, "WITH")) {
+		std::ostringstream o;
+		o << "CREATE OR REPLACE TABLE " << asset_name << " AS " << body;
+		return o.str();
+	}
+	return body;
+}
+
+// Parse a `@target_lag`-style duration string via the Rust FFI. Returns the
+// value in seconds, or throws InvalidInputException on failure.
+static int64_t ParseTargetLagSeconds(const string &raw) {
+	bool ok = false;
+	auto json = CallRustString(
+	    [&](uint8_t **op, size_t *ol) {
+		    return orch_target_lag_parse(reinterpret_cast<const uint8_t *>(raw.c_str()),
+		                                  raw.size(), op, ol);
+	        },
+	    ok);
+	if (!ok) {
+		throw InvalidInputException("orch_create_dynamic_asset: bad target_lag `" + raw +
+		                             "`: " + json);
+	}
+	auto doc = yyjson_ns::yyjson_read(json.c_str(), json.size(), 0);
+	if (!doc) {
+		throw InvalidInputException(
+		    "orch_create_dynamic_asset: target_lag returned invalid JSON");
+	}
+	int64_t secs = 0;
+	auto root = yyjson_ns::yyjson_doc_get_root(doc);
+	if (root) {
+		auto sv = yyjson_ns::yyjson_obj_get(root, "seconds");
+		if (sv) {
+			if (yyjson_ns::yyjson_is_int(sv)) {
+				secs = yyjson_ns::yyjson_get_int(sv);
+			} else if (yyjson_ns::yyjson_is_uint(sv)) {
+				secs = (int64_t)yyjson_ns::yyjson_get_uint(sv);
+			}
+		}
+	}
+	yyjson_ns::yyjson_doc_free(doc);
+	if (secs <= 0) {
+		throw InvalidInputException("orch_create_dynamic_asset: target_lag `" + raw +
+		                             "` resolved to zero seconds");
+	}
+	return secs;
+}
+
+// Call `orch_extract_io` and pick the `inputs` array out. Outputs are
+// determined by the caller (the asset name itself). Returns the inputs as
+// a sorted vector. Best-effort: parse errors yield an empty list.
+static std::vector<string> ExtractInputsFromSql(const string &sql) {
+	std::vector<string> out;
+	bool ok = false;
+	auto json = CallRustString(
+	    [&](uint8_t **op, size_t *ol) {
+		    return orch_extract_io(reinterpret_cast<const uint8_t *>(sql.c_str()),
+		                            sql.size(), op, ol);
+	        },
+	    ok);
+	if (!ok) return out;
+	auto doc = yyjson_ns::yyjson_read(json.c_str(), json.size(), 0);
+	if (!doc) return out;
+	auto root = yyjson_ns::yyjson_doc_get_root(doc);
+	auto inputs = yyjson_ns::yyjson_obj_get(root, "inputs");
+	if (inputs && yyjson_ns::yyjson_is_arr(inputs)) {
+		size_t i, m;
+		yyjson_ns::yyjson_val *v;
+		yyjson_arr_foreach(inputs, i, m, v) {
+			const char *s = yyjson_ns::yyjson_get_str(v);
+			if (s && *s) out.emplace_back(s);
+		}
+	}
+	yyjson_ns::yyjson_doc_free(doc);
+	return out;
+}
+
+// `PRAGMA orch_create_dynamic_asset(name, target_lag, sql)`
+//
+// Synthesizes a Phase 13 task + asset pair from a Snowflake-style dynamic
+// declaration. The asset is given `automation_condition='eager()'` and the
+// supplied `target_lag` so the Phase 15 sensor (`SensorTickOnce` at line
+// ~2287, see commit 5883f47 "Phase 15: AutomationCondition + @target_lag +
+// sensor loop") picks it up on the next tick.
+//
+// Returns a one-row SELECT summarizing the registration so the caller (CLI
+// or DuckDB session) sees the wired-up details immediately.
+static string OrchCreateDynamicAssetPragma(ClientContext &context,
+                                            const FunctionParameters &parameters) {
+	EnsureAssetSchemaCheap(context);
+	if (parameters.values.size() < 3 || parameters.values[0].IsNull() ||
+	    parameters.values[1].IsNull() || parameters.values[2].IsNull()) {
+		throw InvalidInputException(
+		    "orch_create_dynamic_asset requires (name, target_lag, sql)");
+	}
+	string asset_name = parameters.values[0].GetValue<string>();
+	string target_lag_raw = parameters.values[1].GetValue<string>();
+	string user_sql = parameters.values[2].GetValue<string>();
+	if (asset_name.empty() || target_lag_raw.empty() || user_sql.empty()) {
+		throw InvalidInputException(
+		    "orch_create_dynamic_asset: name / target_lag / sql must all be non-empty");
+	}
+
+	int64_t target_lag_seconds = ParseTargetLagSeconds(target_lag_raw);
+	string wrapped_sql = WrapDynamicSql(asset_name, user_sql);
+	string task_name = SanitizeTaskName(asset_name);
+	string code_version = ComputeCodeVersion(wrapped_sql);
+	auto inputs = ExtractInputsFromSql(wrapped_sql);
+
+	Connection con(*context.db);
+	EnsureOrchSchema(con);
+
+	std::ostringstream batch;
+
+	// Render inputs/outputs as VARCHAR[] literals.
+	auto render_list = [](const std::vector<string> &xs) -> string {
+		std::ostringstream o;
+		o << "[";
+		bool first = true;
+		for (auto &x : xs) {
+			if (!first) o << ",";
+			first = false;
+			o << SqlEscape(x);
+		}
+		o << "]::VARCHAR[]";
+		return o.str();
+	};
+	std::vector<string> outputs{asset_name};
+	string inputs_lit = render_list(inputs);
+	string outputs_lit = render_list(outputs);
+
+	batch << "INSERT OR REPLACE INTO __orch__.tasks "
+	      << "(name, description, owner, sql, inputs, outputs, depends_on, "
+	      << "schedule_cron, retries, timeout_seconds, incremental_by, tags, "
+	      << "file_path, partitions_json, params_json) VALUES ("
+	      << SqlEscape(task_name) << ", "
+	      << SqlEscape(string("dynamic asset: ") + asset_name) << ", "
+	      << "NULL, "
+	      << SqlEscape(wrapped_sql) << ", "
+	      << inputs_lit << ", "
+	      << outputs_lit << ", "
+	      << "[]::VARCHAR[], "
+	      << "NULL, 0, NULL, NULL, "
+	      << "[]::VARCHAR[], "
+	      << "NULL, NULL, NULL);\n";
+
+	// Asset upsert. automation_condition is the canonical eager() DSL —
+	// same shape Rust's `Task.automation_dsl` produces in Phase 15 so the
+	// sensor's existing parser accepts it without any branch.
+	batch << "INSERT INTO __orch__.assets "
+	      << "(name, kind, location, group_name, owner, description, "
+	      << "code_version, defined_by_task, tags, "
+	      << "automation_condition, target_lag_seconds) VALUES ("
+	      << SqlEscape(asset_name) << ", "
+	      << SqlEscape(string("table")) << ", "
+	      << "NULL, NULL, NULL, "
+	      << SqlEscape(string("dynamic asset: ") + asset_name) << ", "
+	      << SqlEscape(code_version) << ", "
+	      << SqlEscape(task_name) << ", "
+	      << "[]::VARCHAR[], "
+	      << SqlEscape(string("eager()")) << ", "
+	      << target_lag_seconds
+	      << ") ON CONFLICT (name) DO UPDATE SET "
+	      << "kind=EXCLUDED.kind, "
+	      << "description=EXCLUDED.description, "
+	      << "code_version=EXCLUDED.code_version, "
+	      << "defined_by_task=EXCLUDED.defined_by_task, "
+	      << "automation_condition=EXCLUDED.automation_condition, "
+	      << "target_lag_seconds=EXCLUDED.target_lag_seconds;\n";
+
+	// Project asset_edges from inputs × outputs, just like orch_register
+	// does at the tail. Only Asset-to-Asset edges land; raw.* style source
+	// tables that aren't registered as Assets are silently dropped.
+	batch << "INSERT OR IGNORE INTO __orch__.asset_edges "
+	      << "(upstream_asset, downstream_asset, via_task, edge_type) "
+	      << "SELECT i.input, o.output, t.name, 'declared' "
+	      << "FROM __orch__.tasks t, "
+	      << "     UNNEST(t.inputs)  AS i(input), "
+	      << "     UNNEST(t.outputs) AS o(output) "
+	      << "WHERE t.name = " << SqlEscape(task_name)
+	      << "  AND EXISTS (SELECT 1 FROM __orch__.assets a WHERE a.name = i.input) "
+	      << "  AND EXISTS (SELECT 1 FROM __orch__.assets a WHERE a.name = o.output);\n";
+
+	auto exec_result = con.Query(batch.str());
+	if (exec_result->HasError()) {
+		throw InvalidInputException("orch_create_dynamic_asset exec failed: " +
+		                             exec_result->GetError());
+	}
+
+	// Single-row summary back to the caller: name, target_lag_seconds and the
+	// detected upstream dependencies (a VARCHAR[]).
+	std::ostringstream out;
+	out << "SELECT " << SqlEscape(asset_name) << " AS name, "
+	    << target_lag_seconds << "::BIGINT AS target_lag_seconds, "
+	    << inputs_lit << " AS dependencies;";
+	return out.str();
+}
+
+// `PRAGMA orch_dynamic_list` — every automation-driven asset (the set
+// `CREATE DYNAMIC ASSET` produces), sorted by name. Reuses the Phase 15
+// `automation_condition IS NOT NULL` filter so manually-declared
+// `@automation eager` tasks show up alongside `CREATE DYNAMIC ASSET` ones.
+static string OrchDynamicListPragma(ClientContext &context,
+                                      const FunctionParameters &parameters) {
+	EnsureAssetSchemaCheap(context);
+	(void)parameters;
+	return "SELECT name, target_lag_seconds, automation_condition, "
+	       "defined_by_task "
+	       "FROM __orch__.assets "
+	       "WHERE automation_condition IS NOT NULL "
+	       "ORDER BY name;";
+}
+
+// `PRAGMA orch_dynamic_refresh('asset.name')` — force-run the defining
+// task immediately, ignoring the target_lag throttle. Mirrors the
+// sensor's wire-up (`SensorTickOnce` -> `RunSingleTask`) but skips the
+// `EvaluateAutomationOnce` step.
+static void OrchDynamicRefreshPragma(ClientContext &context,
+                                       const FunctionParameters &parameters) {
+	Connection con(*context.db);
+	EnsureOrchSchema(con);
+	if (parameters.values.empty() || parameters.values[0].IsNull()) {
+		throw InvalidInputException("orch_dynamic_refresh requires an asset name");
+	}
+	string asset = parameters.values[0].GetValue<string>();
+	string task_name = LookupDefiningTask(con, asset);
+	if (task_name.empty()) {
+		throw InvalidInputException(
+		    "orch_dynamic_refresh: no task defines asset `" + asset + "`");
+	}
+	auto task = LoadTaskRowByName(con, task_name);
+	auto pipeline_uuid =
+	    con.Query("SELECT uuid()::VARCHAR")->GetValue(0, 0).ToString();
+	RunSingleTask(con, task, pipeline_uuid, string());
+}
+
+// ========================================================================
 // Configuration callbacks
 // ========================================================================
 
@@ -2988,6 +3278,17 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "orch_sensor_set_interval",
 	    static_cast<pragma_function_t>(OrchSensorSetIntervalPragma),
 	    {LogicalType::BIGINT}));
+
+	// Phase 17: Dynamic Asset surface (Snowflake compat).
+	loader.RegisterFunction(PragmaFunction::PragmaCall(
+	    "orch_create_dynamic_asset", OrchCreateDynamicAssetPragma,
+	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}));
+	loader.RegisterFunction(PragmaFunction::PragmaStatement(
+	    "orch_dynamic_list", OrchDynamicListPragma));
+	loader.RegisterFunction(PragmaFunction::PragmaCall(
+	    "orch_dynamic_refresh",
+	    static_cast<pragma_function_t>(OrchDynamicRefreshPragma),
+	    {LogicalType::VARCHAR}));
 }
 
 void DuckorchExtension::Load(ExtensionLoader &loader) {
