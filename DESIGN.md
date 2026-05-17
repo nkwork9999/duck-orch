@@ -17,8 +17,11 @@ SQLMesh 風のファイルフォーマット + Claude エージェント連携�
 | 7 | インクリメンタル(Jinja {{ var }} + 動的 watermark)+ @test | ✅ 完了 |
 | 8 | スケジューラ(CLI daemon + cron) | ✅ 完了 |
 | 9 | OpenLineage HTTP 発行(背景 worker thread + queue) | ✅ 完了 |
+| 11-17 | **Asset 一級化 + MCP + Snowflake Dynamic Tables 互換** | 📋 設計確定 → [ROADMAP.md](ROADMAP.md) |
 
 検証済み: 4タスクの DAG パイプラインが PRAGMA / CLI 両方で動作、Mermaid 出力、並列実行、インクリメンタル差分、OL イベント送信、cron 登録すべて確認済み。
+
+**Phase 11 以降の設計は [ROADMAP.md](ROADMAP.md) を参照** (Asset 中心アーキテクチャへの転換、MCP サーバ追加、Snowflake `TARGET_LAG` 互換、3 経路 CLI/SQL/MCP カバレッジ)。
 
 ---
 

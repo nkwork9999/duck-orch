@@ -9,3 +9,4 @@ crate-type = ["rlib"]
 
 [dependencies]
 sqlparser = "0.52"
+serde = { version = "1", features = ["derive"] }

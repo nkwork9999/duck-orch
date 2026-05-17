@@ -27,6 +27,13 @@ int32_t orch_load_directory(const uint8_t *path_ptr, size_t path_len,
 int32_t orch_extract_io(const uint8_t *sql_ptr, size_t sql_len,
                          uint8_t **out_ptr, size_t *out_len);
 
+// Extract column-level lineage. schema_json is optional (empty string ok),
+// used to resolve `SELECT *`. Returns JSON array of ExtractResult.
+int32_t orch_extract_column_lineage(
+    const uint8_t *sql_ptr, size_t sql_len,
+    const uint8_t *schema_json_ptr, size_t schema_json_len,
+    uint8_t **out_ptr, size_t *out_len);
+
 // Build DAG. Input: JSON array of Tasks. Returns DagResult JSON.
 int32_t orch_build_dag(const uint8_t *tasks_json_ptr, size_t tasks_json_len,
                         uint8_t **out_ptr, size_t *out_len);
@@ -56,5 +63,60 @@ int32_t orch_ol_emit(const uint8_t *ptr, size_t len);
 // Topological layers for parallel execution (Phase 5)
 int32_t orch_topo_layers(const uint8_t *tasks_json_ptr, size_t tasks_json_len,
                           uint8_t **out_ptr, size_t *out_len);
+
+// Phase 13: canonical SQL code_version (FNV-1a 64-bit hex) for Asset rows.
+int32_t orch_sql_code_version(const uint8_t *sql_ptr, size_t sql_len,
+                               uint8_t **out_ptr, size_t *out_len);
+
+// Phase 13 m2: render Mermaid centered on `focal_asset`. `edges_json` is a
+// JSON array of `{upstream_asset, downstream_asset, via_task, edge_type}`
+// rows pre-filtered by the caller (no transitive closure done Rust-side).
+int32_t orch_render_asset_lineage(const uint8_t *focal_ptr, size_t focal_len,
+                                   const uint8_t *edges_json_ptr,
+                                   size_t edges_json_len, uint8_t **out_ptr,
+                                   size_t *out_len);
+
+// Phase 14: expand a PartitionDef into concrete keys. `def_json` is the
+// serde-serialized PartitionDef carried on Task.partitions. `range_json`
+// is optional `{"from":"YYYY-MM-DD","to":"YYYY-MM-DD"}` for daily; pass
+// empty string to use the natural range. Output: JSON array of
+// `{key, dimension_values: {...}}` rows.
+int32_t orch_partition_expand(const uint8_t *def_json_ptr, size_t def_json_len,
+                               const uint8_t *range_json_ptr, size_t range_json_len,
+                               uint8_t **out_ptr, size_t *out_len);
+
+// Phase 14: split a partition key into per-dimension `(name, value)` pairs.
+// Returns a JSON array; for non-Multi defs it's a single element with
+// name="partition_key".
+int32_t orch_partition_split_key(const uint8_t *def_json_ptr, size_t def_json_len,
+                                  const uint8_t *key_ptr, size_t key_len,
+                                  uint8_t **out_ptr, size_t *out_len);
+
+// Phase 14: render the calendar-style ASCII for an Asset. `rows_json` is
+// `[{"key":..., "status": null|"success"|"failed"|"in_progress"}, ...]`.
+int32_t orch_render_partition_calendar(const uint8_t *asset_ptr, size_t asset_len,
+                                        const uint8_t *def_json_ptr, size_t def_json_len,
+                                        const uint8_t *rows_json_ptr, size_t rows_json_len,
+                                        uint8_t **out_ptr, size_t *out_len);
+
+// Phase 15: AutomationCondition surface.
+//
+// `orch_automation_parse` validates a DSL string. Output:
+//   `{"dsl": "...canonical...", "ast": <serde-json>}` on success
+//   `{"error": "..."}` on failure (return -1).
+int32_t orch_automation_parse(const uint8_t *src_ptr, size_t src_len,
+                               uint8_t **out_ptr, size_t *out_len);
+
+// `orch_automation_evaluate` evaluates a stored condition against a context
+// snapshot. `ctx_json` is a JSON object with `EvalContext` fields (snake_case).
+// Output: `{"condition_met": bool, "reason": "...", "dsl": "..."}`.
+int32_t orch_automation_evaluate(const uint8_t *cond_dsl_ptr, size_t cond_dsl_len,
+                                  const uint8_t *ctx_json_ptr, size_t ctx_json_len,
+                                  uint8_t **out_ptr, size_t *out_len);
+
+// `orch_target_lag_parse` parses a `@target_lag` duration string and returns
+// `{"seconds": N}`.
+int32_t orch_target_lag_parse(const uint8_t *src_ptr, size_t src_len,
+                               uint8_t **out_ptr, size_t *out_len);
 
 }
