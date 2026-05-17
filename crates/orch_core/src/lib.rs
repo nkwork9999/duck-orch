@@ -330,6 +330,47 @@ pub extern "C" fn orch_sql_code_version(
 }
 
 // ---------------------------------------------------------------------------
+// Phase 13 m2: Asset-level Mermaid renderer
+// ---------------------------------------------------------------------------
+
+/// Render a Mermaid graph centered on `focal_asset`. `edges_json` is a JSON
+/// array of `{upstream_asset, downstream_asset, via_task, edge_type}` rows
+/// that the C++ caller has already pulled from `__orch__.asset_edges`
+/// (typically upstream-of + downstream-of the focal asset). No transitive
+/// closure is performed Rust-side.
+#[unsafe(no_mangle)]
+pub extern "C" fn orch_render_asset_lineage(
+    focal_ptr: *const u8,
+    focal_len: usize,
+    edges_json_ptr: *const u8,
+    edges_json_len: usize,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        let focal = unsafe { read_str(focal_ptr, focal_len) };
+        let edges_json = unsafe { read_str(edges_json_ptr, edges_json_len) };
+        let edges: Vec<orch_dag::mermaid::AssetEdge> = if edges_json.is_empty() {
+            Vec::new()
+        } else {
+            match serde_json::from_str(edges_json) {
+                Ok(v) => v,
+                Err(e) => {
+                    return err_to_buf(
+                        &format!("invalid edges json: {}", e),
+                        out_ptr,
+                        out_len,
+                    );
+                }
+            }
+        };
+        let s = orch_dag::mermaid::render_asset_lineage(focal, &edges);
+        write_out(s, out_ptr, out_len)
+    }))
+    .unwrap_or(-1)
+}
+
+// ---------------------------------------------------------------------------
 // OpenLineage (orch_ol)
 // ---------------------------------------------------------------------------
 

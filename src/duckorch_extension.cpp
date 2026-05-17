@@ -1076,6 +1076,24 @@ static void OrchRunPragma(ClientContext &context, const FunctionParameters &para
 		}
 	}
 	yyjson_ns::yyjson_doc_free(doc2);
+
+	// Phase 13 m2: project __orch__.lineage_edges into __orch__.asset_edges.
+	// Both ends must be registered Assets (auto-derived from @outputs or
+	// explicitly via @asset) to count as a real Asset edge — anonymous
+	// upstreams (e.g. raw source files not declared as Assets) get dropped
+	// here. Idempotent: INSERT OR IGNORE keys on
+	// (upstream_asset, downstream_asset, via_task).
+	{
+		const char *kProject =
+		    "INSERT OR IGNORE INTO __orch__.asset_edges "
+		    "(upstream_asset, downstream_asset, via_task, edge_type) "
+		    "SELECT le.src_dataset, le.dst_dataset, le.via_task, "
+		    "       COALESCE(NULLIF(le.transform_type, ''), 'direct') AS edge_type "
+		    "FROM __orch__.lineage_edges le "
+		    "WHERE EXISTS (SELECT 1 FROM __orch__.assets a WHERE a.name = le.src_dataset) "
+		    "  AND EXISTS (SELECT 1 FROM __orch__.assets a WHERE a.name = le.dst_dataset);";
+		con.Query(kProject);
+	}
 }
 
 // ========================================================================
@@ -1234,6 +1252,169 @@ static string OrchVisualizePragma(ClientContext &context, const FunctionParamete
 
 	std::ostringstream sql;
 	sql << "SELECT " << SqlEscape(mermaid) << " AS mermaid;";
+	return sql.str();
+}
+
+// ========================================================================
+// Phase 13 m2: Asset read-side pragmas (`pragma_query_t`).
+//
+// All return a SELECT statement so duckdb prints rows like any other query
+// and the Rust CLI can pipe through `.mode json`. Match the existing
+// `orch_visualize` pattern — no new TableFunction infrastructure needed.
+// ========================================================================
+
+// Make sure the Asset schema exists before each query. Cheap (CREATE IF NOT
+// EXISTS only) and protects against callers who hit asset pragmas before
+// `orch_init` / `orch_register` have run.
+static void EnsureAssetSchemaCheap(ClientContext &context) {
+	Connection con(*context.db);
+	EnsureOrchSchema(con);
+}
+
+// PRAGMA orch_asset_list()                — all assets.
+// PRAGMA orch_asset_list_group(group_name) — filter by group_name (empty
+//                                            string = all). Two-pragma split
+//                                            sidesteps DuckDB pragma optional
+//                                            positional-arg quirks.
+static string OrchAssetListPragma(ClientContext &context, const FunctionParameters &parameters) {
+	EnsureAssetSchemaCheap(context);
+	(void)parameters;
+	return "SELECT name, kind, group_name, owner, description, "
+	       "code_version, defined_by_task, tags, created_at "
+	       "FROM __orch__.assets ORDER BY name;";
+}
+
+static string OrchAssetListGroupPragma(ClientContext &context,
+                                        const FunctionParameters &parameters) {
+	EnsureAssetSchemaCheap(context);
+	string group_filter;
+	if (!parameters.values.empty() && !parameters.values[0].IsNull()) {
+		group_filter = parameters.values[0].GetValue<string>();
+	}
+	std::ostringstream sql;
+	sql << "SELECT name, kind, group_name, owner, description, "
+	    << "code_version, defined_by_task, tags, created_at "
+	    << "FROM __orch__.assets";
+	if (!group_filter.empty()) {
+		sql << " WHERE group_name = " << SqlEscape(group_filter);
+	}
+	sql << " ORDER BY name;";
+	return sql.str();
+}
+
+static string OrchAssetShowPragma(ClientContext &context, const FunctionParameters &parameters) {
+	EnsureAssetSchemaCheap(context);
+	if (parameters.values.empty() || parameters.values[0].IsNull()) {
+		throw InvalidInputException("orch_asset_show requires an asset name");
+	}
+	string name = parameters.values[0].GetValue<string>();
+	std::ostringstream sql;
+	sql << "SELECT name, kind, location, group_name, owner, description, "
+	    << "code_version, defined_by_task, tags, created_at "
+	    << "FROM __orch__.assets WHERE name = " << SqlEscape(name) << ";";
+	return sql.str();
+}
+
+static string OrchAssetMaterializationsPragma(ClientContext &context,
+                                                const FunctionParameters &parameters) {
+	EnsureAssetSchemaCheap(context);
+	if (parameters.values.empty() || parameters.values[0].IsNull()) {
+		throw InvalidInputException(
+		    "orch_asset_materializations requires an asset name");
+	}
+	string name = parameters.values[0].GetValue<string>();
+	int64_t limit = 50;
+	if (parameters.values.size() > 1 && !parameters.values[1].IsNull()) {
+		limit = parameters.values[1].GetValue<int64_t>();
+		if (limit <= 0) limit = 50;
+	}
+	std::ostringstream sql;
+	sql << "SELECT asset_name, partition_key, materialized_at, run_id, "
+	    << "rows, bytes, status FROM __orch__.asset_materializations "
+	    << "WHERE asset_name = " << SqlEscape(name)
+	    << " ORDER BY materialized_at DESC LIMIT " << limit << ";";
+	return sql.str();
+}
+
+// Render Mermaid centered on `focal`. Pulls upstream + downstream edges
+// (one hop each direction) from `__orch__.asset_edges` and hands off to the
+// Rust Mermaid renderer via FFI. Returns a single-row SELECT '...' AS mermaid.
+static string OrchAssetLineagePragma(ClientContext &context,
+                                      const FunctionParameters &parameters) {
+	EnsureAssetSchemaCheap(context);
+	if (parameters.values.empty() || parameters.values[0].IsNull()) {
+		throw InvalidInputException("orch_asset_lineage requires an asset name");
+	}
+	string focal = parameters.values[0].GetValue<string>();
+	Connection con(*context.db);
+
+	std::ostringstream eq;
+	eq << "SELECT to_json(list({"
+	   << "upstream_asset: upstream_asset, "
+	   << "downstream_asset: downstream_asset, "
+	   << "via_task: via_task, "
+	   << "edge_type: edge_type})) "
+	   << "FROM __orch__.asset_edges "
+	   << "WHERE upstream_asset = " << SqlEscape(focal)
+	   << " OR downstream_asset = " << SqlEscape(focal) << ";";
+	string edges_json = "[]";
+	auto er = con.Query(eq.str());
+	if (!er->HasError() && er->RowCount() > 0 && !er->GetValue(0, 0).IsNull()) {
+		auto v = er->GetValue(0, 0).ToString();
+		if (!v.empty() && v != "NULL") {
+			edges_json = v;
+		}
+	}
+
+	bool ok = false;
+	auto mermaid = CallRustString(
+	    [&](uint8_t **op, size_t *ol) {
+		    return orch_render_asset_lineage(
+		        reinterpret_cast<const uint8_t *>(focal.c_str()), focal.size(),
+		        reinterpret_cast<const uint8_t *>(edges_json.c_str()),
+		        edges_json.size(), op, ol);
+	        },
+	    ok);
+	if (!ok) {
+		return "SELECT 'asset lineage render failed' AS mermaid;";
+	}
+	std::ostringstream sql;
+	sql << "SELECT " << SqlEscape(mermaid) << " AS mermaid;";
+	return sql.str();
+}
+
+// Best-effort per-Asset health: last materialization status + age (seconds),
+// total/successful/failed runs in the last 24h. NULL columns for Assets that
+// have never materialized.
+static string OrchAssetHealthPragma(ClientContext &context,
+                                     const FunctionParameters &parameters) {
+	EnsureAssetSchemaCheap(context);
+	(void)parameters;
+	std::ostringstream sql;
+	sql << "WITH latest AS ("
+	    << "  SELECT asset_name, status AS last_status, materialized_at AS last_at "
+	    << "  FROM __orch__.asset_materializations "
+	    << "  QUALIFY row_number() OVER (PARTITION BY asset_name ORDER BY materialized_at DESC) = 1"
+	    << "), recent AS ("
+	    << "  SELECT asset_name, "
+	    << "         count(*) AS runs_24h, "
+	    << "         count(*) FILTER (WHERE status = 'failed') AS failed_24h, "
+	    << "         count(*) FILTER (WHERE status = 'success') AS success_24h "
+	    << "  FROM __orch__.asset_materializations "
+	    << "  WHERE materialized_at >= current_timestamp - INTERVAL 24 HOUR "
+	    << "  GROUP BY asset_name"
+	    << ") "
+	    << "SELECT a.name AS asset_name, a.kind, a.group_name, "
+	    << "       l.last_status, l.last_at, "
+	    << "       CASE WHEN l.last_at IS NULL THEN NULL "
+	    << "            ELSE epoch(current_timestamp - l.last_at) END AS age_seconds, "
+	    << "       COALESCE(r.runs_24h, 0)    AS runs_24h, "
+	    << "       COALESCE(r.success_24h, 0) AS success_24h, "
+	    << "       COALESCE(r.failed_24h, 0)  AS failed_24h "
+	    << "FROM __orch__.assets a "
+	    << "LEFT JOIN latest l ON l.asset_name = a.name "
+	    << "LEFT JOIN recent r ON r.asset_name = a.name "
+	    << "ORDER BY a.name;";
 	return sql.str();
 }
 
@@ -1748,6 +1929,22 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "orch_visualize", OrchVisualizePragma, {LogicalType::VARCHAR}));
 	loader.RegisterFunction(PragmaFunction::PragmaStatement(
 	    "orch_test", static_cast<pragma_function_t>(OrchTestPragma)));
+
+	// Phase 13 m2: Asset read-side pragmas. All `pragma_query_t` — they
+	// return a SELECT statement so duckdb prints rows natively.
+	loader.RegisterFunction(PragmaFunction::PragmaStatement(
+	    "orch_asset_list", OrchAssetListPragma));
+	loader.RegisterFunction(PragmaFunction::PragmaCall(
+	    "orch_asset_list_group", OrchAssetListGroupPragma, {LogicalType::VARCHAR}));
+	loader.RegisterFunction(PragmaFunction::PragmaCall(
+	    "orch_asset_show", OrchAssetShowPragma, {LogicalType::VARCHAR}));
+	loader.RegisterFunction(PragmaFunction::PragmaCall(
+	    "orch_asset_materializations", OrchAssetMaterializationsPragma,
+	    {LogicalType::VARCHAR, LogicalType::BIGINT}));
+	loader.RegisterFunction(PragmaFunction::PragmaCall(
+	    "orch_asset_lineage", OrchAssetLineagePragma, {LogicalType::VARCHAR}));
+	loader.RegisterFunction(PragmaFunction::PragmaStatement(
+	    "orch_asset_health", OrchAssetHealthPragma));
 }
 
 void DuckorchExtension::Load(ExtensionLoader &loader) {

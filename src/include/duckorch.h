@@ -68,4 +68,12 @@ int32_t orch_topo_layers(const uint8_t *tasks_json_ptr, size_t tasks_json_len,
 int32_t orch_sql_code_version(const uint8_t *sql_ptr, size_t sql_len,
                                uint8_t **out_ptr, size_t *out_len);
 
+// Phase 13 m2: render Mermaid centered on `focal_asset`. `edges_json` is a
+// JSON array of `{upstream_asset, downstream_asset, via_task, edge_type}`
+// rows pre-filtered by the caller (no transitive closure done Rust-side).
+int32_t orch_render_asset_lineage(const uint8_t *focal_ptr, size_t focal_len,
+                                   const uint8_t *edges_json_ptr,
+                                   size_t edges_json_len, uint8_t **out_ptr,
+                                   size_t *out_len);
+
 }
