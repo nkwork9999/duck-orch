@@ -59,12 +59,42 @@ pub struct Task {
     /// `automation = eager() throttle <N>` — the throttle is applied by the
     /// evaluator (see `automation::evaluate`).
     pub target_lag_seconds: Option<u64>,
+    /// Phase 16: `-- @freshness max_lag=<duration>` value in seconds. The
+    /// evaluator's `FreshnessViolated` condition reads this from
+    /// `EvalContext.freshness_lag_seconds`; the C++ asset upsert writes it
+    /// into `__orch__.assets.freshness_lag_seconds`. `None` = no policy.
+    pub freshness_lag_seconds: Option<u64>,
+    /// Phase 16: data-quality checks declared via `-- @check ...` headers.
+    /// Promoted to the new `__orch__.asset_checks` table at register time.
+    /// Order is preserved so re-registration is stable.
+    pub checks: Vec<AssetCheck>,
+    /// Phase 16: severity applied to every check on this asset. `None` ⇒
+    /// `'error'` at the C++ side (blocks downstream on failure); explicit
+    /// `'warn'` keeps the run successful and only logs.
+    pub check_severity: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskTest {
     pub query: String,
     pub assertion: String,
+}
+
+/// Phase 16: a single data-quality check declared via `-- @check ...`.
+///
+/// `${asset}` in `sql` is substituted with the owning Asset's name at
+/// execution time (see `PRAGMA orch_check_run`). The check passes when the
+/// scalar result (first column of first row) compares true against
+/// `expect_value` per `expect_type`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssetCheck {
+    pub name: String,
+    pub sql: String,
+    /// One of `"eq" | "gt" | "lt" | "between" | "not_null"`.
+    pub expect_type: String,
+    /// String-form expected value. `between` takes `"<low>,<high>"`;
+    /// `not_null` ignores this field.
+    pub expect_value: String,
 }
 
 /// Declared DuckDB-native parameter on a task: `$name` with a SQL type.

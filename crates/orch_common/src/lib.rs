@@ -17,4 +17,4 @@ pub use automation::{
 };
 pub use hash::{fnv1a_64, sql_code_version};
 pub use partition::{parse_partition_decl, PartitionDef, PartitionParseError};
-pub use task::{ParamSpec, ParamType, Task, TaskTest};
+pub use task::{AssetCheck, ParamSpec, ParamType, Task, TaskTest};

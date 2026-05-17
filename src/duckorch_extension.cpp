@@ -362,6 +362,40 @@ CREATE TABLE IF NOT EXISTS __orch__.automation_evaluations (
     reason VARCHAR,
     PRIMARY KEY (asset_name, evaluated_at)
 );
+
+-- Phase 16: Freshness policy + Asset Check ------------------------------
+--
+-- `freshness_lag_seconds` lives on the assets row so the sensor's
+-- BuildEvalContextJson can pass it to the FreshnessViolated evaluator with
+-- one extra column lookup (no join). Wired from the `-- @freshness ...`
+-- header.
+ALTER TABLE __orch__.assets ADD COLUMN IF NOT EXISTS freshness_lag_seconds BIGINT;
+
+-- One row per declared `-- @check ...` (or legacy `-- @test ...` promoted
+-- as `test_<N>`). Re-registration UPSERTs by (asset_name, check_name).
+CREATE TABLE IF NOT EXISTS __orch__.asset_checks (
+    asset_name VARCHAR,
+    check_name VARCHAR,
+    sql VARCHAR,
+    expect_type VARCHAR,         -- 'eq' | 'gt' | 'lt' | 'between' | 'not_null'
+    expect_value VARCHAR,        -- string-form; cast at compare time
+    severity VARCHAR,            -- 'error' | 'warn'
+    PRIMARY KEY (asset_name, check_name)
+);
+
+-- One row per check execution. PK includes executed_at so multiple runs
+-- in the same second on different checks coexist; status is 'pass' or
+-- 'fail'. actual_value is the scalar (column 0, row 0) returned by the
+-- check SQL, rendered as VARCHAR for portability.
+CREATE TABLE IF NOT EXISTS __orch__.asset_check_results (
+    asset_name VARCHAR,
+    check_name VARCHAR,
+    run_id UUID,
+    executed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    status VARCHAR,              -- 'pass' | 'fail'
+    actual_value VARCHAR,
+    PRIMARY KEY (asset_name, check_name, executed_at)
+);
 )";
 
 static void EnsureOrchSchema(Connection &con) {
@@ -593,6 +627,32 @@ static void OrchRegisterPragma(ClientContext &context, const FunctionParameters 
 				}
 			}
 
+			// Phase 16: `-- @freshness max_lag=<duration>` value (seconds).
+			// Stored on __orch__.assets.freshness_lag_seconds. NULL => no
+			// freshness policy, in which case `freshness_violated()` always
+			// returns false.
+			int64_t freshness_lag = 0;
+			bool freshness_lag_set = false;
+			{
+				auto fv = yyjson_ns::yyjson_obj_get(t, "freshness_lag_seconds");
+				if (fv && !yyjson_ns::yyjson_is_null(fv)) {
+					if (yyjson_ns::yyjson_is_int(fv)) {
+						freshness_lag = yyjson_ns::yyjson_get_int(fv);
+						freshness_lag_set = true;
+					} else if (yyjson_ns::yyjson_is_uint(fv)) {
+						freshness_lag = (int64_t)yyjson_ns::yyjson_get_uint(fv);
+						freshness_lag_set = true;
+					}
+				}
+			}
+
+			// Phase 16: per-asset check severity. NULL/empty => 'error'.
+			string check_severity = get_str("check_severity");
+			if (check_severity.empty()) check_severity = "error";
+			// Checks array — promoted into __orch__.asset_checks after the
+			// primary asset is known (down below).
+			auto checks_json = yyjson_ns::yyjson_obj_get(t, "checks");
+
 			// Helper to render the upsert for one Asset row. Re-registering a
 			// task UPDATEs the row (preserves created_at via DO UPDATE).
 			//
@@ -612,10 +672,17 @@ static void OrchRegisterPragma(ClientContext &context, const FunctionParameters 
 				string target_lag_lit = target_lag_set
 				                            ? std::to_string(target_lag)
 				                            : string("NULL");
+				// Phase 16: also write freshness_lag_seconds. Re-registering
+				// without `@freshness` clears the column so the source SQL
+				// stays authoritative (mirrors automation_condition behavior).
+				string freshness_lit = freshness_lag_set
+				                           ? std::to_string(freshness_lag)
+				                           : string("NULL");
 				sql << "INSERT INTO __orch__.assets "
 				    << "(name, kind, location, group_name, owner, description, "
 				    << "code_version, defined_by_task, tags, "
-				    << "automation_condition, target_lag_seconds) VALUES ("
+				    << "automation_condition, target_lag_seconds, "
+				    << "freshness_lag_seconds) VALUES ("
 				    << SqlEscape(a_name) << ", "
 				    << SqlEscape(a_kind) << ", "
 				    << "NULL, "
@@ -626,7 +693,8 @@ static void OrchRegisterPragma(ClientContext &context, const FunctionParameters 
 				    << SqlEscape(name) << ", "
 				    << tags_literal << ", "
 				    << automation_lit << ", "
-				    << target_lag_lit
+				    << target_lag_lit << ", "
+				    << freshness_lit
 				    << ") ON CONFLICT (name) DO UPDATE SET "
 				    << "kind=EXCLUDED.kind, "
 				    << "group_name=EXCLUDED.group_name, "
@@ -636,7 +704,8 @@ static void OrchRegisterPragma(ClientContext &context, const FunctionParameters 
 				    << "defined_by_task=EXCLUDED.defined_by_task, "
 				    << "tags=EXCLUDED.tags, "
 				    << "automation_condition=EXCLUDED.automation_condition, "
-				    << "target_lag_seconds=EXCLUDED.target_lag_seconds;\n";
+				    << "target_lag_seconds=EXCLUDED.target_lag_seconds, "
+				    << "freshness_lag_seconds=EXCLUDED.freshness_lag_seconds;\n";
 			};
 
 			// Determine the "primary asset" for this task so Phase 14 can
@@ -663,6 +732,44 @@ static void OrchRegisterPragma(ClientContext &context, const FunctionParameters 
 					emit_asset_upsert(out_name, string("table"), asset_group,
 					                   task_owner, task_desc, tags_lit);
 					if (primary_asset.empty()) primary_asset = out_name;
+				}
+			}
+
+			// Phase 16: promote `task.checks` into __orch__.asset_checks for
+			// the primary asset. Re-registration is the source of truth: drop
+			// every existing check on this asset, then re-insert from the
+			// header bundle. The legacy `__orch__.tests` table is still
+			// populated by the @test branch above for back-compat with
+			// `PRAGMA orch_test`.
+			if (!primary_asset.empty()) {
+				sql << "DELETE FROM __orch__.asset_checks WHERE asset_name = "
+				    << SqlEscape(primary_asset) << ";\n";
+				if (checks_json && yyjson_ns::yyjson_is_arr(checks_json)) {
+					size_t cidx, cmax;
+					yyjson_ns::yyjson_val *cv;
+					yyjson_arr_foreach(checks_json, cidx, cmax, cv) {
+						auto cnv = yyjson_ns::yyjson_obj_get(cv, "name");
+						auto csv = yyjson_ns::yyjson_obj_get(cv, "sql");
+						auto ctv = yyjson_ns::yyjson_obj_get(cv, "expect_type");
+						auto cvv = yyjson_ns::yyjson_obj_get(cv, "expect_value");
+						const char *cn = cnv ? yyjson_ns::yyjson_get_str(cnv) : nullptr;
+						const char *cs = csv ? yyjson_ns::yyjson_get_str(csv) : nullptr;
+						const char *ct = ctv ? yyjson_ns::yyjson_get_str(ctv) : "eq";
+						const char *cval = cvv ? yyjson_ns::yyjson_get_str(cvv) : "";
+						if (!cn || !cs) continue;
+						sql << "INSERT INTO __orch__.asset_checks "
+						    << "(asset_name, check_name, sql, expect_type, expect_value, severity) "
+						    << "VALUES ("
+						    << SqlEscape(primary_asset) << ", "
+						    << SqlEscape(string(cn)) << ", "
+						    << SqlEscape(string(cs)) << ", "
+						    << SqlEscape(string(ct ? ct : "eq")) << ", "
+						    << SqlEscape(string(cval ? cval : "")) << ", "
+						    << SqlEscape(check_severity)
+						    << ") ON CONFLICT (asset_name, check_name) DO UPDATE SET "
+						    << "sql=EXCLUDED.sql, expect_type=EXCLUDED.expect_type, "
+						    << "expect_value=EXCLUDED.expect_value, severity=EXCLUDED.severity;\n";
+					}
 				}
 			}
 
@@ -953,6 +1060,21 @@ BuildParamValues(const string &params_json,
 	return out;
 }
 
+// Phase 16: outcome of one asset-check execution. Declared here (rather
+// than next to RunChecksForAsset below) so RunSingleTask can iterate the
+// vector returned by the helper. The helper definition itself stays in
+// the Phase 16 section to keep all check-related code colocated.
+struct CheckResult {
+	string check_name;
+	string status;       // 'pass' | 'fail'
+	string actual_value;
+	string expected;     // human-readable expect_type + expect_value
+	string severity;
+	string reason;
+};
+static std::vector<CheckResult>
+RunChecksForAsset(Connection &con, const string &asset_name, const string &run_id);
+
 // Run a single task in `con`. Updates state tables and emits OL events.
 // `partition_key` is `__default__` for unpartitioned tasks and a concrete
 // key (e.g. `2026-05-17`, `2026-05-17|jp`) for partitioned runs. When set
@@ -1156,6 +1278,49 @@ static bool RunSingleTask(Connection &con, const TaskRow &task, const string &pi
 			    << "FROM __orch__.assets WHERE defined_by_task = "
 			    << SqlEscape(task.name) << ";";
 			con.Query(mat.str());
+		}
+
+		// Phase 16: auto-run every declared check for each Asset this task
+		// produces. A failure at severity='error' demotes the run to
+		// 'failed' (and the matching asset_materializations rows too) so
+		// the existing skip-propagation in OrchRunPragma treats the task
+		// as having failed. severity='warn' only logs.
+		{
+			auto out_r = con.Query(
+			    "SELECT name FROM __orch__.assets WHERE defined_by_task = " +
+			    SqlEscape(task.name) + ";");
+			std::vector<string> asset_names;
+			if (!out_r->HasError()) {
+				for (idx_t i = 0; i < out_r->RowCount(); i++) {
+					asset_names.push_back(out_r->GetValue(0, i).ToString());
+				}
+			}
+			bool any_error_failure = false;
+			for (auto &an : asset_names) {
+				auto results = RunChecksForAsset(con, an, run_uuid);
+				for (auto &cr : results) {
+					if (cr.status == "fail" && cr.severity == "error") {
+						any_error_failure = true;
+					}
+				}
+			}
+			if (any_error_failure) {
+				// Flip the run row and the just-inserted materialization
+				// rows to 'failed' so the rest of the pipeline (skip
+				// propagation, asset health) sees the check failure.
+				std::ostringstream upd_run;
+				upd_run << "UPDATE __orch__.runs SET status = 'failed', "
+				        << "error_message = 'asset_check failure (severity=error)' "
+				        << "WHERE run_id = " << SqlEscape(run_uuid) << ";";
+				con.Query(upd_run.str());
+				std::ostringstream upd_mat;
+				upd_mat << "UPDATE __orch__.asset_materializations "
+				        << "SET status = 'failed' "
+				        << "WHERE run_id = CAST(" << SqlEscape(run_uuid) << " AS UUID);";
+				con.Query(upd_mat.str());
+				success = false;
+				error_msg = "asset_check failure (severity=error)";
+			}
 		}
 		// Phase 14 fix: populate __orch__.lineage_edges from each
 		// successful run too, not just from OrchRunPragma's DAG-build path.
@@ -1758,6 +1923,11 @@ static string OrchAssetLineagePragma(ClientContext &context,
 // Best-effort per-Asset health: last materialization status + age (seconds),
 // total/successful/failed runs in the last 24h. NULL columns for Assets that
 // have never materialized.
+//
+// Phase 16: also surfaces
+//   * `freshness_lag_seconds`  — raw value from `@freshness max_lag=...`
+//   * `freshness_status`       — 'ok' | 'violated' | 'none'
+//                                (computed from age_seconds vs the policy)
 static string OrchAssetHealthPragma(ClientContext &context,
                                      const FunctionParameters &parameters) {
 	EnsureAssetSchemaCheap(context);
@@ -1782,11 +1952,288 @@ static string OrchAssetHealthPragma(ClientContext &context,
 	    << "            ELSE epoch(current_timestamp::TIMESTAMP - l.last_at) END AS age_seconds, "
 	    << "       COALESCE(r.runs_24h, 0)    AS runs_24h, "
 	    << "       COALESCE(r.success_24h, 0) AS success_24h, "
-	    << "       COALESCE(r.failed_24h, 0)  AS failed_24h "
+	    << "       COALESCE(r.failed_24h, 0)  AS failed_24h, "
+	    << "       a.freshness_lag_seconds   AS freshness_lag_seconds, "
+	    // Phase 16: 'none' when no policy; otherwise compare current age
+	    // (computed inline because the SELECT alias isn't visible in CASE).
+	    // 'violated' when never materialized AND a policy is set, or when
+	    // age_seconds > freshness_lag_seconds; else 'ok'.
+	    << "       CASE "
+	    << "         WHEN a.freshness_lag_seconds IS NULL THEN 'none' "
+	    << "         WHEN l.last_at IS NULL THEN 'violated' "
+	    << "         WHEN epoch(current_timestamp::TIMESTAMP - l.last_at) "
+	    << "              > a.freshness_lag_seconds THEN 'violated' "
+	    << "         ELSE 'ok' "
+	    << "       END AS freshness_status "
 	    << "FROM __orch__.assets a "
 	    << "LEFT JOIN latest l ON l.asset_name = a.name "
 	    << "LEFT JOIN recent r ON r.asset_name = a.name "
 	    << "ORDER BY a.name;";
+	return sql.str();
+}
+
+// ========================================================================
+// Phase 16: Asset Check execution.
+//
+// Surfaces:
+//   * PRAGMA orch_check_run('asset.name')   — execute all declared checks
+//                                              and return one row per check
+//   * PRAGMA orch_check_history('asset.name', limit) — recent results
+//
+// Also exposed as a helper (`RunChecksForAsset`) so successful task runs
+// can auto-execute every check on each output asset.
+// ========================================================================
+
+struct CheckRow {
+	string check_name;
+	string sql;
+	string expect_type;   // 'eq' | 'gt' | 'lt' | 'between' | 'not_null'
+	string expect_value;  // raw text; parsed at compare time
+	string severity;      // 'error' | 'warn'
+};
+
+static std::vector<CheckRow> LoadChecksForAsset(Connection &con, const string &asset_name) {
+	std::vector<CheckRow> out;
+	std::ostringstream q;
+	q << "SELECT check_name, sql, expect_type, expect_value, severity "
+	  << "FROM __orch__.asset_checks WHERE asset_name = " << SqlEscape(asset_name)
+	  << " ORDER BY check_name;";
+	auto r = con.Query(q.str());
+	if (r->HasError()) return out;
+	for (idx_t i = 0; i < r->RowCount(); i++) {
+		CheckRow cr;
+		cr.check_name = r->GetValue(0, i).ToString();
+		cr.sql = r->GetValue(1, i).ToString();
+		cr.expect_type = r->GetValue(2, i).ToString();
+		auto ev = r->GetValue(3, i);
+		cr.expect_value = ev.IsNull() ? string() : ev.ToString();
+		auto sv = r->GetValue(4, i);
+		cr.severity = sv.IsNull() ? string("error") : sv.ToString();
+		out.push_back(std::move(cr));
+	}
+	return out;
+}
+
+// Substitute `${asset}` (identifier interpolation) in a check SQL with the
+// owning Asset's name. Plain string replace — matches the ROADMAP example
+// and the existing no-Jinja policy for non-typed substitutions. The asset
+// name is the only piece that varies per execution; the check SQL itself
+// is user-authored and trusted.
+static string SubstituteAssetVar(const string &sql, const string &asset_name) {
+	const string needle = "${asset}";
+	if (sql.find(needle) == string::npos) return sql;
+	string out;
+	out.reserve(sql.size() + asset_name.size());
+	size_t i = 0;
+	while (i < sql.size()) {
+		size_t pos = sql.find(needle, i);
+		if (pos == string::npos) {
+			out.append(sql, i, string::npos);
+			break;
+		}
+		out.append(sql, i, pos - i);
+		out.append(asset_name);
+		i = pos + needle.size();
+	}
+	return out;
+}
+
+// Compare a scalar Value (returned by the check SQL) against the declared
+// expectation. Returns true on pass. `actual_out` is the rendered scalar
+// for logging into asset_check_results.actual_value.
+static bool EvalCheckScalar(const Value &actual_v, const string &expect_type,
+                             const string &expect_value, string &actual_out,
+                             string &reason_out) {
+	if (expect_type == "not_null") {
+		actual_out = actual_v.IsNull() ? string("NULL") : actual_v.ToString();
+		bool pass = !actual_v.IsNull();
+		if (!pass) reason_out = "actual is NULL";
+		return pass;
+	}
+	if (actual_v.IsNull()) {
+		actual_out = "NULL";
+		reason_out = "actual is NULL";
+		return false;
+	}
+	actual_out = actual_v.ToString();
+	// Numeric comparison covers BIGINT/INTEGER/DOUBLE/etc. via DOUBLE cast;
+	// string fallback for non-numeric scalars.
+	auto try_double = [](const string &s, double &out) -> bool {
+		if (s.empty()) return false;
+		try {
+			size_t end = 0;
+			out = std::stod(s, &end);
+			while (end < s.size() && (s[end] == ' ' || s[end] == '\t')) end++;
+			return end == s.size();
+		} catch (...) {
+			return false;
+		}
+	};
+	double a_d = 0, b_d = 0;
+	bool a_num = try_double(actual_out, a_d);
+	if (expect_type == "between") {
+		// expect_value = "lo,hi"
+		auto comma = expect_value.find(',');
+		if (comma == string::npos) {
+			reason_out = "between: bad expect_value `" + expect_value + "`";
+			return false;
+		}
+		string lo = expect_value.substr(0, comma);
+		string hi = expect_value.substr(comma + 1);
+		double lo_d = 0, hi_d = 0;
+		bool num_ok = a_num && try_double(lo, lo_d) && try_double(hi, hi_d);
+		if (!num_ok) {
+			reason_out = "between: non-numeric comparison";
+			return false;
+		}
+		bool pass = a_d >= lo_d && a_d <= hi_d;
+		if (!pass) {
+			reason_out = "expected between " + lo + " and " + hi + ", got " + actual_out;
+		}
+		return pass;
+	}
+	bool b_num = try_double(expect_value, b_d);
+	if (expect_type == "eq") {
+		bool pass = (a_num && b_num) ? (a_d == b_d) : (actual_out == expect_value);
+		if (!pass) reason_out = "expected " + expect_value + ", got " + actual_out;
+		return pass;
+	}
+	if (expect_type == "gt") {
+		bool pass = a_num && b_num && a_d > b_d;
+		if (!pass) reason_out = "expected > " + expect_value + ", got " + actual_out;
+		return pass;
+	}
+	if (expect_type == "lt") {
+		bool pass = a_num && b_num && a_d < b_d;
+		if (!pass) reason_out = "expected < " + expect_value + ", got " + actual_out;
+		return pass;
+	}
+	reason_out = "unknown expect_type `" + expect_type + "`";
+	return false;
+}
+
+// Execute every declared check for `asset_name`. Inserts one row per check
+// into __orch__.asset_check_results tagged with `run_id` (a UUID string).
+// Returns the per-check outcomes for in-process consumers.
+static std::vector<CheckResult>
+RunChecksForAsset(Connection &con, const string &asset_name, const string &run_id) {
+	std::vector<CheckResult> out;
+	auto checks = LoadChecksForAsset(con, asset_name);
+	if (checks.empty()) return out;
+	for (auto &c : checks) {
+		CheckResult cr;
+		cr.check_name = c.check_name;
+		cr.severity = c.severity.empty() ? string("error") : c.severity;
+		// Human-readable expected string for the pragma return + logging.
+		if (c.expect_type == "not_null") {
+			cr.expected = "NOT NULL";
+		} else if (c.expect_type == "between") {
+			cr.expected = "between " + c.expect_value;
+		} else {
+			cr.expected = c.expect_type + " " + c.expect_value;
+		}
+		string substituted = SubstituteAssetVar(c.sql, asset_name);
+		auto qres = con.Query(substituted);
+		if (qres->HasError() || qres->RowCount() == 0 ||
+		    qres->ColumnCount() == 0) {
+			cr.status = "fail";
+			cr.actual_value = "ERROR";
+			cr.reason = qres->HasError() ? qres->GetError() : "check SQL returned no rows";
+		} else {
+			Value v = qres->GetValue(0, 0);
+			string actual_str, reason;
+			bool pass = EvalCheckScalar(v, c.expect_type, c.expect_value, actual_str, reason);
+			cr.status = pass ? "pass" : "fail";
+			cr.actual_value = actual_str;
+			cr.reason = reason;
+		}
+		// Log the execution. PK is (asset, check, executed_at) — sleeping
+		// briefly is unnecessary because we're already inside one logical
+		// run and DuckDB's TIMESTAMP has microsecond resolution.
+		std::ostringstream ins;
+		ins << "INSERT OR REPLACE INTO __orch__.asset_check_results "
+		    << "(asset_name, check_name, run_id, executed_at, status, actual_value) "
+		    << "VALUES ("
+		    << SqlEscape(asset_name) << ", "
+		    << SqlEscape(c.check_name) << ", "
+		    << (run_id.empty() ? string("NULL") : ("CAST(" + SqlEscape(run_id) + " AS UUID)"))
+		    << ", current_timestamp, "
+		    << SqlEscape(cr.status) << ", "
+		    << SqlEscape(cr.actual_value)
+		    << ");";
+		con.Query(ins.str());
+		out.push_back(std::move(cr));
+	}
+	return out;
+}
+
+// PRAGMA orch_check_run('asset.name')
+// Side effect: insert one row per declared check into asset_check_results.
+// Returns: one row per check (check_name, status, actual_value, expected,
+//          severity, reason).
+static string OrchCheckRunPragma(ClientContext &context,
+                                   const FunctionParameters &parameters) {
+	EnsureAssetSchemaCheap(context);
+	if (parameters.values.empty() || parameters.values[0].IsNull()) {
+		throw InvalidInputException("orch_check_run requires an asset name");
+	}
+	string asset_name = parameters.values[0].GetValue<string>();
+	Connection con(*context.db);
+	auto run_id = con.Query("SELECT uuid()::VARCHAR")->GetValue(0, 0).ToString();
+	auto results = RunChecksForAsset(con, asset_name, run_id);
+	if (results.empty()) {
+		// No checks registered — return an empty result set with the
+		// expected column shape so JSON consumers still get a stable schema.
+		std::ostringstream o;
+		o << "SELECT NULL::VARCHAR AS check_name, NULL::VARCHAR AS status, "
+		  << "NULL::VARCHAR AS actual_value, NULL::VARCHAR AS expected, "
+		  << "NULL::VARCHAR AS severity, NULL::VARCHAR AS reason "
+		  << "WHERE FALSE;";
+		return o.str();
+	}
+	// Build an inline VALUES list so the pragma returns rich per-check rows
+	// without a second round-trip to the just-inserted result table (which
+	// would risk picking up unrelated historical rows on collisions).
+	std::ostringstream o;
+	o << "SELECT * FROM (VALUES ";
+	for (size_t i = 0; i < results.size(); i++) {
+		if (i > 0) o << ", ";
+		o << "("
+		  << SqlEscape(results[i].check_name) << ", "
+		  << SqlEscape(results[i].status) << ", "
+		  << SqlEscape(results[i].actual_value) << ", "
+		  << SqlEscape(results[i].expected) << ", "
+		  << SqlEscape(results[i].severity) << ", "
+		  << SqlEscape(results[i].reason)
+		  << ")";
+	}
+	o << ") AS t(check_name, status, actual_value, expected, severity, reason);";
+	return o.str();
+}
+
+// PRAGMA orch_check_history('asset.name', limit)
+// Read-only: surface recent rows of __orch__.asset_check_results joined
+// with __orch__.asset_checks for expect_type / expect_value context.
+static string OrchCheckHistoryPragma(ClientContext &context,
+                                       const FunctionParameters &parameters) {
+	EnsureAssetSchemaCheap(context);
+	if (parameters.values.empty() || parameters.values[0].IsNull()) {
+		throw InvalidInputException("orch_check_history requires an asset name");
+	}
+	string asset_name = parameters.values[0].GetValue<string>();
+	int64_t limit = 50;
+	if (parameters.values.size() > 1 && !parameters.values[1].IsNull()) {
+		limit = parameters.values[1].GetValue<int64_t>();
+		if (limit <= 0) limit = 50;
+	}
+	std::ostringstream sql;
+	sql << "SELECT r.asset_name, r.check_name, r.executed_at, r.status, "
+	    << "       r.actual_value, c.expect_type, c.expect_value, c.severity "
+	    << "FROM __orch__.asset_check_results r "
+	    << "LEFT JOIN __orch__.asset_checks c "
+	    << "  ON c.asset_name = r.asset_name AND c.check_name = r.check_name "
+	    << "WHERE r.asset_name = " << SqlEscape(asset_name)
+	    << " ORDER BY r.executed_at DESC LIMIT " << limit << ";";
 	return sql.str();
 }
 
@@ -2057,12 +2504,17 @@ struct AutomationRow {
 	string condition_dsl;
 	int64_t target_lag_seconds = 0;
 	bool target_lag_set = false;
+	// Phase 16: freshness policy on this asset. Sourced from the same
+	// __orch__.assets row so BuildEvalContextJson can pass it straight to
+	// the FreshnessViolated evaluator (no extra join per tick).
+	int64_t freshness_lag_seconds = 0;
+	bool freshness_lag_set = false;
 };
 
 static std::vector<AutomationRow> LoadAutomationAssets(Connection &con) {
 	std::vector<AutomationRow> out;
 	auto r = con.Query(
-	    "SELECT name, automation_condition, target_lag_seconds "
+	    "SELECT name, automation_condition, target_lag_seconds, freshness_lag_seconds "
 	    "FROM __orch__.assets "
 	    "WHERE automation_condition IS NOT NULL "
 	    "ORDER BY name;");
@@ -2075,6 +2527,11 @@ static std::vector<AutomationRow> LoadAutomationAssets(Connection &con) {
 		if (!tlv.IsNull()) {
 			row.target_lag_seconds = tlv.GetValue<int64_t>();
 			row.target_lag_set = true;
+		}
+		auto flv = r->GetValue(3, i);
+		if (!flv.IsNull()) {
+			row.freshness_lag_seconds = flv.GetValue<int64_t>();
+			row.freshness_lag_set = true;
 		}
 		out.push_back(std::move(row));
 	}
@@ -2089,7 +2546,10 @@ static std::vector<AutomationRow> LoadAutomationAssets(Connection &con) {
 //                                    where status='success'
 //   * missing_partition_count      — partitions without any success row
 //   * in_progress                  — any materialization with status='in_progress'
-//   * freshness_lag_seconds        — punted to Phase 16 (always NULL here)
+//   * freshness_lag_seconds        — Phase 16: passed straight through from
+//                                    __orch__.assets.freshness_lag_seconds
+//                                    (loaded into AutomationRow). NULL when
+//                                    the asset has no `@freshness` policy.
 static string BuildEvalContextJson(Connection &con, const AutomationRow &row,
                                     const string &now_iso) {
 	auto val_or_null = [](DataChunk &) {}; // placeholder for clarity
@@ -2154,7 +2614,8 @@ static string BuildEvalContextJson(Connection &con, const AutomationRow &row,
 	  << ",\"own_last_materialized_at\":" << json_or_null(own_last)
 	  << ",\"missing_partition_count\":" << missing
 	  << ",\"now\":" << JsonEscape(now_iso)
-	  << ",\"freshness_lag_seconds\":null"
+	  << ",\"freshness_lag_seconds\":"
+	  << (row.freshness_lag_set ? std::to_string(row.freshness_lag_seconds) : string("null"))
 	  << ",\"in_progress\":" << (in_progress ? "true" : "false");
 	if (row.target_lag_set) {
 		o << ",\"target_lag_seconds\":" << row.target_lag_seconds;
@@ -2954,6 +3415,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "orch_asset_lineage", OrchAssetLineagePragma, {LogicalType::VARCHAR}));
 	loader.RegisterFunction(PragmaFunction::PragmaStatement(
 	    "orch_asset_health", OrchAssetHealthPragma));
+
+	// Phase 16: Asset Check execution + history.
+	loader.RegisterFunction(PragmaFunction::PragmaCall(
+	    "orch_check_run", OrchCheckRunPragma, {LogicalType::VARCHAR}));
+	loader.RegisterFunction(PragmaFunction::PragmaCall(
+	    "orch_check_history", OrchCheckHistoryPragma,
+	    {LogicalType::VARCHAR, LogicalType::BIGINT}));
 
 	// Phase 14: Partition + backfill pragmas.
 	loader.RegisterFunction(PragmaFunction::PragmaCall(
