@@ -11,3 +11,6 @@ crate-type = ["rlib"]
 orch_common = { path = "../orch_common" }
 orch_lineage = { path = "../orch_lineage" }
 serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }

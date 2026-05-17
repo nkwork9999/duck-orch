@@ -148,11 +148,13 @@ dependencies = [
 name = "duckorch_core"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "orch_common",
  "orch_dag",
  "orch_lineage",
  "orch_ol",
  "orch_runtime",
+ "serde",
  "serde_json",
  "walkdir",
 ]
@@ -531,6 +533,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 name = "orch_common"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "serde",
  "serde_json",
 ]
@@ -577,6 +580,7 @@ dependencies = [
 name = "orch_runtime"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "orch_common",
  "orch_lineage",
  "serde",

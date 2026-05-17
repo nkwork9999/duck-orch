@@ -21,6 +21,16 @@ SUBCOMMANDS:
     validate <file>          Parse and validate one task file (writes JSON to stdout)
     impact <table>           Show downstream tasks/tables affected by changing <table>
     lineage <table>          Show upstream lineage of <table>
+    asset list [--group <g>]                    List Assets (optional group filter)
+    asset show <name>                            Show one Asset row
+    asset lineage <name>                         Mermaid for upstream+downstream of an Asset
+    asset materializations <name> [--limit N]    Recent materialization history
+    asset health                                  Per-Asset health summary (last status + 24h counts)
+    asset partitions <name> [--json]             Calendar-style ASCII (or JSON rows)
+    run --partition <key> <asset>                Run one partition of an Asset
+    backfill <asset> --from <date> --to <date>   Re-run all partitions in [from, to]
+    backfill <asset> --partition <key>           Re-run one partition
+    backfill <asset> --missing                   Re-run only never-succeeded partitions
     schedule add <name> <cron>   Register a cron schedule
     schedule list                List schedules
     schedule run-due             Run pipelines whose next trigger is due
@@ -170,6 +180,29 @@ fn cmd_register(args: &Args) -> i32 {
 }
 
 fn cmd_run(args: &Args) -> i32 {
+    // Phase 14: `duck-orch run <asset> --partition <key>` runs a single
+    // partition of one Asset (via PRAGMA orch_run_partition). When no
+    // --partition flag is given we keep the Phase 5 full-DAG behaviour.
+    let mut rest: Vec<String> = args.rest.clone();
+    let partition = extract_flag_value(&mut rest, "--partition");
+    if let Some(key) = partition {
+        if rest.is_empty() {
+            eprintln!("run --partition: missing <asset_name>");
+            return 2;
+        }
+        let asset = &rest[0];
+        let sql = format!(
+            "PRAGMA orch_run_partition({}, {});",
+            sql_escape(asset),
+            sql_escape(&key)
+        );
+        let (_, err, code) = match run_sql(args, &sql, false) {
+            Ok(r) => r,
+            Err(e) => { eprintln!("{}", e); return 2; }
+        };
+        if !err.is_empty() { eprintln!("{}", err); }
+        return code;
+    }
     let (_, err, code) = match run_sql(args, "PRAGMA orch_run;", false) {
         Ok(r) => r,
         Err(e) => { eprintln!("{}", e); return 2; }
@@ -185,6 +218,65 @@ fn cmd_run(args: &Args) -> i32 {
         let (out, _, _) = run_sql(args, q, false).unwrap_or_default();
         print!("{}", out);
     }
+    0
+}
+
+// Phase 14: `duck-orch backfill <asset> [--from FROM --to TO | --partition K |
+// --missing]`. Sequential per-partition execution on the C++ side
+// (`PRAGMA orch_backfill*`).
+//
+// `--parallel N` is recognized but currently delegated to the existing
+// `orch_max_parallel` global rather than spinning local threads — full
+// per-partition fan-out is punted to a follow-up.
+fn cmd_backfill(args: &Args) -> i32 {
+    if args.rest.is_empty() {
+        eprintln!("backfill: missing <asset> argument");
+        return 2;
+    }
+    let mut rest: Vec<String> = args.rest.clone();
+    let from = extract_flag_value(&mut rest, "--from");
+    let to = extract_flag_value(&mut rest, "--to");
+    let partition = extract_flag_value(&mut rest, "--partition");
+    let _parallel = extract_flag_value(&mut rest, "--parallel");
+    let missing = rest.iter().any(|s| s == "--missing");
+    let rest_clean: Vec<&String> = rest.iter().filter(|s| s.as_str() != "--missing").collect();
+    if rest_clean.is_empty() {
+        eprintln!("backfill: missing <asset> argument");
+        return 2;
+    }
+    let asset = rest_clean[0];
+    let sql = if let Some(k) = partition {
+        format!(
+            "PRAGMA orch_run_partition({}, {});",
+            sql_escape(asset),
+            sql_escape(&k)
+        )
+    } else if missing {
+        format!("PRAGMA orch_backfill_missing({});", sql_escape(asset))
+    } else {
+        let from_v = from.map(|s| format!("'{}'", s.replace('\'', "''"))).unwrap_or("NULL".into());
+        let to_v = to.map(|s| format!("'{}'", s.replace('\'', "''"))).unwrap_or("NULL".into());
+        format!(
+            "PRAGMA orch_backfill({}, {}, {});",
+            sql_escape(asset),
+            from_v,
+            to_v
+        )
+    };
+    let (_, err, code) = match run_sql(args, &sql, false) {
+        Ok(r) => r,
+        Err(e) => { eprintln!("{}", e); return 2; }
+    };
+    if !err.is_empty() { eprintln!("{}", err); }
+    if code != 0 { return code; }
+    // Echo the resulting per-partition status for the asset.
+    let report_sql = format!(
+        "SELECT partition_key, last_status, last_materialized_at \
+         FROM (PRAGMA orch_asset_partitions({})) ORDER BY partition_key;",
+        sql_escape(asset)
+    );
+    let (out, _, _) = run_sql(args, &report_sql, args.json).unwrap_or_default();
+    print!("{}", out);
     0
 }
 
@@ -298,6 +390,201 @@ fn cmd_lineage(args: &Args) -> i32 {
     };
     if !err.is_empty() { eprintln!("{}", err); }
     print!("{}", out);
+    code
+}
+
+// =============================================================================
+// Phase 13 m2: `duck-orch asset ...` subcommands.
+//
+// Each leaf calls the corresponding `PRAGMA orch_asset_*` and pipes stdout
+// through. `--json` flips duckdb to `.mode json` (handled by run_sql) so the
+// caller gets a JSON envelope per row.
+// =============================================================================
+
+fn extract_flag_value(rest: &mut Vec<String>, flag: &str) -> Option<String> {
+    let mut i = 0;
+    while i < rest.len() {
+        if rest[i] == flag {
+            if i + 1 < rest.len() {
+                let v = rest.remove(i + 1);
+                rest.remove(i);
+                return Some(v);
+            }
+            // Trailing --flag with no value → drop it and stop.
+            rest.remove(i);
+            return None;
+        }
+        i += 1;
+    }
+    None
+}
+
+fn cmd_asset(args: &Args) -> i32 {
+    let sub = args.rest.first().map(|s| s.as_str()).unwrap_or("");
+    match sub {
+        "list" => cmd_asset_list(args),
+        "show" => cmd_asset_show(args),
+        "lineage" => cmd_asset_lineage(args),
+        "materializations" => cmd_asset_materializations(args),
+        "health" => cmd_asset_health(args),
+        "partitions" => cmd_asset_partitions(args),
+        "" => {
+            eprintln!("asset: missing subcommand (list|show|lineage|materializations|health|partitions)");
+            2
+        }
+        other => {
+            eprintln!("unknown asset subcommand: {}", other);
+            2
+        }
+    }
+}
+
+fn cmd_asset_list(args: &Args) -> i32 {
+    // Pull optional --group flag out of the rest after the "list" verb.
+    let mut tail: Vec<String> = args.rest.iter().skip(1).cloned().collect();
+    let group = extract_flag_value(&mut tail, "--group");
+    let sql = match group {
+        Some(g) => format!("PRAGMA orch_asset_list_group({});", sql_escape(&g)),
+        None => "PRAGMA orch_asset_list;".to_string(),
+    };
+    let (out, err, code) = match run_sql(args, &sql, args.json) {
+        Ok(r) => r,
+        Err(e) => { eprintln!("{}", e); return 2; }
+    };
+    if !err.is_empty() { eprintln!("{}", err); }
+    print!("{}", out);
+    code
+}
+
+fn cmd_asset_show(args: &Args) -> i32 {
+    if args.rest.len() < 2 {
+        eprintln!("asset show: missing <name>");
+        return 2;
+    }
+    let name = &args.rest[1];
+    let sql = format!("PRAGMA orch_asset_show({});", sql_escape(name));
+    let (out, err, code) = match run_sql(args, &sql, args.json) {
+        Ok(r) => r,
+        Err(e) => { eprintln!("{}", e); return 2; }
+    };
+    if !err.is_empty() { eprintln!("{}", err); }
+    print!("{}", out);
+    code
+}
+
+fn cmd_asset_lineage(args: &Args) -> i32 {
+    if args.rest.len() < 2 {
+        eprintln!("asset lineage: missing <name>");
+        return 2;
+    }
+    let name = &args.rest[1];
+    let sql = format!("PRAGMA orch_asset_lineage({});", sql_escape(name));
+    let (out, err, code) = match run_sql(args, &sql, args.json) {
+        Ok(r) => r,
+        Err(e) => { eprintln!("{}", e); return 2; }
+    };
+    if !err.is_empty() { eprintln!("{}", err); }
+    if args.json {
+        print!("{}", out);
+    } else {
+        // Strip the duckdb table chrome and unescape \n inside the mermaid
+        // string (mirrors the `graph` subcommand behaviour).
+        for line in out.lines() {
+            if line.contains("graph LR")
+                || line.contains("classDef")
+                || line.contains("-->")
+                || line.contains("class ")
+            {
+                println!("{}", line.replace("\\n", "\n").trim_matches('│').trim());
+            }
+        }
+    }
+    code
+}
+
+fn cmd_asset_materializations(args: &Args) -> i32 {
+    if args.rest.len() < 2 {
+        eprintln!("asset materializations: missing <name>");
+        return 2;
+    }
+    let name = &args.rest[1];
+    let mut tail: Vec<String> = args.rest.iter().skip(2).cloned().collect();
+    let limit: i64 = extract_flag_value(&mut tail, "--limit")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50);
+    let sql = format!(
+        "PRAGMA orch_asset_materializations({}, {});",
+        sql_escape(name),
+        limit
+    );
+    let (out, err, code) = match run_sql(args, &sql, args.json) {
+        Ok(r) => r,
+        Err(e) => { eprintln!("{}", e); return 2; }
+    };
+    if !err.is_empty() { eprintln!("{}", err); }
+    print!("{}", out);
+    code
+}
+
+fn cmd_asset_health(args: &Args) -> i32 {
+    let sql = "PRAGMA orch_asset_health;";
+    let (out, err, code) = match run_sql(args, sql, args.json) {
+        Ok(r) => r,
+        Err(e) => { eprintln!("{}", e); return 2; }
+    };
+    if !err.is_empty() { eprintln!("{}", err); }
+    print!("{}", out);
+    code
+}
+
+// =============================================================================
+// Phase 14: `duck-orch asset partitions <asset> [--json]`.
+//
+// Default (text mode): calls `PRAGMA orch_asset_partitions_calendar` to get
+// the rendered ASCII calendar (single VARCHAR cell) and strips duckdb's
+// table chrome before printing — same trick as `asset lineage`.
+//
+// --json: emits the raw partition rows via `PRAGMA orch_asset_partitions`.
+// =============================================================================
+fn cmd_asset_partitions(args: &Args) -> i32 {
+    if args.rest.len() < 2 {
+        eprintln!("asset partitions: missing <name>");
+        return 2;
+    }
+    let name = &args.rest[1];
+    if args.json {
+        let sql = format!("PRAGMA orch_asset_partitions({});", sql_escape(name));
+        let (out, err, code) = match run_sql(args, &sql, true) {
+            Ok(r) => r,
+            Err(e) => { eprintln!("{}", e); return 2; }
+        };
+        if !err.is_empty() { eprintln!("{}", err); }
+        print!("{}", out);
+        return code;
+    }
+    let sql = format!(
+        "PRAGMA orch_asset_partitions_calendar({});",
+        sql_escape(name)
+    );
+    let (out, err, code) = match run_sql(args, &sql, false) {
+        Ok(r) => r,
+        Err(e) => { eprintln!("{}", e); return 2; }
+    };
+    if !err.is_empty() { eprintln!("{}", err); }
+    // Strip duckdb table chrome and unescape \n inside the rendered cell.
+    // The single column 'calendar' carries a multi-line string; duckdb
+    // surrounds it with │ borders and renders newlines as `\n` literals.
+    for line in out.lines() {
+        if line.starts_with('│') {
+            let body = line.trim_matches('│').trim();
+            if body.is_empty() || body == "calendar" || body.starts_with("varchar") {
+                continue;
+            }
+            for sub in body.split("\\n") {
+                println!("{}", sub);
+            }
+        }
+    }
     code
 }
 
@@ -430,9 +717,56 @@ fn main() {
         "validate" => cmd_validate(&args),
         "impact" => cmd_impact(&args),
         "lineage" => cmd_lineage(&args),
+        "asset" => cmd_asset(&args),
+        "backfill" => cmd_backfill(&args),
         "schedule" => cmd_schedule(&args),
         "help" | "" => { print!("{}", HELP); 0 }
         other => { eprintln!("unknown subcommand: {}", other); print!("{}", HELP); 2 }
     };
     std::process::exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_flag_value_basic() {
+        let mut v = vec!["a".to_string(), "--group".to_string(), "sales".to_string()];
+        assert_eq!(extract_flag_value(&mut v, "--group"), Some("sales".into()));
+        assert_eq!(v, vec!["a"]);
+    }
+
+    #[test]
+    fn extract_flag_value_missing() {
+        let mut v = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(extract_flag_value(&mut v, "--group"), None);
+        assert_eq!(v, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn extract_flag_value_trailing() {
+        // `--group` with no following arg → dropped, returns None.
+        let mut v = vec!["a".to_string(), "--group".to_string()];
+        assert_eq!(extract_flag_value(&mut v, "--group"), None);
+        assert_eq!(v, vec!["a"]);
+    }
+
+    #[test]
+    fn extract_flag_value_preserves_order() {
+        let mut v = vec![
+            "a".to_string(),
+            "--limit".to_string(),
+            "20".to_string(),
+            "b".to_string(),
+        ];
+        assert_eq!(extract_flag_value(&mut v, "--limit"), Some("20".into()));
+        assert_eq!(v, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn sql_escape_quotes() {
+        assert_eq!(sql_escape("o'brien"), "'o''brien'");
+        assert_eq!(sql_escape("plain"), "'plain'");
+    }
 }

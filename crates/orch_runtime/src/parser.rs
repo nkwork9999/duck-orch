@@ -1,6 +1,7 @@
 // Parses SQL files with `-- @key value` header comments into Task structs.
 
-use orch_common::{Task, TaskTest};
+use crate::binding::parse_param_decl;
+use orch_common::{parse_partition_decl, Task, TaskTest};
 use std::path::Path;
 
 #[derive(Debug)]
@@ -118,6 +119,45 @@ fn apply_header(task: &mut Task, content: &str, line: usize) -> Result<(), Parse
         "incremental_by" => task.incremental_by = Some(rest.trim().to_string()),
         "tags" => task.tags = split_csv(rest),
         "test" => task.tests.push(parse_test(rest, line)?),
+        "param" => {
+            let spec = parse_param_decl(rest).map_err(|e| ParseError {
+                message: e.to_string(),
+                line: Some(line),
+            })?;
+            task.params.push(spec);
+        }
+        // Phase 13: Asset 一級化 headers. `@asset` mirrors `@task` and parses
+        // `name=value`; the rest are scalar/CSV style like other headers.
+        "asset" => {
+            let mut got = false;
+            for (k, v) in parse_inline_kv(rest) {
+                if k == "name" {
+                    task.asset_name = Some(v.to_string());
+                    got = true;
+                }
+            }
+            if !got {
+                let bare = rest.trim().trim_matches('"');
+                if !bare.is_empty() {
+                    task.asset_name = Some(bare.to_string());
+                }
+            }
+        }
+        "asset_kind" => task.asset_kind = Some(rest.trim().to_string()),
+        "asset_group" => task.asset_group = Some(rest.trim().to_string()),
+        "asset_owner" => task.asset_owner = Some(rest.trim().to_string()),
+        "asset_description" => task.asset_description = Some(rest.trim().to_string()),
+        "asset_tags" => task.asset_tags = split_csv(rest),
+        // Phase 14: partition declaration. Stored on the task; expanded into
+        // concrete partition keys at registration time on the C++ side, and
+        // surfaced via `$partition_key` bindings at execution time.
+        "partitions_by" => {
+            let def = parse_partition_decl(rest).map_err(|e| ParseError {
+                message: e.to_string(),
+                line: Some(line),
+            })?;
+            task.partitions = Some(def);
+        }
         _ => {}
     }
 
@@ -169,4 +209,188 @@ fn parse_test(rest: &str, line: usize) -> Result<TaskTest, ParseError> {
     let query = after_open[..close].to_string();
     let assertion = after_open[close + 1..].trim().to_string();
     Ok(TaskTest { query, assertion })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orch_common::ParamType;
+
+    #[test]
+    fn parses_param_header() {
+        let sql = "-- @name my_task\n-- @param partition_key:DATE\n-- @param count:INT\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert_eq!(task.name, "my_task");
+        assert_eq!(task.params.len(), 2);
+        assert_eq!(task.params[0].name, "partition_key");
+        assert_eq!(task.params[0].ty, ParamType::Date);
+        assert_eq!(task.params[1].name, "count");
+        assert_eq!(task.params[1].ty, ParamType::Integer);
+    }
+
+    #[test]
+    fn rejects_bad_param_header() {
+        let sql = "-- @name bad\n-- @param oops_no_colon\nSELECT 1;\n";
+        let err = parse_sql_file(sql, None).expect_err("should fail");
+        assert!(err.message.contains("@param"), "got: {}", err.message);
+        assert_eq!(err.line, Some(2));
+    }
+
+    #[test]
+    fn task_without_param_header_has_empty_params() {
+        let sql = "-- @name plain\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert!(task.params.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 13: Asset header parsing
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parses_asset_name_kv() {
+        let sql = "-- @name t\n-- @asset name=analytics.user_stats\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert_eq!(task.asset_name.as_deref(), Some("analytics.user_stats"));
+    }
+
+    #[test]
+    fn parses_asset_name_bare() {
+        // Tolerate `-- @asset analytics.user_stats` without name= prefix
+        let sql = "-- @name t\n-- @asset analytics.user_stats\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert_eq!(task.asset_name.as_deref(), Some("analytics.user_stats"));
+    }
+
+    #[test]
+    fn parses_asset_kind() {
+        let sql = "-- @name t\n-- @asset_kind view\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert_eq!(task.asset_kind.as_deref(), Some("view"));
+    }
+
+    #[test]
+    fn parses_asset_group() {
+        let sql = "-- @name t\n-- @asset_group sales\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert_eq!(task.asset_group.as_deref(), Some("sales"));
+    }
+
+    #[test]
+    fn parses_asset_owner() {
+        let sql = "-- @name t\n-- @asset_owner data@example.com\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert_eq!(task.asset_owner.as_deref(), Some("data@example.com"));
+    }
+
+    #[test]
+    fn parses_asset_description() {
+        let sql = "-- @name t\n-- @asset_description Active users by country\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert_eq!(
+            task.asset_description.as_deref(),
+            Some("Active users by country")
+        );
+    }
+
+    #[test]
+    fn parses_asset_tags_csv() {
+        let sql = "-- @name t\n-- @asset_tags daily, sales, kpi\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert_eq!(task.asset_tags, vec!["daily", "sales", "kpi"]);
+    }
+
+    #[test]
+    fn task_without_asset_headers_is_empty() {
+        let sql = "-- @name t\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert!(task.asset_name.is_none());
+        assert!(task.asset_kind.is_none());
+        assert!(task.asset_group.is_none());
+        assert!(task.asset_owner.is_none());
+        assert!(task.asset_description.is_none());
+        assert!(task.asset_tags.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 14: @partitions_by header parsing
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parses_partitions_by_daily() {
+        let sql = "-- @name t\n-- @partitions_by daily(start=2026-01-01)\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        match task.partitions {
+            Some(orch_common::PartitionDef::Daily { ref start, end }) => {
+                assert_eq!(start.to_string(), "2026-01-01");
+                assert!(end.is_none());
+            }
+            other => panic!("expected Daily, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_partitions_by_static() {
+        let sql = "-- @name t\n-- @partitions_by static(jp,us,eu)\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        match task.partitions {
+            Some(orch_common::PartitionDef::Static(ref v)) => {
+                assert_eq!(v, &vec!["jp".to_string(), "us".to_string(), "eu".to_string()]);
+            }
+            other => panic!("expected Static, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_partitions_by_multi() {
+        let sql = "-- @name t\n-- @partitions_by multi(date=daily(start=2026-01-01),region=static(jp,us))\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        match task.partitions {
+            Some(orch_common::PartitionDef::Multi(ref dims)) => {
+                assert!(dims.contains_key("date"));
+                assert!(dims.contains_key("region"));
+            }
+            other => panic!("expected Multi, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rejects_bad_partitions_by() {
+        let sql = "-- @name t\n-- @partitions_by hourly(start=2026-01-01)\nSELECT 1;\n";
+        let err = parse_sql_file(sql, None).expect_err("should fail");
+        assert!(err.message.contains("@partitions_by"), "got: {}", err.message);
+        assert_eq!(err.line, Some(2));
+    }
+
+    #[test]
+    fn task_without_partitions_by_has_none() {
+        let sql = "-- @name t\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert!(task.partitions.is_none());
+    }
+
+    #[test]
+    fn parses_full_asset_header_bundle() {
+        let sql = "\
+-- @name user_stats
+-- @asset name=analytics.user_stats
+-- @asset_kind table
+-- @asset_group sales
+-- @asset_owner data-team@example.com
+-- @asset_description Active users by country
+-- @asset_tags daily,kpi
+SELECT 1;
+";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert_eq!(task.name, "user_stats");
+        assert_eq!(task.asset_name.as_deref(), Some("analytics.user_stats"));
+        assert_eq!(task.asset_kind.as_deref(), Some("table"));
+        assert_eq!(task.asset_group.as_deref(), Some("sales"));
+        assert_eq!(task.asset_owner.as_deref(), Some("data-team@example.com"));
+        assert_eq!(
+            task.asset_description.as_deref(),
+            Some("Active users by country")
+        );
+        assert_eq!(task.asset_tags, vec!["daily", "kpi"]);
+    }
 }
