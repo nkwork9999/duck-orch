@@ -8,4 +8,4 @@
 pub mod ffi;
 pub mod task;
 
-pub use task::{Task, TaskTest};
+pub use task::{ParamSpec, ParamType, Task, TaskTest};

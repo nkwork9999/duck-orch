@@ -1,5 +1,6 @@
 // Parses SQL files with `-- @key value` header comments into Task structs.
 
+use crate::binding::parse_param_decl;
 use orch_common::{Task, TaskTest};
 use std::path::Path;
 
@@ -118,6 +119,13 @@ fn apply_header(task: &mut Task, content: &str, line: usize) -> Result<(), Parse
         "incremental_by" => task.incremental_by = Some(rest.trim().to_string()),
         "tags" => task.tags = split_csv(rest),
         "test" => task.tests.push(parse_test(rest, line)?),
+        "param" => {
+            let spec = parse_param_decl(rest).map_err(|e| ParseError {
+                message: e.to_string(),
+                line: Some(line),
+            })?;
+            task.params.push(spec);
+        }
         _ => {}
     }
 
@@ -169,4 +177,37 @@ fn parse_test(rest: &str, line: usize) -> Result<TaskTest, ParseError> {
     let query = after_open[..close].to_string();
     let assertion = after_open[close + 1..].trim().to_string();
     Ok(TaskTest { query, assertion })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orch_common::ParamType;
+
+    #[test]
+    fn parses_param_header() {
+        let sql = "-- @name my_task\n-- @param partition_key:DATE\n-- @param count:INT\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert_eq!(task.name, "my_task");
+        assert_eq!(task.params.len(), 2);
+        assert_eq!(task.params[0].name, "partition_key");
+        assert_eq!(task.params[0].ty, ParamType::Date);
+        assert_eq!(task.params[1].name, "count");
+        assert_eq!(task.params[1].ty, ParamType::Integer);
+    }
+
+    #[test]
+    fn rejects_bad_param_header() {
+        let sql = "-- @name bad\n-- @param oops_no_colon\nSELECT 1;\n";
+        let err = parse_sql_file(sql, None).expect_err("should fail");
+        assert!(err.message.contains("@param"), "got: {}", err.message);
+        assert_eq!(err.line, Some(2));
+    }
+
+    #[test]
+    fn task_without_param_header_has_empty_params() {
+        let sql = "-- @name plain\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert!(task.params.is_empty());
+    }
 }
