@@ -558,3 +558,157 @@ pub extern "C" fn orch_render_partition_calendar(
     }))
     .unwrap_or(-1)
 }
+
+// ---------------------------------------------------------------------------
+// Phase 15: AutomationCondition FFI surface.
+// ---------------------------------------------------------------------------
+
+/// Parse an `@automation` DSL string into a canonical AST + DSL string.
+/// Used by the asset upsert path to re-validate stored conditions on load
+/// and by the simulate pragma to display the parsed condition. Output:
+/// `{"dsl": "...", "ast": <serde-json>}` on success, `{"error":"..."}` on
+/// failure (return -1).
+#[unsafe(no_mangle)]
+pub extern "C" fn orch_automation_parse(
+    src_ptr: *const u8,
+    src_len: usize,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        let src = unsafe { read_str(src_ptr, src_len) };
+        match orch_common::parse_automation(src) {
+            Ok(cond) => {
+                let dsl = cond.serialize_dsl();
+                let v = serde_json::json!({
+                    "dsl": dsl,
+                    "ast": cond,
+                });
+                write_out(v.to_string(), out_ptr, out_len)
+            }
+            Err(e) => err_to_buf(&e.to_string(), out_ptr, out_len),
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+/// Evaluate an automation condition against a context snapshot.
+///
+/// `cond_dsl`: the DSL string stored on `__orch__.assets.automation_condition`.
+/// `ctx_json`: a JSON object with snake_case fields matching `EvalContext`.
+/// Timestamps are ISO `YYYY-MM-DD HH:MM:SS[.fff]` strings; missing or null
+/// fields fall back to defaults (`None`, `0`, `false`).
+///
+/// Returns `{"condition_met": bool, "reason": "...", "dsl": "...canonical..."}`.
+#[unsafe(no_mangle)]
+pub extern "C" fn orch_automation_evaluate(
+    cond_dsl_ptr: *const u8,
+    cond_dsl_len: usize,
+    ctx_json_ptr: *const u8,
+    ctx_json_len: usize,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        let dsl = unsafe { read_str(cond_dsl_ptr, cond_dsl_len) };
+        let ctx_json = unsafe { read_str(ctx_json_ptr, ctx_json_len) };
+        let cond = match orch_common::parse_automation(dsl) {
+            Ok(c) => c,
+            Err(e) => {
+                return err_to_buf(
+                    &format!("automation parse error: {}", e),
+                    out_ptr,
+                    out_len,
+                );
+            }
+        };
+
+        #[derive(serde::Deserialize, Default)]
+        #[serde(default)]
+        struct RawCtx {
+            upstream_max_materialized_at: Option<String>,
+            own_last_materialized_at: Option<String>,
+            missing_partition_count: u64,
+            now: Option<String>,
+            freshness_lag_seconds: Option<u64>,
+            in_progress: bool,
+            target_lag_seconds: Option<u64>,
+            last_evaluated_at: Option<String>,
+        }
+
+        let raw: RawCtx = if ctx_json.is_empty() {
+            RawCtx::default()
+        } else {
+            match serde_json::from_str(ctx_json) {
+                Ok(v) => v,
+                Err(e) => {
+                    return err_to_buf(
+                        &format!("invalid eval context json: {}", e),
+                        out_ptr,
+                        out_len,
+                    );
+                }
+            }
+        };
+
+        fn parse_ts(s: &str) -> Option<chrono::NaiveDateTime> {
+            // Try a few formats commonly emitted by DuckDB.
+            for fmt in [
+                "%Y-%m-%d %H:%M:%S%.f",
+                "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%dT%H:%M:%S%.f",
+                "%Y-%m-%dT%H:%M:%S",
+            ] {
+                if let Ok(t) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
+                    return Some(t);
+                }
+            }
+            None
+        }
+        fn opt_ts(s: Option<String>) -> Option<chrono::NaiveDateTime> {
+            s.and_then(|v| parse_ts(&v))
+        }
+
+        let now = opt_ts(raw.now.clone()).unwrap_or_else(|| chrono::Utc::now().naive_utc());
+        let ctx = orch_common::EvalContext {
+            upstream_max_materialized_at: opt_ts(raw.upstream_max_materialized_at),
+            own_last_materialized_at: opt_ts(raw.own_last_materialized_at),
+            missing_partition_count: raw.missing_partition_count,
+            now,
+            freshness_lag_seconds: raw.freshness_lag_seconds,
+            in_progress: raw.in_progress,
+            target_lag_seconds: raw.target_lag_seconds,
+            last_evaluated_at: opt_ts(raw.last_evaluated_at),
+        };
+        let (met, reason) = orch_common::evaluate_automation(&cond, &ctx);
+        let v = serde_json::json!({
+            "condition_met": met,
+            "reason": reason,
+            "dsl": cond.serialize_dsl(),
+        });
+        write_out(v.to_string(), out_ptr, out_len)
+    }))
+    .unwrap_or(-1)
+}
+
+/// Parse a `@target_lag` duration string and return its value in seconds
+/// as a JSON `{"seconds": N}` object.
+#[unsafe(no_mangle)]
+pub extern "C" fn orch_target_lag_parse(
+    src_ptr: *const u8,
+    src_len: usize,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        let src = unsafe { read_str(src_ptr, src_len) };
+        match orch_common::parse_target_lag(src) {
+            Ok(s) => {
+                let v = serde_json::json!({ "seconds": s });
+                write_out(v.to_string(), out_ptr, out_len)
+            }
+            Err(e) => err_to_buf(&e.to_string(), out_ptr, out_len),
+        }
+    }))
+    .unwrap_or(-1)
+}

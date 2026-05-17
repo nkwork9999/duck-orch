@@ -99,4 +99,24 @@ int32_t orch_render_partition_calendar(const uint8_t *asset_ptr, size_t asset_le
                                         const uint8_t *rows_json_ptr, size_t rows_json_len,
                                         uint8_t **out_ptr, size_t *out_len);
 
+// Phase 15: AutomationCondition surface.
+//
+// `orch_automation_parse` validates a DSL string. Output:
+//   `{"dsl": "...canonical...", "ast": <serde-json>}` on success
+//   `{"error": "..."}` on failure (return -1).
+int32_t orch_automation_parse(const uint8_t *src_ptr, size_t src_len,
+                               uint8_t **out_ptr, size_t *out_len);
+
+// `orch_automation_evaluate` evaluates a stored condition against a context
+// snapshot. `ctx_json` is a JSON object with `EvalContext` fields (snake_case).
+// Output: `{"condition_met": bool, "reason": "...", "dsl": "..."}`.
+int32_t orch_automation_evaluate(const uint8_t *cond_dsl_ptr, size_t cond_dsl_len,
+                                  const uint8_t *ctx_json_ptr, size_t ctx_json_len,
+                                  uint8_t **out_ptr, size_t *out_len);
+
+// `orch_target_lag_parse` parses a `@target_lag` duration string and returns
+// `{"seconds": N}`.
+int32_t orch_target_lag_parse(const uint8_t *src_ptr, size_t src_len,
+                               uint8_t **out_ptr, size_t *out_len);
+
 }

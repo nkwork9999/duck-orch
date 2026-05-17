@@ -1,5 +1,6 @@
 // Canonical Task definition. Shared by parser, dag, executor, lineage.
 
+use crate::automation::AutomationCondition;
 use crate::partition::PartitionDef;
 use serde::{Deserialize, Serialize};
 
@@ -44,6 +45,20 @@ pub struct Task {
     /// `None` means the asset is unpartitioned (everything goes under the
     /// `'__default__'` partition_key, preserving Phase 13 behaviour).
     pub partitions: Option<PartitionDef>,
+    /// Phase 15: parsed AutomationCondition AST from `-- @automation <expr>`.
+    /// `None` means the asset is *not* automation-driven; the sensor loop
+    /// will skip it entirely.
+    pub automation: Option<AutomationCondition>,
+    /// Phase 15: canonical DSL string for the automation condition, populated
+    /// in lock-step with `automation`. Stored separately so the C++ asset
+    /// upsert path can write the string directly to
+    /// `__orch__.assets.automation_condition` without needing an extra
+    /// Rust-side serializer call.
+    pub automation_dsl: Option<String>,
+    /// Phase 15: `@target_lag` value in seconds. Conceptually
+    /// `automation = eager() throttle <N>` — the throttle is applied by the
+    /// evaluator (see `automation::evaluate`).
+    pub target_lag_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
