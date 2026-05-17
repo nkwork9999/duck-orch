@@ -7,7 +7,9 @@ drive duckOrch over **stdio**.
 Built on the official Rust SDK [`rmcp`](https://crates.io/crates/rmcp) v0.3
 with features `server`, `macros`, `transport-io`.
 
-## What it exposes (read-only, first cut)
+## What it exposes
+
+### Read-only
 
 | Tool             | Wraps                              | Notes |
 |------------------|------------------------------------|-------|
@@ -17,8 +19,16 @@ with features `server`, `macros`, `transport-io`.
 | `get_lineage`    | `duck-orch lineage` + `graph`      | Returns rows + full Mermaid graph. |
 | `validate`       | `duck-orch validate <file> --json` | Parse + validate one `.sql` task file. |
 
-Write tools (`run`, `register`, `schedule add`, …) are **not** exposed yet —
-they'll land in a follow-up commit.
+### Write (safety-defaulted)
+
+| Tool               | Wraps                                                | Safety default |
+|--------------------|------------------------------------------------------|----------------|
+| `run_pipeline`     | `duck-orch run --json`                               | **`dry_run=true`** — returns the lineage Mermaid + recent runs as a preview, no execution. Pass `dry_run=false` to actually run. |
+| `register_task`    | `duck-orch register <path> --json`                   | Rejects unless `path` is an existing file/directory (no raw SQL). |
+| `unregister_task`  | `DELETE FROM __orch__.tasks` via direct `duckdb`     | **Requires `confirm=true`** (default `false` → refused). The CLI has no `unregister` subcommand yet, so this tool talks to `duckdb` directly using `DUCK_ORCH_DB` / `DUCKORCH_EXT`. |
+| `schedule_add`     | `duck-orch schedule add <name> <cron>`               | Cron is validated by the CLI. |
+
+`schedule_remove` is not exposed (the CLI has no matching subcommand yet — punted).
 
 ## Build
 

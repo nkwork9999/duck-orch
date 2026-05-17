@@ -51,6 +51,44 @@ pub struct ValidateRequest {
     pub file: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RunPipelineRequest {
+    /// Pipeline / tag name (currently advisory — duck-orch runs the full DAG).
+    #[serde(default)]
+    pub pipeline: Option<String>,
+    /// If true (default), do NOT execute. Returns the lineage graph + task list
+    /// so the caller can preview "what would run". Only when explicitly false
+    /// does this tool actually invoke `duck-orch run`.
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
+}
+
+fn default_true() -> bool { true }
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RegisterTaskRequest {
+    /// Filesystem path to a directory of .sql task files (the CLI's
+    /// `register <dir>` argument). Raw SQL strings are rejected.
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct UnregisterTaskRequest {
+    /// Task name to remove from `__orch__.tasks`.
+    pub name: String,
+    /// Must be set to `true` explicitly; otherwise the call is refused.
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ScheduleAddRequest {
+    /// Pipeline-or-task name to schedule.
+    pub name: String,
+    /// Cron expression (standard 5-field or 6-field).
+    pub cron: String,
+}
+
 // ---- helpers ----
 
 fn duck_orch_bin() -> String {
@@ -103,6 +141,46 @@ fn to_mcp_err(msg: String) -> McpError {
 
 fn ok_text(s: impl Into<String>) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![Content::text(s.into())]))
+}
+
+/// Run a raw SQL statement through `duckdb` (not via `duck-orch`).
+/// Needed for write tools the CLI doesn't expose yet (e.g. unregister).
+/// Loads DUCKORCH_EXT first so `__orch__` tables resolve.
+fn run_duckdb_sql(sql: &str) -> Result<String, String> {
+    let bin = std::env::var("DUCKDB_BIN").unwrap_or_else(|_| "duckdb".to_string());
+    let db = db_arg().unwrap_or_else(|| "./mydata.duckdb".to_string());
+    let mut prelude = String::new();
+    if let Some(ext) = ext_arg() {
+        prelude.push_str(&format!("LOAD '{}';\n", ext));
+    }
+    let full_sql = prelude + sql;
+    let mut cmd = Command::new(&bin);
+    cmd.arg(&db)
+        .arg("-init").arg("/dev/null")
+        .arg("-unsigned")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn()
+        .map_err(|e| format!("failed to spawn {}: {}", bin, e))?;
+    use std::io::Write;
+    child.stdin.as_mut().ok_or("no stdin")?
+        .write_all(full_sql.as_bytes())
+        .map_err(|e| format!("write stdin: {}", e))?;
+    let out = child.wait_with_output().map_err(|e| e.to_string())?;
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    if !out.status.success() {
+        return Err(format!(
+            "duckdb exited {}: {}{}",
+            out.status.code().unwrap_or(-1), stderr, stdout
+        ));
+    }
+    Ok(stdout)
+}
+
+fn sql_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
 }
 
 // ---- server ----
@@ -224,6 +302,106 @@ impl DuckOrchServer {
         let out = run_cli(&["validate", &req.file], true).map_err(to_mcp_err)?;
         ok_text(out)
     }
+
+    // ---- write tools ----
+
+    #[tool(
+        name = "run_pipeline",
+        description = "Run the registered DAG via `duck-orch run`. Defaults to dry_run=true \
+                       (returns the lineage graph + recent task list as a preview, no execution). \
+                       Pass dry_run=false to actually invoke the pipeline."
+    )]
+    pub async fn run_pipeline(
+        &self,
+        Parameters(req): Parameters<RunPipelineRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        if req.dry_run {
+            // No execution — show what would run.
+            let graph = run_cli(&["graph", "lineage"], false).unwrap_or_default();
+            let status = run_cli(&["status"], true).unwrap_or_default();
+            let body = serde_json::json!({
+                "ok": true,
+                "dry_run": true,
+                "pipeline": req.pipeline,
+                "would_run_graph_mermaid": graph,
+                "recent_runs": serde_json::from_str::<serde_json::Value>(&status)
+                    .unwrap_or(serde_json::Value::Null),
+                "note": "dry_run=true — nothing executed. Pass dry_run=false to actually run.",
+            });
+            return ok_text(body.to_string());
+        }
+        let out = run_cli(&["run"], true).map_err(to_mcp_err)?;
+        let parsed = serde_json::from_str::<serde_json::Value>(&out)
+            .unwrap_or(serde_json::Value::String(out.clone()));
+        let body = serde_json::json!({
+            "ok": true,
+            "dry_run": false,
+            "pipeline": req.pipeline,
+            "output": parsed,
+        });
+        ok_text(body.to_string())
+    }
+
+    #[tool(
+        name = "register_task",
+        description = "Register tasks from a directory of `.sql` files. Wraps `duck-orch register <path> --json`. \
+                       Input must be an existing filesystem path (file or directory), not raw SQL."
+    )]
+    pub async fn register_task(
+        &self,
+        Parameters(req): Parameters<RegisterTaskRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = std::path::Path::new(&req.path);
+        if !p.exists() {
+            return Err(to_mcp_err(format!(
+                "register_task: path {:?} does not exist (expected a file or directory, not raw SQL)",
+                req.path
+            )));
+        }
+        let out = run_cli(&["register", &req.path], true).map_err(to_mcp_err)?;
+        let parsed = serde_json::from_str::<serde_json::Value>(&out)
+            .unwrap_or(serde_json::Value::String(out.clone()));
+        let body = serde_json::json!({ "ok": true, "output": parsed });
+        ok_text(body.to_string())
+    }
+
+    #[tool(
+        name = "unregister_task",
+        description = "Delete one row from `__orch__.tasks` by name. Requires confirm=true \
+                       (default false → refused). Implemented via a direct DuckDB DELETE because \
+                       the CLI has no `unregister` subcommand yet."
+    )]
+    pub async fn unregister_task(
+        &self,
+        Parameters(req): Parameters<UnregisterTaskRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        if !req.confirm {
+            return Err(to_mcp_err(
+                "unregister_task: confirm=false (default). Pass confirm=true to actually delete.".into(),
+            ));
+        }
+        let sql = format!(
+            "DELETE FROM __orch__.tasks WHERE name = {}; SELECT changes() AS deleted;",
+            sql_quote(&req.name)
+        );
+        let out = run_duckdb_sql(&sql).map_err(to_mcp_err)?;
+        let body = serde_json::json!({ "ok": true, "name": req.name, "output": out });
+        ok_text(body.to_string())
+    }
+
+    #[tool(
+        name = "schedule_add",
+        description = "Register a cron schedule. Wraps `duck-orch schedule add <name> <cron>`."
+    )]
+    pub async fn schedule_add(
+        &self,
+        Parameters(req): Parameters<ScheduleAddRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let out = run_cli(&["schedule", "add", &req.name, &req.cron], false)
+            .map_err(to_mcp_err)?;
+        let body = serde_json::json!({ "ok": true, "name": req.name, "cron": req.cron, "output": out });
+        ok_text(body.to_string())
+    }
 }
 
 #[tool_handler]
@@ -231,8 +409,10 @@ impl ServerHandler for DuckOrchServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "duckOrch MCP server — read-only tools that wrap the `duck-orch` CLI \
-                 (lineage, runs, validate). Set DUCK_ORCH_DB to point at the DuckDB file."
+                "duckOrch MCP server — wraps the `duck-orch` CLI. Read tools: list_pipelines, \
+                 list_runs, describe_task, get_lineage, validate. Write tools: run_pipeline \
+                 (dry_run=true by default), register_task, unregister_task (requires confirm=true), \
+                 schedule_add. Set DUCK_ORCH_DB to point at the DuckDB file."
                     .into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
