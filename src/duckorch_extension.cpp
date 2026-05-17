@@ -346,6 +346,22 @@ CREATE TABLE IF NOT EXISTS __orch__.asset_partitions (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (asset_name, partition_key)
 );
+
+-- Phase 15: AutomationCondition + @target_lag. Columns are added to the
+-- existing assets table so any pre-Phase15 database picks them up via the
+-- ALTER ... ADD COLUMN IF NOT EXISTS guard.
+ALTER TABLE __orch__.assets ADD COLUMN IF NOT EXISTS automation_condition VARCHAR;
+ALTER TABLE __orch__.assets ADD COLUMN IF NOT EXISTS target_lag_seconds BIGINT;
+
+-- Per-tick evaluation log. PK on (asset_name, evaluated_at) keeps history
+-- ordered and replayable; the sensor inserts one row per asset per tick.
+CREATE TABLE IF NOT EXISTS __orch__.automation_evaluations (
+    asset_name VARCHAR,
+    evaluated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    condition_met BOOLEAN,
+    reason VARCHAR,
+    PRIMARY KEY (asset_name, evaluated_at)
+);
 )";
 
 static void EnsureOrchSchema(Connection &con) {
@@ -557,17 +573,49 @@ static void OrchRegisterPragma(ClientContext &context, const FunctionParameters 
 			auto asset_tags_json = yyjson_ns::yyjson_obj_get(t, "asset_tags");
 			auto outputs_json = yyjson_ns::yyjson_obj_get(t, "outputs");
 
+			// Phase 15: AutomationCondition + @target_lag. Rust pre-computes
+			// the canonical DSL string (`automation_dsl`) on Task so the C++
+			// side can write it straight to assets.automation_condition with
+			// no extra round-trip; `target_lag_seconds` is a plain integer.
+			string automation_dsl = get_str("automation_dsl");
+			int64_t target_lag = 0;
+			bool target_lag_set = false;
+			{
+				auto tlv = yyjson_ns::yyjson_obj_get(t, "target_lag_seconds");
+				if (tlv && !yyjson_ns::yyjson_is_null(tlv)) {
+					if (yyjson_ns::yyjson_is_int(tlv)) {
+						target_lag = yyjson_ns::yyjson_get_int(tlv);
+						target_lag_set = true;
+					} else if (yyjson_ns::yyjson_is_uint(tlv)) {
+						target_lag = (int64_t)yyjson_ns::yyjson_get_uint(tlv);
+						target_lag_set = true;
+					}
+				}
+			}
+
 			// Helper to render the upsert for one Asset row. Re-registering a
 			// task UPDATEs the row (preserves created_at via DO UPDATE).
+			//
+			// Phase 15: the upsert now also writes automation_condition and
+			// target_lag_seconds when set on the task. ON CONFLICT clears
+			// these columns on re-registration if the headers have been
+			// dropped, so the source SQL is the source of truth.
 			auto emit_asset_upsert = [&](const string &a_name,
 			                              const string &a_kind,
 			                              const string &a_group,
 			                              const string &a_owner,
 			                              const string &a_desc,
 			                              const string &tags_literal) {
+				string automation_lit = automation_dsl.empty()
+				                            ? string("NULL")
+				                            : SqlEscape(automation_dsl);
+				string target_lag_lit = target_lag_set
+				                            ? std::to_string(target_lag)
+				                            : string("NULL");
 				sql << "INSERT INTO __orch__.assets "
 				    << "(name, kind, location, group_name, owner, description, "
-				    << "code_version, defined_by_task, tags) VALUES ("
+				    << "code_version, defined_by_task, tags, "
+				    << "automation_condition, target_lag_seconds) VALUES ("
 				    << SqlEscape(a_name) << ", "
 				    << SqlEscape(a_kind) << ", "
 				    << "NULL, "
@@ -576,7 +624,9 @@ static void OrchRegisterPragma(ClientContext &context, const FunctionParameters 
 				    << (a_desc.empty() ? string("NULL") : SqlEscape(a_desc)) << ", "
 				    << SqlEscape(code_version) << ", "
 				    << SqlEscape(name) << ", "
-				    << tags_literal
+				    << tags_literal << ", "
+				    << automation_lit << ", "
+				    << target_lag_lit
 				    << ") ON CONFLICT (name) DO UPDATE SET "
 				    << "kind=EXCLUDED.kind, "
 				    << "group_name=EXCLUDED.group_name, "
@@ -584,7 +634,9 @@ static void OrchRegisterPragma(ClientContext &context, const FunctionParameters 
 				    << "description=EXCLUDED.description, "
 				    << "code_version=EXCLUDED.code_version, "
 				    << "defined_by_task=EXCLUDED.defined_by_task, "
-				    << "tags=EXCLUDED.tags;\n";
+				    << "tags=EXCLUDED.tags, "
+				    << "automation_condition=EXCLUDED.automation_condition, "
+				    << "target_lag_seconds=EXCLUDED.target_lag_seconds;\n";
 			};
 
 			// Determine the "primary asset" for this task so Phase 14 can
@@ -1975,6 +2027,389 @@ static void OrchRunPartitionPragma(ClientContext &context,
 }
 
 // ========================================================================
+// Phase 15: AutomationCondition evaluator + sensor loop.
+//
+// Per-asset evaluation runs entirely in C++ — we query DB state to build
+// an EvalContext snapshot, hand it to the Rust evaluator via FFI, then
+// log the result to `__orch__.automation_evaluations`. When the condition
+// is met (and the task is registered), the sensor runs the task directly
+// via `RunSingleTask` (MVP — no separate run_queue table).
+// ========================================================================
+
+struct AutomationRow {
+	string asset_name;
+	string condition_dsl;
+	int64_t target_lag_seconds = 0;
+	bool target_lag_set = false;
+};
+
+static std::vector<AutomationRow> LoadAutomationAssets(Connection &con) {
+	std::vector<AutomationRow> out;
+	auto r = con.Query(
+	    "SELECT name, automation_condition, target_lag_seconds "
+	    "FROM __orch__.assets "
+	    "WHERE automation_condition IS NOT NULL "
+	    "ORDER BY name;");
+	if (r->HasError()) return out;
+	for (idx_t i = 0; i < r->RowCount(); i++) {
+		AutomationRow row;
+		row.asset_name = r->GetValue(0, i).ToString();
+		row.condition_dsl = r->GetValue(1, i).ToString();
+		auto tlv = r->GetValue(2, i);
+		if (!tlv.IsNull()) {
+			row.target_lag_seconds = tlv.GetValue<int64_t>();
+			row.target_lag_set = true;
+		}
+		out.push_back(std::move(row));
+	}
+	return out;
+}
+
+// Build the EvalContext JSON the Rust FFI expects from current DB state.
+// Pulls:
+//   * upstream_max_materialized_at — max(materialized_at) across upstream
+//     assets via __orch__.asset_edges
+//   * own_last_materialized_at     — max(materialized_at) for this asset
+//                                    where status='success'
+//   * missing_partition_count      — partitions without any success row
+//   * in_progress                  — any materialization with status='in_progress'
+//   * freshness_lag_seconds        — punted to Phase 16 (always NULL here)
+static string BuildEvalContextJson(Connection &con, const AutomationRow &row,
+                                    const string &now_iso) {
+	auto val_or_null = [](DataChunk &) {}; // placeholder for clarity
+	(void)val_or_null;
+
+	auto query_string = [&](const string &q) -> string {
+		auto r = con.Query(q);
+		if (r->HasError() || r->RowCount() == 0 || r->GetValue(0, 0).IsNull()) {
+			return string();
+		}
+		return r->GetValue(0, 0).ToString();
+	};
+	auto query_int = [&](const string &q) -> int64_t {
+		auto r = con.Query(q);
+		if (r->HasError() || r->RowCount() == 0 || r->GetValue(0, 0).IsNull()) {
+			return 0;
+		}
+		return r->GetValue(0, 0).GetValue<int64_t>();
+	};
+	auto query_bool = [&](const string &q) -> bool {
+		auto r = con.Query(q);
+		if (r->HasError() || r->RowCount() == 0 || r->GetValue(0, 0).IsNull()) {
+			return false;
+		}
+		return r->GetValue(0, 0).GetValue<bool>();
+	};
+
+	std::ostringstream q_up;
+	q_up << "SELECT max(materialized_at)::VARCHAR FROM __orch__.asset_materializations "
+	     << "WHERE asset_name IN (SELECT upstream_asset FROM __orch__.asset_edges "
+	     << "WHERE downstream_asset = " << SqlEscape(row.asset_name) << ");";
+	string upstream_max = query_string(q_up.str());
+
+	std::ostringstream q_own;
+	q_own << "SELECT max(materialized_at)::VARCHAR FROM __orch__.asset_materializations "
+	      << "WHERE asset_name = " << SqlEscape(row.asset_name)
+	      << " AND status = 'success';";
+	string own_last = query_string(q_own.str());
+
+	std::ostringstream q_miss;
+	q_miss << "SELECT count(*) FROM __orch__.asset_partitions p "
+	       << "WHERE p.asset_name = " << SqlEscape(row.asset_name)
+	       << " AND NOT EXISTS (SELECT 1 FROM __orch__.asset_materializations m "
+	       << "WHERE m.asset_name = p.asset_name AND m.partition_key = p.partition_key "
+	       << "AND m.status = 'success');";
+	int64_t missing = query_int(q_miss.str());
+
+	std::ostringstream q_prog;
+	q_prog << "SELECT EXISTS (SELECT 1 FROM __orch__.asset_materializations "
+	       << "WHERE asset_name = " << SqlEscape(row.asset_name)
+	       << " AND status = 'in_progress');";
+	bool in_progress = query_bool(q_prog.str());
+
+	auto json_or_null = [](const string &s) -> string {
+		if (s.empty()) return "null";
+		return JsonEscape(s);
+	};
+
+	std::ostringstream o;
+	o << "{"
+	  << "\"upstream_max_materialized_at\":" << json_or_null(upstream_max)
+	  << ",\"own_last_materialized_at\":" << json_or_null(own_last)
+	  << ",\"missing_partition_count\":" << missing
+	  << ",\"now\":" << JsonEscape(now_iso)
+	  << ",\"freshness_lag_seconds\":null"
+	  << ",\"in_progress\":" << (in_progress ? "true" : "false");
+	if (row.target_lag_set) {
+		o << ",\"target_lag_seconds\":" << row.target_lag_seconds;
+	}
+	o << "}";
+	return o.str();
+}
+
+struct EvalOutcome {
+	bool condition_met = false;
+	string reason;
+};
+
+static EvalOutcome EvaluateAutomationOnce(const AutomationRow &row, const string &ctx_json) {
+	EvalOutcome out;
+	bool ok = false;
+	auto json = CallRustString(
+	    [&](uint8_t **op, size_t *ol) {
+		    return orch_automation_evaluate(
+		        reinterpret_cast<const uint8_t *>(row.condition_dsl.c_str()),
+		        row.condition_dsl.size(),
+		        reinterpret_cast<const uint8_t *>(ctx_json.c_str()),
+		        ctx_json.size(),
+		        op, ol);
+	        },
+	    ok);
+	if (!ok) {
+		out.reason = "evaluator error: " + json;
+		return out;
+	}
+	auto doc = yyjson_ns::yyjson_read(json.c_str(), json.size(), 0);
+	if (!doc) {
+		out.reason = "evaluator returned invalid JSON";
+		return out;
+	}
+	auto root = yyjson_ns::yyjson_doc_get_root(doc);
+	auto met = yyjson_ns::yyjson_obj_get(root, "condition_met");
+	auto reason = yyjson_ns::yyjson_obj_get(root, "reason");
+	if (met) out.condition_met = yyjson_ns::yyjson_get_bool(met);
+	if (reason) {
+		const char *s = yyjson_ns::yyjson_get_str(reason);
+		if (s) out.reason = string(s);
+	}
+	yyjson_ns::yyjson_doc_free(doc);
+	return out;
+}
+
+// `PRAGMA orch_automation_status` — one row per automation-eligible asset
+// with its most-recent evaluation result.
+static string OrchAutomationStatusPragma(ClientContext &context,
+                                          const FunctionParameters &parameters) {
+	EnsureAssetSchemaCheap(context);
+	(void)parameters;
+	return "WITH latest AS ("
+	       "  SELECT asset_name, evaluated_at, condition_met, reason "
+	       "  FROM __orch__.automation_evaluations "
+	       "  QUALIFY row_number() OVER (PARTITION BY asset_name "
+	       "                             ORDER BY evaluated_at DESC) = 1"
+	       ") "
+	       "SELECT a.name AS asset_name, a.automation_condition, "
+	       "       a.target_lag_seconds, "
+	       "       l.condition_met AS last_condition_met, "
+	       "       l.reason         AS last_reason, "
+	       "       l.evaluated_at   AS last_evaluated_at "
+	       "FROM __orch__.assets a "
+	       "LEFT JOIN latest l ON l.asset_name = a.name "
+	       "WHERE a.automation_condition IS NOT NULL "
+	       "ORDER BY a.name;";
+}
+
+// `PRAGMA orch_automation_simulate('asset.name')` — dry-run: evaluate the
+// stored condition right now against fresh DB state and return the result
+// as a single-row SELECT *without* logging or enqueueing a run.
+static string OrchAutomationSimulatePragma(ClientContext &context,
+                                            const FunctionParameters &parameters) {
+	EnsureAssetSchemaCheap(context);
+	if (parameters.values.empty() || parameters.values[0].IsNull()) {
+		throw InvalidInputException("orch_automation_simulate requires an asset name");
+	}
+	string name = parameters.values[0].GetValue<string>();
+	Connection con(*context.db);
+	auto rows = LoadAutomationAssets(con);
+	AutomationRow *target = nullptr;
+	for (auto &r : rows) {
+		if (r.asset_name == name) { target = &r; break; }
+	}
+	if (!target) {
+		std::ostringstream o;
+		o << "SELECT " << SqlEscape(name) << " AS asset_name, "
+		  << "false AS condition_met, "
+		  << "'no automation condition registered' AS reason, "
+		  << "NULL::VARCHAR AS condition_dsl;";
+		return o.str();
+	}
+	auto now_iso = IsoNow();
+	// Trim ISO trailing 'Z' so duckdb timestamps parse it; the FFI accepts
+	// both forms but be consistent with how DuckDB stores timestamps.
+	string now_for_ctx = now_iso;
+	if (!now_for_ctx.empty() && now_for_ctx.back() == 'Z') {
+		now_for_ctx.pop_back();
+	}
+	// IsoNow uses 'T' as the date/time separator; the evaluator accepts that.
+	string ctx_json = BuildEvalContextJson(con, *target, now_for_ctx);
+	auto outcome = EvaluateAutomationOnce(*target, ctx_json);
+
+	std::ostringstream o;
+	o << "SELECT " << SqlEscape(target->asset_name) << " AS asset_name, "
+	  << (outcome.condition_met ? "true" : "false") << " AS condition_met, "
+	  << SqlEscape(outcome.reason) << " AS reason, "
+	  << SqlEscape(target->condition_dsl) << " AS condition_dsl;";
+	return o.str();
+}
+
+// --- Sensor loop ---------------------------------------------------------
+//
+// The sensor is a single background thread per process; only one tick runs
+// at a time. State is global because PRAGMAs don't carry instance handles.
+
+static std::atomic<bool> g_sensor_running{false};
+static std::atomic<bool> g_sensor_stop{false};
+static std::atomic<int64_t> g_sensor_interval_seconds{30};
+static std::mutex g_sensor_mutex;
+static std::unique_ptr<std::thread> g_sensor_thread;
+static std::atomic<DatabaseInstance *> g_sensor_db{nullptr};
+static std::mutex g_sensor_status_mutex;
+static string g_sensor_last_tick;
+static int64_t g_sensor_last_evaluated = 0;
+static int64_t g_sensor_last_triggered = 0;
+
+static void SensorTickOnce(Connection &con) {
+	auto rows = LoadAutomationAssets(con);
+	int64_t evaluated = 0;
+	int64_t triggered = 0;
+	for (auto &row : rows) {
+		auto now_iso = IsoNow();
+		string now_for_ctx = now_iso;
+		if (!now_for_ctx.empty() && now_for_ctx.back() == 'Z') {
+			now_for_ctx.pop_back();
+		}
+		string ctx_json = BuildEvalContextJson(con, row, now_for_ctx);
+		auto outcome = EvaluateAutomationOnce(row, ctx_json);
+		evaluated++;
+
+		// Log the evaluation.
+		std::ostringstream ins;
+		ins << "INSERT INTO __orch__.automation_evaluations "
+		    << "(asset_name, evaluated_at, condition_met, reason) VALUES ("
+		    << SqlEscape(row.asset_name) << ", current_timestamp, "
+		    << (outcome.condition_met ? "true" : "false") << ", "
+		    << SqlEscape(outcome.reason) << ");";
+		auto r = con.Query(ins.str());
+		if (r->HasError()) continue;
+
+		if (!outcome.condition_met) continue;
+
+		// Fire: look up the defining task and run it once (no partition).
+		auto task_name = LookupDefiningTask(con, row.asset_name);
+		if (task_name.empty()) continue;
+		TaskRow task;
+		try {
+			task = LoadTaskRowByName(con, task_name);
+		} catch (...) {
+			continue;
+		}
+		auto pipeline_uuid =
+		    con.Query("SELECT uuid()::VARCHAR")->GetValue(0, 0).ToString();
+		RunSingleTask(con, task, pipeline_uuid, string());
+		triggered++;
+	}
+	std::lock_guard<std::mutex> lk(g_sensor_status_mutex);
+	g_sensor_last_tick = IsoNow();
+	g_sensor_last_evaluated = evaluated;
+	g_sensor_last_triggered = triggered;
+}
+
+static void SensorThreadMain() {
+	auto *db = g_sensor_db.load();
+	if (!db) {
+		g_sensor_running.store(false);
+		return;
+	}
+	while (!g_sensor_stop.load()) {
+		try {
+			Connection con(*db);
+			EnsureOrchSchema(con);
+			SensorTickOnce(con);
+		} catch (...) {
+			// Sensor errors should never kill the loop; swallow and continue.
+		}
+		// Sleep in 1s chunks so stop is responsive.
+		int64_t interval = g_sensor_interval_seconds.load();
+		if (interval < 1) interval = 1;
+		for (int64_t i = 0; i < interval && !g_sensor_stop.load(); i++) {
+			std::this_thread::sleep_for(std::chrono::seconds(1));
+		}
+	}
+	g_sensor_running.store(false);
+}
+
+static void OrchSensorStartPragma(ClientContext &context,
+                                    const FunctionParameters &parameters) {
+	(void)parameters;
+	Connection con(*context.db);
+	EnsureOrchSchema(con);
+
+	std::lock_guard<std::mutex> lk(g_sensor_mutex);
+	if (g_sensor_running.load()) {
+		return; // idempotent
+	}
+	g_sensor_db.store(context.db.get());
+	g_sensor_stop.store(false);
+	g_sensor_running.store(true);
+	g_sensor_thread = std::make_unique<std::thread>(SensorThreadMain);
+}
+
+static void OrchSensorStopPragma(ClientContext &context,
+                                   const FunctionParameters &parameters) {
+	(void)parameters;
+	(void)context;
+	std::unique_ptr<std::thread> th;
+	{
+		std::lock_guard<std::mutex> lk(g_sensor_mutex);
+		g_sensor_stop.store(true);
+		th = std::move(g_sensor_thread);
+	}
+	if (th && th->joinable()) {
+		th->join();
+	}
+	g_sensor_running.store(false);
+}
+
+static string OrchSensorStatusPragma(ClientContext &context,
+                                       const FunctionParameters &parameters) {
+	EnsureAssetSchemaCheap(context);
+	(void)parameters;
+	string last_tick;
+	int64_t evaluated = 0;
+	int64_t triggered = 0;
+	{
+		std::lock_guard<std::mutex> lk(g_sensor_status_mutex);
+		last_tick = g_sensor_last_tick;
+		evaluated = g_sensor_last_evaluated;
+		triggered = g_sensor_last_triggered;
+	}
+	bool running = g_sensor_running.load();
+	int64_t interval = g_sensor_interval_seconds.load();
+	std::ostringstream o;
+	o << "SELECT " << (running ? "true" : "false") << " AS running, "
+	  << interval << " AS interval_seconds, "
+	  << (last_tick.empty() ? string("NULL::VARCHAR") : SqlEscape(last_tick))
+	  << " AS last_tick, "
+	  << evaluated << " AS last_evaluated, "
+	  << triggered << " AS last_triggered;";
+	return o.str();
+}
+
+// `PRAGMA orch_sensor_set_interval(N)` — change the polling interval in
+// seconds. Takes effect at the next sleep boundary.
+static void OrchSensorSetIntervalPragma(ClientContext &context,
+                                          const FunctionParameters &parameters) {
+	(void)context;
+	if (parameters.values.empty() || parameters.values[0].IsNull()) {
+		throw InvalidInputException(
+		    "orch_sensor_set_interval requires an integer seconds value");
+	}
+	int64_t n = parameters.values[0].GetValue<int64_t>();
+	if (n < 1) n = 1;
+	g_sensor_interval_seconds.store(n);
+}
+
+// ========================================================================
 // Configuration callbacks
 // ========================================================================
 
@@ -2518,6 +2953,23 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(PragmaFunction::PragmaCall(
 	    "orch_run_partition", static_cast<pragma_function_t>(OrchRunPartitionPragma),
 	    {LogicalType::VARCHAR, LogicalType::VARCHAR}));
+
+	// Phase 15: AutomationCondition + sensor pragmas.
+	loader.RegisterFunction(PragmaFunction::PragmaStatement(
+	    "orch_automation_status", OrchAutomationStatusPragma));
+	loader.RegisterFunction(PragmaFunction::PragmaCall(
+	    "orch_automation_simulate", OrchAutomationSimulatePragma,
+	    {LogicalType::VARCHAR}));
+	loader.RegisterFunction(PragmaFunction::PragmaStatement(
+	    "orch_sensor_start", static_cast<pragma_function_t>(OrchSensorStartPragma)));
+	loader.RegisterFunction(PragmaFunction::PragmaStatement(
+	    "orch_sensor_stop", static_cast<pragma_function_t>(OrchSensorStopPragma)));
+	loader.RegisterFunction(PragmaFunction::PragmaStatement(
+	    "orch_sensor_status", OrchSensorStatusPragma));
+	loader.RegisterFunction(PragmaFunction::PragmaCall(
+	    "orch_sensor_set_interval",
+	    static_cast<pragma_function_t>(OrchSensorSetIntervalPragma),
+	    {LogicalType::BIGINT}));
 }
 
 void DuckorchExtension::Load(ExtensionLoader &loader) {

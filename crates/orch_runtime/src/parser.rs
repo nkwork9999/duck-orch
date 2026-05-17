@@ -1,7 +1,7 @@
 // Parses SQL files with `-- @key value` header comments into Task structs.
 
 use crate::binding::parse_param_decl;
-use orch_common::{parse_partition_decl, Task, TaskTest};
+use orch_common::{parse_automation, parse_partition_decl, parse_target_lag, Task, TaskTest};
 use std::path::Path;
 
 #[derive(Debug)]
@@ -157,6 +157,39 @@ fn apply_header(task: &mut Task, content: &str, line: usize) -> Result<(), Parse
                 line: Some(line),
             })?;
             task.partitions = Some(def);
+        }
+        // Phase 15: AutomationCondition / TARGET_LAG headers.
+        //
+        // `@automation <expr>` — Dagster-style condition AST. The parsed AST
+        // is stored on `task.automation`; we *also* pre-compute the canonical
+        // DSL string (`task.automation_dsl`) so the C++ asset upsert path can
+        // write `automation_condition` straight to the DB without a separate
+        // FFI round-trip just to serialize the enum.
+        "automation" => {
+            let cond = parse_automation(rest).map_err(|e| ParseError {
+                message: e.to_string(),
+                line: Some(line),
+            })?;
+            task.automation_dsl = Some(cond.serialize_dsl());
+            task.automation = Some(cond);
+        }
+        // `@target_lag <duration>` — Snowflake Dynamic Tables-style throttle.
+        // Internally `@target_lag 5min` is equivalent to
+        // `@automation eager() throttle 5min`; the throttle column is stored
+        // separately so the evaluator can wrap *any* condition tree with it.
+        // If no explicit `@automation` is set, we synthesize a default
+        // `eager()` condition so the asset is sensor-eligible out of the box.
+        "target_lag" => {
+            let secs = parse_target_lag(rest).map_err(|e| ParseError {
+                message: e.to_string(),
+                line: Some(line),
+            })?;
+            task.target_lag_seconds = Some(secs);
+            if task.automation.is_none() {
+                let cond = orch_common::AutomationCondition::Eager;
+                task.automation_dsl = Some(cond.serialize_dsl());
+                task.automation = Some(cond);
+            }
         }
         _ => {}
     }
@@ -367,6 +400,75 @@ mod tests {
         let sql = "-- @name t\nSELECT 1;\n";
         let task = parse_sql_file(sql, None).expect("parse ok");
         assert!(task.partitions.is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 15: @automation / @target_lag header parsing
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parses_automation_eager_shortcut() {
+        let sql = "-- @name t\n-- @automation eager\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert_eq!(
+            task.automation,
+            Some(orch_common::AutomationCondition::Eager)
+        );
+        assert_eq!(task.automation_dsl.as_deref(), Some("eager()"));
+    }
+
+    #[test]
+    fn parses_automation_combined() {
+        let sql = "-- @name t\n-- @automation eager AND NOT in_progress()\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert!(matches!(
+            task.automation,
+            Some(orch_common::AutomationCondition::And(_, _))
+        ));
+        assert_eq!(
+            task.automation_dsl.as_deref(),
+            Some("eager() AND NOT in_progress()")
+        );
+    }
+
+    #[test]
+    fn rejects_bad_automation() {
+        let sql = "-- @name t\n-- @automation magic_atom()\nSELECT 1;\n";
+        let err = parse_sql_file(sql, None).expect_err("should fail");
+        assert!(err.message.contains("@automation"), "got: {}", err.message);
+        assert_eq!(err.line, Some(2));
+    }
+
+    #[test]
+    fn parses_target_lag_minutes() {
+        let sql = "-- @name t\n-- @target_lag 5min\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert_eq!(task.target_lag_seconds, Some(300));
+        // target_lag without explicit @automation auto-synthesizes eager().
+        assert_eq!(
+            task.automation,
+            Some(orch_common::AutomationCondition::Eager)
+        );
+        assert_eq!(task.automation_dsl.as_deref(), Some("eager()"));
+    }
+
+    #[test]
+    fn target_lag_does_not_clobber_explicit_automation() {
+        let sql = "-- @name t\n-- @automation on_missing()\n-- @target_lag 30s\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert_eq!(
+            task.automation,
+            Some(orch_common::AutomationCondition::OnMissing)
+        );
+        assert_eq!(task.target_lag_seconds, Some(30));
+    }
+
+    #[test]
+    fn rejects_bad_target_lag() {
+        let sql = "-- @name t\n-- @target_lag five-minutes\nSELECT 1;\n";
+        let err = parse_sql_file(sql, None).expect_err("should fail");
+        assert!(err.message.contains("@target_lag"), "got: {}", err.message);
+        assert_eq!(err.line, Some(2));
     }
 
     #[test]

@@ -35,6 +35,12 @@ SUBCOMMANDS:
     schedule list                List schedules
     schedule run-due             Run pipelines whose next trigger is due
     schedule daemon              Long-running loop polling schedules every 30s
+    automation status [--json]                  Per-asset automation condition + last eval
+    automation simulate <asset> [--json]        Dry-run eval one asset (no logging, no run)
+    sensor start                                Start the automation sensor thread
+    sensor stop                                 Stop the automation sensor thread
+    sensor status                               Show running flag + last tick stats
+    sensor set-interval <seconds>               Change the sensor polling interval
     help                     Show this help
 
 GLOBAL FLAGS:
@@ -703,6 +709,105 @@ fn run_schedule_due(args: &Args) -> i32 {
     0
 }
 
+// =============================================================================
+// Phase 15: `duck-orch automation ...` + `duck-orch sensor ...` subcommands.
+// =============================================================================
+
+fn cmd_automation(args: &Args) -> i32 {
+    let sub = args.rest.first().map(|s| s.as_str()).unwrap_or("");
+    match sub {
+        "status" => {
+            let (out, err, code) =
+                match run_sql(args, "PRAGMA orch_automation_status;", args.json) {
+                    Ok(r) => r,
+                    Err(e) => { eprintln!("{}", e); return 2; }
+                };
+            if !err.is_empty() { eprintln!("{}", err); }
+            print!("{}", out);
+            code
+        }
+        "simulate" => {
+            if args.rest.len() < 2 {
+                eprintln!("automation simulate: missing <asset>");
+                return 2;
+            }
+            let asset = &args.rest[1];
+            let sql = format!("PRAGMA orch_automation_simulate({});", sql_escape(asset));
+            let (out, err, code) = match run_sql(args, &sql, args.json) {
+                Ok(r) => r,
+                Err(e) => { eprintln!("{}", e); return 2; }
+            };
+            if !err.is_empty() { eprintln!("{}", err); }
+            print!("{}", out);
+            code
+        }
+        "" => {
+            eprintln!("automation: missing subcommand (status|simulate)");
+            2
+        }
+        other => {
+            eprintln!("unknown automation subcommand: {}", other);
+            2
+        }
+    }
+}
+
+fn cmd_sensor(args: &Args) -> i32 {
+    let sub = args.rest.first().map(|s| s.as_str()).unwrap_or("");
+    match sub {
+        "start" | "enable" => {
+            let (_, err, code) = match run_sql(args, "PRAGMA orch_sensor_start;", false) {
+                Ok(r) => r,
+                Err(e) => { eprintln!("{}", e); return 2; }
+            };
+            if !err.is_empty() { eprintln!("{}", err); }
+            code
+        }
+        "stop" | "disable" => {
+            let (_, err, code) = match run_sql(args, "PRAGMA orch_sensor_stop;", false) {
+                Ok(r) => r,
+                Err(e) => { eprintln!("{}", e); return 2; }
+            };
+            if !err.is_empty() { eprintln!("{}", err); }
+            code
+        }
+        "status" => {
+            let (out, err, code) = match run_sql(args, "PRAGMA orch_sensor_status;", args.json) {
+                Ok(r) => r,
+                Err(e) => { eprintln!("{}", e); return 2; }
+            };
+            if !err.is_empty() { eprintln!("{}", err); }
+            print!("{}", out);
+            code
+        }
+        "set-interval" => {
+            if args.rest.len() < 2 {
+                eprintln!("sensor set-interval: missing <seconds>");
+                return 2;
+            }
+            let n: i64 = match args.rest[1].parse() {
+                Ok(v) => v,
+                Err(_) => { eprintln!("sensor set-interval: invalid integer"); return 2; }
+            };
+            let sql = format!("PRAGMA orch_sensor_set_interval({});", n);
+            let (_, err, code) = match run_sql(args, &sql, false) {
+                Ok(r) => r,
+                Err(e) => { eprintln!("{}", e); return 2; }
+            };
+            if !err.is_empty() { eprintln!("{}", err); }
+            code
+        }
+        "" => {
+            eprintln!("sensor: missing subcommand (start|stop|status|set-interval)");
+            2
+        }
+        other => {
+            eprintln!("unknown sensor subcommand: {}", other);
+            2
+        }
+    }
+}
+
 fn main() {
     let args = match parse_args() {
         Ok(a) => a,
@@ -720,6 +825,8 @@ fn main() {
         "asset" => cmd_asset(&args),
         "backfill" => cmd_backfill(&args),
         "schedule" => cmd_schedule(&args),
+        "automation" => cmd_automation(&args),
+        "sensor" => cmd_sensor(&args),
         "help" | "" => { print!("{}", HELP); 0 }
         other => { eprintln!("unknown subcommand: {}", other); print!("{}", HELP); 2 }
     };
