@@ -727,6 +727,22 @@ static void OrchRegisterPragma(ClientContext &context, const FunctionParameters 
 	if (exec_result->HasError()) {
 		throw InvalidInputException("orch_register exec failed: " + exec_result->GetError());
 	}
+
+	// Phase 15 fix: populate __orch__.asset_edges from declared task
+	// inputs/outputs at register time too — not only post-run. The
+	// Automation Sensor's upstream lookup uses asset_edges, and it would
+	// otherwise see no upstream for a fresh downstream Asset until that
+	// downstream itself runs (chicken-and-egg). Only Asset-to-Asset edges
+	// land; anonymous source tables (e.g. raw.*) are filtered out.
+	user_con.Query(
+	    "INSERT OR IGNORE INTO __orch__.asset_edges "
+	    "(upstream_asset, downstream_asset, via_task, edge_type) "
+	    "SELECT i.input, o.output, t.name, 'declared' "
+	    "FROM __orch__.tasks t, "
+	    "     UNNEST(t.inputs)  AS i(input), "
+	    "     UNNEST(t.outputs) AS o(output) "
+	    "WHERE EXISTS (SELECT 1 FROM __orch__.assets a WHERE a.name = i.input) "
+	    "  AND EXISTS (SELECT 1 FROM __orch__.assets a WHERE a.name = o.output);");
 }
 
 // ========================================================================
@@ -2351,7 +2367,9 @@ static void OrchSensorStartPragma(ClientContext &context,
 	g_sensor_db.store(context.db.get());
 	g_sensor_stop.store(false);
 	g_sensor_running.store(true);
-	g_sensor_thread = std::make_unique<std::thread>(SensorThreadMain);
+	// DuckDB's helper.hpp banishes std::make_unique (forces make_uniq).
+	// std::thread isn't a DuckDB type, so use raw new + reset.
+	g_sensor_thread.reset(new std::thread(SensorThreadMain));
 }
 
 static void OrchSensorStopPragma(ClientContext &context,
