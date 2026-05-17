@@ -1,5 +1,6 @@
 // Canonical Task definition. Shared by parser, dag, executor, lineage.
 
+use crate::partition::PartitionDef;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -39,6 +40,10 @@ pub struct Task {
     pub asset_description: Option<String>,
     /// Asset tags for filtering/grouping in `asset list`.
     pub asset_tags: Vec<String>,
+    /// Phase 14: partition definition from `-- @partitions_by <expr>`.
+    /// `None` means the asset is unpartitioned (everything goes under the
+    /// `'__default__'` partition_key, preserving Phase 13 behaviour).
+    pub partitions: Option<PartitionDef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

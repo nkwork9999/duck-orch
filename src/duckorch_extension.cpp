@@ -236,8 +236,19 @@ CREATE TABLE IF NOT EXISTS __orch__.tasks (
     incremental_by VARCHAR,
     tags VARCHAR[],
     file_path VARCHAR,
-    registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    -- Phase 14: serialized PartitionDef (serde JSON) when the task carries
+    -- a `-- @partitions_by ...` header. NULL = unpartitioned task.
+    partitions_json VARCHAR,
+    -- Phase 14: declared `-- @param name:TYPE` specs as a JSON array of
+    -- `{name, ty}`. Re-hydrated at execution time so RunSingleTask knows
+    -- which params to bind via DuckDB PREPARE.
+    params_json VARCHAR
 );
+-- Tolerate older databases that pre-date Phase 14: add the new columns
+-- if they are missing. NULL default keeps the unpartitioned path intact.
+ALTER TABLE __orch__.tasks ADD COLUMN IF NOT EXISTS partitions_json VARCHAR;
+ALTER TABLE __orch__.tasks ADD COLUMN IF NOT EXISTS params_json VARCHAR;
 
 CREATE TABLE IF NOT EXISTS __orch__.runs (
     run_id UUID PRIMARY KEY,
@@ -321,6 +332,19 @@ CREATE TABLE IF NOT EXISTS __orch__.asset_edges (
     via_task VARCHAR,
     edge_type VARCHAR,
     PRIMARY KEY (upstream_asset, downstream_asset, via_task)
+);
+
+-- Phase 14: per-Asset partition registry. One row per (asset, key) tuple
+-- expanded from `@partitions_by` at registration time. `dimension_values`
+-- is a JSON string (`{"date":"2026-05-17","region":"jp"}` for Multi,
+-- `{"partition_key":"jp"}` for Static, `{"partition_key":"2026-05-17"}`
+-- for Daily). Re-registration is idempotent via INSERT OR IGNORE.
+CREATE TABLE IF NOT EXISTS __orch__.asset_partitions (
+    asset_name VARCHAR,
+    partition_key VARCHAR,
+    dimension_values VARCHAR,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (asset_name, partition_key)
 );
 )";
 
@@ -440,9 +464,29 @@ static void OrchRegisterPragma(ClientContext &context, const FunctionParameters 
 			string name = get_str("name");
 			if (name.empty()) continue;
 
+			// Phase 14: serialize partitions + params back to JSON for
+			// storage on __orch__.tasks. The Rust side already shaped them
+			// inside the task JSON; we extract the sub-object and re-emit
+			// it so RunSingleTask can rehydrate at execution time.
+			auto get_sub_json = [&](const char *k) -> string {
+				auto v = yyjson_ns::yyjson_obj_get(t, k);
+				if (!v) return string();
+				auto *mut = yyjson_ns::yyjson_val_mut_copy(nullptr, v);
+				if (!mut) return string();
+				size_t l = 0;
+				char *raw =
+				    yyjson_ns::yyjson_mut_val_write(mut, 0, &l);
+				string out = raw ? string(raw, l) : string();
+				free(raw);
+				return out;
+			};
+			string partitions_json = get_sub_json("partitions");
+			string params_json = get_sub_json("params");
+
 			sql << "INSERT OR REPLACE INTO __orch__.tasks "
 			    << "(name, description, owner, sql, inputs, outputs, depends_on, schedule_cron, "
-			    << "retries, timeout_seconds, incremental_by, tags, file_path) VALUES ("
+			    << "retries, timeout_seconds, incremental_by, tags, file_path, "
+			    << "partitions_json, params_json) VALUES ("
 			    << SqlEscape(name) << ", "
 			    << SqlEscape(get_str("description")) << ", "
 			    << SqlEscape(get_str("owner")) << ", "
@@ -461,7 +505,15 @@ static void OrchRegisterPragma(ClientContext &context, const FunctionParameters 
 			}
 			sql << ", " << SqlEscape(get_str("incremental_by")) << ", "
 			    << SqlArrayLiteral(yyjson_ns::yyjson_obj_get(t, "tags")) << ", "
-			    << SqlEscape(get_str("file_path")) << ");\n";
+			    << SqlEscape(get_str("file_path")) << ", "
+			    << (partitions_json.empty() || partitions_json == "null"
+			            ? string("NULL")
+			            : SqlEscape(partitions_json))
+			    << ", "
+			    << (params_json.empty() || params_json == "null"
+			            ? string("NULL")
+			            : SqlEscape(params_json))
+			    << ");\n";
 
 			// Save tests
 			sql << "DELETE FROM __orch__.tests WHERE task_name = " << SqlEscape(name) << ";\n";
@@ -533,12 +585,18 @@ static void OrchRegisterPragma(ClientContext &context, const FunctionParameters 
 				    << "tags=EXCLUDED.tags;\n";
 			};
 
+			// Determine the "primary asset" for this task so Phase 14 can
+			// expand partition keys against it. Mirrors the asset upsert
+			// fan-out: explicit `@asset name=...` wins, else the first
+			// `@outputs` entry.
+			string primary_asset;
 			if (!asset_name.empty()) {
 				string kind = asset_kind.empty() ? string("table") : asset_kind;
 				string owner = asset_owner.empty() ? task_owner : asset_owner;
 				string desc = asset_desc.empty() ? task_desc : asset_desc;
 				string tags_lit = SqlArrayLiteral(asset_tags_json);
 				emit_asset_upsert(asset_name, kind, asset_group, owner, desc, tags_lit);
+				primary_asset = asset_name;
 			} else if (outputs_json && yyjson_ns::yyjson_is_arr(outputs_json)) {
 				// Backward-compat: each @outputs entry becomes its own Asset.
 				size_t oidx, omax;
@@ -550,6 +608,60 @@ static void OrchRegisterPragma(ClientContext &context, const FunctionParameters 
 					string tags_lit = SqlArrayLiteral(asset_tags_json);
 					emit_asset_upsert(out_name, string("table"), asset_group,
 					                   task_owner, task_desc, tags_lit);
+					if (primary_asset.empty()) primary_asset = out_name;
+				}
+			}
+
+			// Phase 14: if the task is partitioned and has at least one
+			// asset, expand the partition definition into concrete keys
+			// and INSERT OR IGNORE them into __orch__.asset_partitions.
+			// Re-registration is idempotent on (asset_name, partition_key).
+			if (!primary_asset.empty() && !partitions_json.empty() &&
+			    partitions_json != "null") {
+				bool exp_ok = false;
+				auto rows_json = CallRustString(
+				    [&](uint8_t **op, size_t *ol) {
+					    return orch_partition_expand(
+					        reinterpret_cast<const uint8_t *>(partitions_json.c_str()),
+					        partitions_json.size(), nullptr, 0, op, ol);
+				        },
+				    exp_ok);
+				if (exp_ok) {
+					auto rdoc = yyjson_ns::yyjson_read(rows_json.c_str(), rows_json.size(), 0);
+					if (rdoc) {
+						auto rroot = yyjson_ns::yyjson_doc_get_root(rdoc);
+						if (rroot && yyjson_ns::yyjson_is_arr(rroot)) {
+							size_t ridx, rmax;
+							yyjson_ns::yyjson_val *r;
+							yyjson_arr_foreach(rroot, ridx, rmax, r) {
+								auto kv = yyjson_ns::yyjson_obj_get(r, "key");
+								auto dv = yyjson_ns::yyjson_obj_get(r, "dimension_values");
+								const char *ks = kv ? yyjson_ns::yyjson_get_str(kv) : nullptr;
+								if (!ks) continue;
+								// Re-emit dimension_values as a JSON string.
+								string dim_str;
+								if (dv) {
+									auto *mut = yyjson_ns::yyjson_val_mut_copy(nullptr, dv);
+									if (mut) {
+										size_t l = 0;
+										char *raw =
+										    yyjson_ns::yyjson_mut_val_write(mut, 0, &l);
+										if (raw) {
+											dim_str = string(raw, l);
+											free(raw);
+										}
+									}
+								}
+								sql << "INSERT OR IGNORE INTO __orch__.asset_partitions "
+								    << "(asset_name, partition_key, dimension_values) VALUES ("
+								    << SqlEscape(primary_asset) << ", "
+								    << SqlEscape(string(ks)) << ", "
+								    << (dim_str.empty() ? string("NULL") : SqlEscape(dim_str))
+								    << ");\n";
+							}
+						}
+						yyjson_ns::yyjson_doc_free(rdoc);
+					}
 				}
 			}
 		}
@@ -660,11 +772,16 @@ struct TaskRow {
 	int retries = 0;
 	string incremental_by;
 	std::vector<string> tests; // [query, assertion, query, assertion, ...]
+	// Phase 14: hydrated from __orch__.tasks. Both NULL/empty when the task
+	// is unpartitioned / declares no @param headers.
+	string partitions_json;
+	string params_json;
 };
 
 static std::vector<TaskRow> LoadTaskRows(Connection &con) {
 	auto result = con.Query(
-	    "SELECT name, sql, retries, incremental_by FROM __orch__.tasks");
+	    "SELECT name, sql, retries, incremental_by, partitions_json, params_json "
+	    "FROM __orch__.tasks");
 	if (result->HasError()) {
 		throw InvalidInputException("failed: " + result->GetError());
 	}
@@ -677,6 +794,10 @@ static std::vector<TaskRow> LoadTaskRows(Connection &con) {
 		r.retries = rv.IsNull() ? 0 : rv.GetValue<int32_t>();
 		auto iv = result->GetValue(3, i);
 		r.incremental_by = iv.IsNull() ? string() : iv.ToString();
+		auto pv = result->GetValue(4, i);
+		r.partitions_json = pv.IsNull() ? string() : pv.ToString();
+		auto pmv = result->GetValue(5, i);
+		r.params_json = pmv.IsNull() ? string() : pmv.ToString();
 		out.push_back(std::move(r));
 	}
 	return out;
@@ -705,10 +826,72 @@ static string RunTaskTests(Connection &con, const string &task_name) {
 	return "";
 }
 
+// Phase 14: helper that bridges a Rust-side ParamType token to a DuckDB
+// Value. The Value::FromString equivalents would also work but going via
+// LogicalType keeps us explicit about coercion failures.
+static Value CoerceParam(const string &raw, const string &ty_token) {
+	try {
+		if (ty_token == "Date") return Value::DATE(Date::FromString(raw));
+		if (ty_token == "Timestamp") {
+			return Value::TIMESTAMP(Timestamp::FromString(raw, false));
+		}
+		if (ty_token == "Integer") return Value::INTEGER((int32_t)std::stoll(raw));
+		if (ty_token == "BigInt") return Value::BIGINT((int64_t)std::stoll(raw));
+		if (ty_token == "Double") return Value::DOUBLE(std::stod(raw));
+		if (ty_token == "Boolean") {
+			string l = raw;
+			std::transform(l.begin(), l.end(), l.begin(),
+			               [](unsigned char c) { return std::tolower(c); });
+			return Value::BOOLEAN(l == "true" || l == "1");
+		}
+	} catch (...) {
+		// Fall through to VARCHAR (DuckDB will cast at execute time).
+	}
+	return Value(raw);
+}
+
+// Phase 14: build the parameter map for PREPARE binding. Sources values
+// from `bound_params` (typically `{partition_key: "2026-05-17"}`). Returns
+// a name→Value map keyed by declared ParamSpec.name; declared params with
+// no provided value are skipped (DuckDB will fail prepare if SQL truly
+// needs them).
+static unordered_map<string, Value>
+BuildParamValues(const string &params_json,
+                 const std::map<string, string> &bound_params) {
+	unordered_map<string, Value> out;
+	if (params_json.empty() || params_json == "null") {
+		return out;
+	}
+	auto doc = yyjson_ns::yyjson_read(params_json.c_str(), params_json.size(), 0);
+	if (!doc) return out;
+	auto root = yyjson_ns::yyjson_doc_get_root(doc);
+	if (root && yyjson_ns::yyjson_is_arr(root)) {
+		size_t i, m;
+		yyjson_ns::yyjson_val *p;
+		yyjson_arr_foreach(root, i, m, p) {
+			auto nv = yyjson_ns::yyjson_obj_get(p, "name");
+			auto tv = yyjson_ns::yyjson_obj_get(p, "ty");
+			const char *ns = nv ? yyjson_ns::yyjson_get_str(nv) : nullptr;
+			const char *ts = tv ? yyjson_ns::yyjson_get_str(tv) : "Varchar";
+			if (!ns) continue;
+			auto it = bound_params.find(string(ns));
+			if (it == bound_params.end()) continue;
+			out.emplace(string(ns), CoerceParam(it->second, string(ts ? ts : "Varchar")));
+		}
+	}
+	yyjson_ns::yyjson_doc_free(doc);
+	return out;
+}
+
 // Run a single task in `con`. Updates state tables and emits OL events.
+// `partition_key` is `__default__` for unpartitioned tasks and a concrete
+// key (e.g. `2026-05-17`, `2026-05-17|jp`) for partitioned runs. When set
+// to a non-default value AND the task carries `params`, the SQL is run via
+// `PREPARE`+bind so `$partition_key` / `$partition_<dim>` resolve natively.
 // Returns true on success, false on failure.
 static bool RunSingleTask(Connection &con, const TaskRow &task, const string &pipeline_run_id,
-                          const string &tasks_json) {
+                          const string &tasks_json,
+                          const string &partition_key = "__default__") {
 	auto run_uuid = con.Query("SELECT uuid()::VARCHAR")->GetValue(0, 0).ToString();
 	string started = IsoNow();
 
@@ -759,17 +942,98 @@ static bool RunSingleTask(Connection &con, const TaskRow &task, const string &pi
 	    sub_ok);
 	if (sub_ok) sql_to_run = substituted;
 
+	// Phase 14: when running a specific partition, build the bind map for
+	// `$partition_key` and (for Multi) `$partition_<dim>` placeholders so
+	// the SQL is executed via DuckDB's PREPARE + bind path rather than
+	// raw textual interpolation. Unpartitioned tasks (partition_key=
+	// "__default__") fall through to the plain Query path, preserving
+	// Phase 13 behaviour.
+	std::map<string, string> bound;
+	bool use_prepared = false;
+	if (partition_key != "__default__" && !task.params_json.empty()) {
+		use_prepared = true;
+		bound["partition_key"] = partition_key;
+		if (!task.partitions_json.empty() && task.partitions_json != "null") {
+			bool split_ok = false;
+			auto split_json = CallRustString(
+			    [&](uint8_t **op, size_t *ol) {
+				    return orch_partition_split_key(
+				        reinterpret_cast<const uint8_t *>(task.partitions_json.c_str()),
+				        task.partitions_json.size(),
+				        reinterpret_cast<const uint8_t *>(partition_key.c_str()),
+				        partition_key.size(), op, ol);
+			        },
+			    split_ok);
+			if (split_ok) {
+				auto sd = yyjson_ns::yyjson_read(split_json.c_str(), split_json.size(), 0);
+				if (sd) {
+					auto sroot = yyjson_ns::yyjson_doc_get_root(sd);
+					if (sroot && yyjson_ns::yyjson_is_arr(sroot)) {
+						size_t i, m;
+						yyjson_ns::yyjson_val *p;
+						yyjson_arr_foreach(sroot, i, m, p) {
+							auto nv = yyjson_ns::yyjson_obj_get(p, "name");
+							auto vv = yyjson_ns::yyjson_obj_get(p, "value");
+							const char *ns = nv ? yyjson_ns::yyjson_get_str(nv) : nullptr;
+							const char *vs = vv ? yyjson_ns::yyjson_get_str(vv) : nullptr;
+							if (!ns || !vs) continue;
+							// Both `partition_key` and dimensioned aliases
+							// (e.g. `partition_date`, `partition_region`)
+							// can appear in @param headers — bind whichever
+							// the user declared.
+							bound[string(ns)] = string(vs);
+							bound[string("partition_") + string(ns)] = string(vs);
+						}
+					}
+					yyjson_ns::yyjson_doc_free(sd);
+				}
+			}
+		}
+	}
+
 	int retries_left = task.retries;
 	int retry_count = 0;
 	bool success = false;
 	string error_msg;
 	while (true) {
-		auto exec_result = con.Query(sql_to_run);
-		if (!exec_result->HasError()) {
+		bool ran_ok = false;
+		string this_err;
+		if (use_prepared) {
+			auto prepared = con.Prepare(sql_to_run);
+			if (prepared->HasError()) {
+				this_err = prepared->GetError();
+			} else {
+				auto values = BuildParamValues(task.params_json, bound);
+				// PreparedStatement::Execute accepts a
+				// case_insensitive_map_t<BoundParameterData> for named
+				// bindings; values are validated against the prepared
+				// statement's declared parameter set.
+				case_insensitive_map_t<BoundParameterData> bind_map;
+				for (auto &kv : values) {
+					bind_map.emplace(kv.first, BoundParameterData(kv.second));
+				}
+				auto qres = prepared->Execute(bind_map);
+				if (qres && !qres->HasError()) {
+					ran_ok = true;
+				} else if (qres) {
+					this_err = qres->GetError();
+				} else {
+					this_err = "prepared execute returned null";
+				}
+			}
+		} else {
+			auto qres = con.Query(sql_to_run);
+			if (!qres->HasError()) {
+				ran_ok = true;
+			} else {
+				this_err = qres->GetError();
+			}
+		}
+		if (ran_ok) {
 			success = true;
 			break;
 		}
-		error_msg = exec_result->GetError();
+		error_msg = this_err;
 		if (retries_left <= 0) break;
 		retries_left--;
 		retry_count++;
@@ -802,12 +1066,15 @@ static bool RunSingleTask(Connection &con, const TaskRow &task, const string &pi
 		// Phase 13: record successful materialization for every Asset this
 		// task produces. Sourced from __orch__.assets where defined_by_task
 		// matches — covers both the explicit `@asset` row and the per-output
-		// backward-compat fan-out from `@outputs`.
+		// backward-compat fan-out from `@outputs`. Phase 14: partition_key
+		// reflects the specific partition just run (defaults to
+		// `__default__` for unpartitioned tasks).
 		{
 			std::ostringstream mat;
 			mat << "INSERT OR IGNORE INTO __orch__.asset_materializations "
 			    << "(asset_name, partition_key, materialized_at, run_id, rows, bytes, status) "
-			    << "SELECT name, '__default__', TIMESTAMP '" << finished << "', "
+			    << "SELECT name, " << SqlEscape(partition_key)
+			    << ", TIMESTAMP '" << finished << "', "
 			    << "CAST(" << SqlEscape(run_uuid) << " AS UUID), NULL, NULL, 'success' "
 			    << "FROM __orch__.assets WHERE defined_by_task = "
 			    << SqlEscape(task.name) << ";";
@@ -853,13 +1120,14 @@ static bool RunSingleTask(Connection &con, const TaskRow &task, const string &pi
 		con.Query(ins.str());
 
 		// Phase 13: record a 'failed' materialization row for each declared
-		// Asset so failures show up in `asset materializations` history
-		// (CLI lands in milestone 2 but the data is captured now).
+		// Asset so failures show up in `asset materializations` history.
+		// Phase 14: scoped to the partition that just failed.
 		{
 			std::ostringstream mat;
 			mat << "INSERT OR IGNORE INTO __orch__.asset_materializations "
 			    << "(asset_name, partition_key, materialized_at, run_id, rows, bytes, status) "
-			    << "SELECT name, '__default__', TIMESTAMP '" << finished << "', "
+			    << "SELECT name, " << SqlEscape(partition_key)
+			    << ", TIMESTAMP '" << finished << "', "
 			    << "CAST(" << SqlEscape(run_uuid) << " AS UUID), NULL, NULL, 'failed' "
 			    << "FROM __orch__.assets WHERE defined_by_task = "
 			    << SqlEscape(task.name) << ";";
@@ -1419,6 +1687,258 @@ static string OrchAssetHealthPragma(ClientContext &context,
 }
 
 // ========================================================================
+// Phase 14: Partition read-side pragmas + backfill executor.
+// ========================================================================
+
+// `PRAGMA orch_asset_partitions('asset.name')` — list every registered
+// partition for an Asset alongside its most-recent materialization status
+// (NULL when never materialized).
+static string OrchAssetPartitionsPragma(ClientContext &context,
+                                          const FunctionParameters &parameters) {
+	EnsureAssetSchemaCheap(context);
+	if (parameters.values.empty() || parameters.values[0].IsNull()) {
+		throw InvalidInputException("orch_asset_partitions requires an asset name");
+	}
+	string name = parameters.values[0].GetValue<string>();
+	std::ostringstream sql;
+	sql << "WITH latest AS ("
+	    << "  SELECT asset_name, partition_key, status, materialized_at "
+	    << "  FROM __orch__.asset_materializations "
+	    << "  WHERE asset_name = " << SqlEscape(name)
+	    << "  QUALIFY row_number() OVER (PARTITION BY asset_name, partition_key "
+	    << "                              ORDER BY materialized_at DESC) = 1"
+	    << ") "
+	    << "SELECT p.asset_name, p.partition_key, p.dimension_values, "
+	    << "       l.status AS last_status, l.materialized_at AS last_materialized_at "
+	    << "FROM __orch__.asset_partitions p "
+	    << "LEFT JOIN latest l "
+	    << "  ON l.asset_name = p.asset_name AND l.partition_key = p.partition_key "
+	    << "WHERE p.asset_name = " << SqlEscape(name)
+	    << " ORDER BY p.partition_key;";
+	return sql.str();
+}
+
+// `PRAGMA orch_asset_partitions_calendar('asset.name')` — render the
+// calendar-style ASCII string as a single SELECT row. The CLI surfaces
+// this via `duck-orch asset partitions`.
+static string OrchAssetPartitionsCalendarPragma(ClientContext &context,
+                                                  const FunctionParameters &parameters) {
+	EnsureAssetSchemaCheap(context);
+	if (parameters.values.empty() || parameters.values[0].IsNull()) {
+		throw InvalidInputException(
+		    "orch_asset_partitions_calendar requires an asset name");
+	}
+	string name = parameters.values[0].GetValue<string>();
+	Connection con(*context.db);
+
+	// Look up the partition definition stored on the task that defines
+	// this Asset.
+	string def_json;
+	{
+		std::ostringstream q;
+		q << "SELECT t.partitions_json FROM __orch__.tasks t "
+		  << "JOIN __orch__.assets a ON a.defined_by_task = t.name "
+		  << "WHERE a.name = " << SqlEscape(name)
+		  << " AND t.partitions_json IS NOT NULL LIMIT 1;";
+		auto r = con.Query(q.str());
+		if (!r->HasError() && r->RowCount() > 0 && !r->GetValue(0, 0).IsNull()) {
+			def_json = r->GetValue(0, 0).ToString();
+		}
+	}
+	if (def_json.empty()) {
+		std::ostringstream s;
+		s << "SELECT 'Asset " << name << " is not partitioned' AS calendar;";
+		return s.str();
+	}
+
+	// Join partition registry with the last status per key.
+	string rows_json = "[]";
+	{
+		std::ostringstream q;
+		q << "WITH latest AS ("
+		  << "  SELECT partition_key, status "
+		  << "  FROM __orch__.asset_materializations "
+		  << "  WHERE asset_name = " << SqlEscape(name)
+		  << "  QUALIFY row_number() OVER (PARTITION BY partition_key "
+		  << "                              ORDER BY materialized_at DESC) = 1"
+		  << ") "
+		  << "SELECT to_json(list({key: p.partition_key, status: l.status})) "
+		  << "FROM __orch__.asset_partitions p "
+		  << "LEFT JOIN latest l USING (partition_key) "
+		  << "WHERE p.asset_name = " << SqlEscape(name) << ";";
+		auto r = con.Query(q.str());
+		if (!r->HasError() && r->RowCount() > 0 && !r->GetValue(0, 0).IsNull()) {
+			rows_json = r->GetValue(0, 0).ToString();
+		}
+	}
+
+	bool ok = false;
+	auto cal = CallRustString(
+	    [&](uint8_t **op, size_t *ol) {
+		    return orch_render_partition_calendar(
+		        reinterpret_cast<const uint8_t *>(name.c_str()), name.size(),
+		        reinterpret_cast<const uint8_t *>(def_json.c_str()), def_json.size(),
+		        reinterpret_cast<const uint8_t *>(rows_json.c_str()), rows_json.size(),
+		        op, ol);
+	        },
+	    ok);
+	if (!ok) {
+		return "SELECT 'calendar render failed' AS calendar;";
+	}
+	std::ostringstream sql;
+	sql << "SELECT " << SqlEscape(cal) << " AS calendar;";
+	return sql.str();
+}
+
+// Look up the task name that defines `asset_name` (via __orch__.assets
+// defined_by_task). Returns empty string if not found.
+static string LookupDefiningTask(Connection &con, const string &asset_name) {
+	std::ostringstream q;
+	q << "SELECT defined_by_task FROM __orch__.assets WHERE name = "
+	  << SqlEscape(asset_name) << " LIMIT 1;";
+	auto r = con.Query(q.str());
+	if (r->HasError() || r->RowCount() == 0 || r->GetValue(0, 0).IsNull()) {
+		return string();
+	}
+	return r->GetValue(0, 0).ToString();
+}
+
+// Shared backfill driver: re-run `task` for every partition in `keys`.
+// Sequential; failures are recorded but do not stop iteration so the rest
+// of the backfill completes (CLI surfaces the per-partition status).
+static void RunBackfillKeys(Connection &con, const TaskRow &task,
+                             const std::vector<string> &keys) {
+	auto pipeline_uuid = con.Query("SELECT uuid()::VARCHAR")->GetValue(0, 0).ToString();
+	for (auto &k : keys) {
+		RunSingleTask(con, task, pipeline_uuid, string(), k);
+	}
+}
+
+// Load partitions for an asset filtered by an optional [from, to] range.
+// For Daily partitions the bounds are inclusive `YYYY-MM-DD`. For Static /
+// Multi the filter is ignored (the full registered set is returned).
+static std::vector<string> KeysFromRegistry(Connection &con, const string &asset_name,
+                                              const string &from, const string &to) {
+	std::vector<string> out;
+	std::ostringstream q;
+	q << "SELECT partition_key FROM __orch__.asset_partitions WHERE asset_name = "
+	  << SqlEscape(asset_name);
+	if (!from.empty()) {
+		q << " AND partition_key >= " << SqlEscape(from);
+	}
+	if (!to.empty()) {
+		q << " AND partition_key <= " << SqlEscape(to);
+	}
+	q << " ORDER BY partition_key;";
+	auto r = con.Query(q.str());
+	if (r->HasError()) return out;
+	for (idx_t i = 0; i < r->RowCount(); i++) {
+		out.push_back(r->GetValue(0, i).ToString());
+	}
+	return out;
+}
+
+// Filter `keys` to only those not yet successfully materialized.
+static std::vector<string> FilterMissing(Connection &con, const string &asset_name,
+                                           const std::vector<string> &keys) {
+	if (keys.empty()) return keys;
+	std::ostringstream q;
+	q << "SELECT partition_key FROM __orch__.asset_materializations "
+	  << "WHERE asset_name = " << SqlEscape(asset_name)
+	  << " AND status = 'success';";
+	std::set<string> done;
+	auto r = con.Query(q.str());
+	if (!r->HasError()) {
+		for (idx_t i = 0; i < r->RowCount(); i++) {
+			done.insert(r->GetValue(0, i).ToString());
+		}
+	}
+	std::vector<string> out;
+	for (auto &k : keys) {
+		if (!done.count(k)) out.push_back(k);
+	}
+	return out;
+}
+
+// Look up a TaskRow by name. Throws on missing.
+static TaskRow LoadTaskRowByName(Connection &con, const string &task_name) {
+	auto rows = LoadTaskRows(con);
+	for (auto &r : rows) {
+		if (r.name == task_name) return r;
+	}
+	throw InvalidInputException("orch_backfill: task `" + task_name + "` not found");
+}
+
+// `PRAGMA orch_backfill('asset.name', 'YYYY-MM-DD', 'YYYY-MM-DD')`
+//   Run every partition in [from, to]. Both bounds optional (NULL = open).
+static void OrchBackfillPragma(ClientContext &context,
+                                 const FunctionParameters &parameters) {
+	Connection con(*context.db);
+	EnsureOrchSchema(con);
+	if (parameters.values.empty() || parameters.values[0].IsNull()) {
+		throw InvalidInputException("orch_backfill requires an asset name");
+	}
+	string asset = parameters.values[0].GetValue<string>();
+	string from = parameters.values.size() > 1 && !parameters.values[1].IsNull()
+	                  ? parameters.values[1].GetValue<string>()
+	                  : string();
+	string to = parameters.values.size() > 2 && !parameters.values[2].IsNull()
+	                ? parameters.values[2].GetValue<string>()
+	                : string();
+	string task_name = LookupDefiningTask(con, asset);
+	if (task_name.empty()) {
+		throw InvalidInputException("orch_backfill: no task defines asset `" + asset + "`");
+	}
+	auto task = LoadTaskRowByName(con, task_name);
+	auto keys = KeysFromRegistry(con, asset, from, to);
+	RunBackfillKeys(con, task, keys);
+}
+
+// `PRAGMA orch_backfill_missing('asset.name')` — same as orch_backfill
+// but skips partitions whose latest status is already 'success'.
+static void OrchBackfillMissingPragma(ClientContext &context,
+                                        const FunctionParameters &parameters) {
+	Connection con(*context.db);
+	EnsureOrchSchema(con);
+	if (parameters.values.empty() || parameters.values[0].IsNull()) {
+		throw InvalidInputException("orch_backfill_missing requires an asset name");
+	}
+	string asset = parameters.values[0].GetValue<string>();
+	string task_name = LookupDefiningTask(con, asset);
+	if (task_name.empty()) {
+		throw InvalidInputException(
+		    "orch_backfill_missing: no task defines asset `" + asset + "`");
+	}
+	auto task = LoadTaskRowByName(con, task_name);
+	auto keys = KeysFromRegistry(con, asset, "", "");
+	keys = FilterMissing(con, asset, keys);
+	RunBackfillKeys(con, task, keys);
+}
+
+// `PRAGMA orch_run_partition('asset.name', 'partition_key')` — run a
+// single partition. Convenience for `duck-orch run <task> --partition K`.
+static void OrchRunPartitionPragma(ClientContext &context,
+                                     const FunctionParameters &parameters) {
+	Connection con(*context.db);
+	EnsureOrchSchema(con);
+	if (parameters.values.size() < 2 || parameters.values[0].IsNull() ||
+	    parameters.values[1].IsNull()) {
+		throw InvalidInputException(
+		    "orch_run_partition requires (asset_name, partition_key)");
+	}
+	string asset = parameters.values[0].GetValue<string>();
+	string key = parameters.values[1].GetValue<string>();
+	string task_name = LookupDefiningTask(con, asset);
+	if (task_name.empty()) {
+		throw InvalidInputException(
+		    "orch_run_partition: no task defines asset `" + asset + "`");
+	}
+	auto task = LoadTaskRowByName(con, task_name);
+	auto pipeline_uuid = con.Query("SELECT uuid()::VARCHAR")->GetValue(0, 0).ToString();
+	RunSingleTask(con, task, pipeline_uuid, string(), key);
+}
+
+// ========================================================================
 // Configuration callbacks
 // ========================================================================
 
@@ -1945,6 +2465,23 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "orch_asset_lineage", OrchAssetLineagePragma, {LogicalType::VARCHAR}));
 	loader.RegisterFunction(PragmaFunction::PragmaStatement(
 	    "orch_asset_health", OrchAssetHealthPragma));
+
+	// Phase 14: Partition + backfill pragmas.
+	loader.RegisterFunction(PragmaFunction::PragmaCall(
+	    "orch_asset_partitions", OrchAssetPartitionsPragma, {LogicalType::VARCHAR}));
+	loader.RegisterFunction(PragmaFunction::PragmaCall(
+	    "orch_asset_partitions_calendar", OrchAssetPartitionsCalendarPragma,
+	    {LogicalType::VARCHAR}));
+	loader.RegisterFunction(PragmaFunction::PragmaCall(
+	    "orch_backfill", static_cast<pragma_function_t>(OrchBackfillPragma),
+	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}));
+	loader.RegisterFunction(PragmaFunction::PragmaCall(
+	    "orch_backfill_missing",
+	    static_cast<pragma_function_t>(OrchBackfillMissingPragma),
+	    {LogicalType::VARCHAR}));
+	loader.RegisterFunction(PragmaFunction::PragmaCall(
+	    "orch_run_partition", static_cast<pragma_function_t>(OrchRunPartitionPragma),
+	    {LogicalType::VARCHAR, LogicalType::VARCHAR}));
 }
 
 void DuckorchExtension::Load(ExtensionLoader &loader) {

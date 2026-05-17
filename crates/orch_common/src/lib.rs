@@ -7,7 +7,9 @@
 
 pub mod ffi;
 pub mod hash;
+pub mod partition;
 pub mod task;
 
 pub use hash::{fnv1a_64, sql_code_version};
+pub use partition::{parse_partition_decl, PartitionDef, PartitionParseError};
 pub use task::{ParamSpec, ParamType, Task, TaskTest};

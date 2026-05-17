@@ -1,7 +1,7 @@
 // Parses SQL files with `-- @key value` header comments into Task structs.
 
 use crate::binding::parse_param_decl;
-use orch_common::{Task, TaskTest};
+use orch_common::{parse_partition_decl, Task, TaskTest};
 use std::path::Path;
 
 #[derive(Debug)]
@@ -148,6 +148,16 @@ fn apply_header(task: &mut Task, content: &str, line: usize) -> Result<(), Parse
         "asset_owner" => task.asset_owner = Some(rest.trim().to_string()),
         "asset_description" => task.asset_description = Some(rest.trim().to_string()),
         "asset_tags" => task.asset_tags = split_csv(rest),
+        // Phase 14: partition declaration. Stored on the task; expanded into
+        // concrete partition keys at registration time on the C++ side, and
+        // surfaced via `$partition_key` bindings at execution time.
+        "partitions_by" => {
+            let def = parse_partition_decl(rest).map_err(|e| ParseError {
+                message: e.to_string(),
+                line: Some(line),
+            })?;
+            task.partitions = Some(def);
+        }
         _ => {}
     }
 
@@ -300,6 +310,63 @@ mod tests {
         assert!(task.asset_owner.is_none());
         assert!(task.asset_description.is_none());
         assert!(task.asset_tags.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 14: @partitions_by header parsing
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parses_partitions_by_daily() {
+        let sql = "-- @name t\n-- @partitions_by daily(start=2026-01-01)\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        match task.partitions {
+            Some(orch_common::PartitionDef::Daily { ref start, end }) => {
+                assert_eq!(start.to_string(), "2026-01-01");
+                assert!(end.is_none());
+            }
+            other => panic!("expected Daily, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_partitions_by_static() {
+        let sql = "-- @name t\n-- @partitions_by static(jp,us,eu)\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        match task.partitions {
+            Some(orch_common::PartitionDef::Static(ref v)) => {
+                assert_eq!(v, &vec!["jp".to_string(), "us".to_string(), "eu".to_string()]);
+            }
+            other => panic!("expected Static, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_partitions_by_multi() {
+        let sql = "-- @name t\n-- @partitions_by multi(date=daily(start=2026-01-01),region=static(jp,us))\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        match task.partitions {
+            Some(orch_common::PartitionDef::Multi(ref dims)) => {
+                assert!(dims.contains_key("date"));
+                assert!(dims.contains_key("region"));
+            }
+            other => panic!("expected Multi, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rejects_bad_partitions_by() {
+        let sql = "-- @name t\n-- @partitions_by hourly(start=2026-01-01)\nSELECT 1;\n";
+        let err = parse_sql_file(sql, None).expect_err("should fail");
+        assert!(err.message.contains("@partitions_by"), "got: {}", err.message);
+        assert_eq!(err.line, Some(2));
+    }
+
+    #[test]
+    fn task_without_partitions_by_has_none() {
+        let sql = "-- @name t\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert!(task.partitions.is_none());
     }
 
     #[test]

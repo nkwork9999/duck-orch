@@ -76,4 +76,27 @@ int32_t orch_render_asset_lineage(const uint8_t *focal_ptr, size_t focal_len,
                                    size_t edges_json_len, uint8_t **out_ptr,
                                    size_t *out_len);
 
+// Phase 14: expand a PartitionDef into concrete keys. `def_json` is the
+// serde-serialized PartitionDef carried on Task.partitions. `range_json`
+// is optional `{"from":"YYYY-MM-DD","to":"YYYY-MM-DD"}` for daily; pass
+// empty string to use the natural range. Output: JSON array of
+// `{key, dimension_values: {...}}` rows.
+int32_t orch_partition_expand(const uint8_t *def_json_ptr, size_t def_json_len,
+                               const uint8_t *range_json_ptr, size_t range_json_len,
+                               uint8_t **out_ptr, size_t *out_len);
+
+// Phase 14: split a partition key into per-dimension `(name, value)` pairs.
+// Returns a JSON array; for non-Multi defs it's a single element with
+// name="partition_key".
+int32_t orch_partition_split_key(const uint8_t *def_json_ptr, size_t def_json_len,
+                                  const uint8_t *key_ptr, size_t key_len,
+                                  uint8_t **out_ptr, size_t *out_len);
+
+// Phase 14: render the calendar-style ASCII for an Asset. `rows_json` is
+// `[{"key":..., "status": null|"success"|"failed"|"in_progress"}, ...]`.
+int32_t orch_render_partition_calendar(const uint8_t *asset_ptr, size_t asset_len,
+                                        const uint8_t *def_json_ptr, size_t def_json_len,
+                                        const uint8_t *rows_json_ptr, size_t rows_json_len,
+                                        uint8_t **out_ptr, size_t *out_len);
+
 }

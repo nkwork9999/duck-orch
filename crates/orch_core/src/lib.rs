@@ -415,3 +415,146 @@ pub extern "C" fn orch_ol_emit(ptr: *const u8, len: usize) -> i32 {
     }))
     .unwrap_or(-1)
 }
+
+// ---------------------------------------------------------------------------
+// Phase 14: Partition expansion + calendar rendering
+// ---------------------------------------------------------------------------
+
+/// Expand a partition definition into a JSON array of `{key, dimension_values}`
+/// rows. `def_json` is the serde-serialized `PartitionDef`. `range_json` is
+/// optional: when present, `{"from":"YYYY-MM-DD","to":"YYYY-MM-DD"}` narrows
+/// Daily expansion (ignored by Static; applied recursively in Multi).
+///
+/// `dimension_values` is a JSON object string; for non-Multi partitions it
+/// contains a single `partition_key` field, for Multi it carries each named
+/// dimension's value (e.g. `{"date":"2026-05-17","region":"jp"}`).
+#[unsafe(no_mangle)]
+pub extern "C" fn orch_partition_expand(
+    def_json_ptr: *const u8,
+    def_json_len: usize,
+    range_json_ptr: *const u8,
+    range_json_len: usize,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        let def_json = unsafe { read_str(def_json_ptr, def_json_len) };
+        let range_json = unsafe { read_str(range_json_ptr, range_json_len) };
+        let def: orch_common::PartitionDef = match serde_json::from_str(def_json) {
+            Ok(d) => d,
+            Err(e) => {
+                return err_to_buf(&format!("invalid def json: {}", e), out_ptr, out_len);
+            }
+        };
+        #[derive(serde::Deserialize, Default)]
+        struct Range {
+            from: Option<String>,
+            to: Option<String>,
+        }
+        let range: Range = if range_json.is_empty() {
+            Range::default()
+        } else {
+            serde_json::from_str(range_json).unwrap_or_default()
+        };
+        let r = match (range.from, range.to) {
+            (Some(a), Some(b)) => Some((a, b)),
+            _ => None,
+        };
+        let today = chrono::Utc::now().date_naive();
+        let keys = def.expand_keys(today, r);
+        let mut rows = Vec::with_capacity(keys.len());
+        for k in keys {
+            let dims = def.split_key(&k);
+            let mut obj = serde_json::Map::new();
+            for (n, v) in dims {
+                obj.insert(n, serde_json::Value::String(v));
+            }
+            rows.push(serde_json::json!({
+                "key": k,
+                "dimension_values": serde_json::Value::Object(obj),
+            }));
+        }
+        write_out(serde_json::Value::Array(rows).to_string(), out_ptr, out_len)
+    }))
+    .unwrap_or(-1)
+}
+
+/// Split a partition key into per-dimension `(name, value)` pairs. Returns
+/// a JSON array of `{"name":..., "value":...}` objects. For non-Multi
+/// definitions the array has a single element with `name="partition_key"`.
+#[unsafe(no_mangle)]
+pub extern "C" fn orch_partition_split_key(
+    def_json_ptr: *const u8,
+    def_json_len: usize,
+    key_ptr: *const u8,
+    key_len: usize,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        let def_json = unsafe { read_str(def_json_ptr, def_json_len) };
+        let key = unsafe { read_str(key_ptr, key_len) };
+        let def: orch_common::PartitionDef = match serde_json::from_str(def_json) {
+            Ok(d) => d,
+            Err(e) => {
+                return err_to_buf(&format!("invalid def json: {}", e), out_ptr, out_len);
+            }
+        };
+        let parts = def.split_key(key);
+        let arr: Vec<serde_json::Value> = parts
+            .into_iter()
+            .map(|(n, v)| serde_json::json!({"name": n, "value": v}))
+            .collect();
+        write_out(serde_json::Value::Array(arr).to_string(), out_ptr, out_len)
+    }))
+    .unwrap_or(-1)
+}
+
+/// Render the calendar-style ASCII for an Asset's partitions.
+///
+/// `def_json` is the serde-serialized `PartitionDef`.
+/// `rows_json` is a JSON array of `{key, status}` rows; `status` may be
+/// null for never-materialized partitions.
+#[unsafe(no_mangle)]
+pub extern "C" fn orch_render_partition_calendar(
+    asset_ptr: *const u8,
+    asset_len: usize,
+    def_json_ptr: *const u8,
+    def_json_len: usize,
+    rows_json_ptr: *const u8,
+    rows_json_len: usize,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        let asset = unsafe { read_str(asset_ptr, asset_len) };
+        let def_json = unsafe { read_str(def_json_ptr, def_json_len) };
+        let rows_json = unsafe { read_str(rows_json_ptr, rows_json_len) };
+        let def: orch_common::PartitionDef = match serde_json::from_str(def_json) {
+            Ok(d) => d,
+            Err(e) => {
+                return err_to_buf(&format!("invalid def json: {}", e), out_ptr, out_len);
+            }
+        };
+        #[derive(serde::Deserialize)]
+        struct Row {
+            key: String,
+            status: Option<String>,
+        }
+        let raw: Vec<Row> = if rows_json.is_empty() {
+            Vec::new()
+        } else {
+            serde_json::from_str(rows_json).unwrap_or_default()
+        };
+        let rows: Vec<orch_runtime::PartitionStatus> = raw
+            .into_iter()
+            .map(|r| orch_runtime::PartitionStatus {
+                key: r.key,
+                status: r.status,
+            })
+            .collect();
+        let s = orch_runtime::render_calendar(asset, &def, &rows);
+        write_out(s, out_ptr, out_len)
+    }))
+    .unwrap_or(-1)
+}
