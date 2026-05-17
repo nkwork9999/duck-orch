@@ -349,6 +349,11 @@ CREATE TABLE IF NOT EXISTS __orch__.asset_partitions (
 )";
 
 static void EnsureOrchSchema(Connection &con) {
+	// Several pragmas (orch_*_health, orch_asset_partitions_calendar, etc.)
+	// emit `to_json(list(...))` which lives in the json extension. It ships
+	// bundled with DuckDB but is not auto-loaded in `-unsigned` sessions, so
+	// load it explicitly here. Cheap (~no-op after first call).
+	con.Query("INSTALL json; LOAD json;");
 	auto r = con.Query(kOrchSchemaSql);
 	if (r->HasError()) {
 		throw InvalidInputException("orch schema setup failed: " + r->GetError());
@@ -470,12 +475,9 @@ static void OrchRegisterPragma(ClientContext &context, const FunctionParameters 
 			// it so RunSingleTask can rehydrate at execution time.
 			auto get_sub_json = [&](const char *k) -> string {
 				auto v = yyjson_ns::yyjson_obj_get(t, k);
-				if (!v) return string();
-				auto *mut = yyjson_ns::yyjson_val_mut_copy(nullptr, v);
-				if (!mut) return string();
+				if (!v || yyjson_ns::yyjson_is_null(v)) return string();
 				size_t l = 0;
-				char *raw =
-				    yyjson_ns::yyjson_mut_val_write(mut, 0, &l);
+				char *raw = yyjson_ns::yyjson_val_write(v, 0, &l);
 				string out = raw ? string(raw, l) : string();
 				free(raw);
 				return out;
@@ -999,26 +1001,33 @@ static bool RunSingleTask(Connection &con, const TaskRow &task, const string &pi
 		bool ran_ok = false;
 		string this_err;
 		if (use_prepared) {
-			auto prepared = con.Prepare(sql_to_run);
-			if (prepared->HasError()) {
-				this_err = prepared->GetError();
-			} else {
-				auto values = BuildParamValues(task.params_json, bound);
-				// PreparedStatement::Execute accepts a
-				// case_insensitive_map_t<BoundParameterData> for named
-				// bindings; values are validated against the prepared
-				// statement's declared parameter set.
+			// PREPARE supports only one statement, but task SQL often has
+			// multiple (CREATE; DELETE; INSERT;). Split via DuckDB's parser
+			// and prepare/execute each statement, binding the named params
+			// only to statements that actually declare them.
+			auto stmts = con.ExtractStatements(sql_to_run);
+			auto values = BuildParamValues(task.params_json, bound);
+			ran_ok = !stmts.empty();
+			for (auto &stmt : stmts) {
+				string one = stmt->query.substr(stmt->stmt_location, stmt->stmt_length);
+				auto prepared = con.Prepare(one);
+				if (prepared->HasError()) {
+					this_err = prepared->GetError();
+					ran_ok = false;
+					break;
+				}
 				case_insensitive_map_t<BoundParameterData> bind_map;
 				for (auto &kv : values) {
-					bind_map.emplace(kv.first, BoundParameterData(kv.second));
+					if (prepared->named_param_map.find(kv.first) !=
+					    prepared->named_param_map.end()) {
+						bind_map.emplace(kv.first, BoundParameterData(kv.second));
+					}
 				}
 				auto qres = prepared->Execute(bind_map);
-				if (qres && !qres->HasError()) {
-					ran_ok = true;
-				} else if (qres) {
-					this_err = qres->GetError();
-				} else {
-					this_err = "prepared execute returned null";
+				if (!qres || qres->HasError()) {
+					this_err = qres ? qres->GetError() : "prepared execute returned null";
+					ran_ok = false;
+					break;
 				}
 			}
 		} else {
@@ -1080,6 +1089,33 @@ static bool RunSingleTask(Connection &con, const TaskRow &task, const string &pi
 			    << SqlEscape(task.name) << ";";
 			con.Query(mat.str());
 		}
+		// Phase 14 fix: populate __orch__.lineage_edges from each
+		// successful run too, not just from OrchRunPragma's DAG-build path.
+		// Partition-driven runs (OrchRunPartition/OrchBackfill) bypass the
+		// DAG executor entirely, so without this they'd never produce
+		// lineage edges (and therefore no asset_edges either).
+		for (auto &out_ds : task_outputs) {
+			string out_full = out_ds.name;  // OlDataset.name is the bare table name
+			for (auto &in_ds : task_inputs) {
+				string in_full = in_ds.name;
+				std::ostringstream le;
+				le << "INSERT OR IGNORE INTO __orch__.lineage_edges "
+				   << "(src_dataset, dst_dataset, via_task, source) VALUES ("
+				   << SqlEscape(in_full) << ", " << SqlEscape(out_full)
+				   << ", " << SqlEscape(task.name) << ", 'sql_parser');";
+				con.Query(le.str());
+			}
+		}
+		// Project newly-inserted lineage_edges into asset_edges (idempotent).
+		con.Query(
+		    "INSERT OR IGNORE INTO __orch__.asset_edges "
+		    "(upstream_asset, downstream_asset, via_task, edge_type) "
+		    "SELECT le.src_dataset, le.dst_dataset, le.via_task, "
+		    "       COALESCE(NULLIF(le.transform_type, ''), 'direct') "
+		    "FROM __orch__.lineage_edges le "
+		    "WHERE EXISTS (SELECT 1 FROM __orch__.assets a WHERE a.name = le.src_dataset) "
+		    "  AND EXISTS (SELECT 1 FROM __orch__.assets a WHERE a.name = le.dst_dataset);");
+
 		// Phase column-lineage: extract column-level dependencies from the task SQL
 		// (uses DuckDB's catalog DESCRIBE for SELECT * resolution).
 		string cl_json;
@@ -1669,13 +1705,13 @@ static string OrchAssetHealthPragma(ClientContext &context,
 	    << "         count(*) FILTER (WHERE status = 'failed') AS failed_24h, "
 	    << "         count(*) FILTER (WHERE status = 'success') AS success_24h "
 	    << "  FROM __orch__.asset_materializations "
-	    << "  WHERE materialized_at >= current_timestamp - INTERVAL 24 HOUR "
+	    << "  WHERE materialized_at >= current_timestamp::TIMESTAMP - INTERVAL 24 HOUR "
 	    << "  GROUP BY asset_name"
 	    << ") "
 	    << "SELECT a.name AS asset_name, a.kind, a.group_name, "
 	    << "       l.last_status, l.last_at, "
 	    << "       CASE WHEN l.last_at IS NULL THEN NULL "
-	    << "            ELSE epoch(current_timestamp - l.last_at) END AS age_seconds, "
+	    << "            ELSE epoch(current_timestamp::TIMESTAMP - l.last_at) END AS age_seconds, "
 	    << "       COALESCE(r.runs_24h, 0)    AS runs_24h, "
 	    << "       COALESCE(r.success_24h, 0) AS success_24h, "
 	    << "       COALESCE(r.failed_24h, 0)  AS failed_24h "
