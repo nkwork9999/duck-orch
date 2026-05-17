@@ -1,7 +1,9 @@
 // Parses SQL files with `-- @key value` header comments into Task structs.
 
 use crate::binding::parse_param_decl;
-use orch_common::{parse_automation, parse_partition_decl, parse_target_lag, Task, TaskTest};
+use orch_common::{
+    parse_automation, parse_partition_decl, parse_target_lag, AssetCheck, Task, TaskTest,
+};
 use std::path::Path;
 
 #[derive(Debug)]
@@ -118,7 +120,19 @@ fn apply_header(task: &mut Task, content: &str, line: usize) -> Result<(), Parse
         }
         "incremental_by" => task.incremental_by = Some(rest.trim().to_string()),
         "tags" => task.tags = split_csv(rest),
-        "test" => task.tests.push(parse_test(rest, line)?),
+        "test" => {
+            // Phase 16: keep parsing into `tests` for back-compat (the
+            // `__orch__.tests` table and `PRAGMA orch_test` still work),
+            // *and* promote the same assertion into the new asset_checks
+            // table as `test_<N>` so it surfaces in `PRAGMA orch_check_run`
+            // alongside Phase 16 `@check` entries.
+            let tt = parse_test(rest, line)?;
+            let idx = task.tests.len();
+            if let Some(check) = test_to_asset_check(&tt, idx) {
+                task.checks.push(check);
+            }
+            task.tests.push(tt);
+        }
         "param" => {
             let spec = parse_param_decl(rest).map_err(|e| ParseError {
                 message: e.to_string(),
@@ -191,10 +205,204 @@ fn apply_header(task: &mut Task, content: &str, line: usize) -> Result<(), Parse
                 task.automation = Some(cond);
             }
         }
+        // Phase 16: `@freshness max_lag=<duration>` (or bare `@freshness
+        // <duration>` shortcut). Reuses `parse_target_lag` so accepted
+        // suffixes match Phase 15 (`60min`, `1h`, `30s`, integer seconds).
+        // The value flows into __orch__.assets.freshness_lag_seconds and
+        // is read back by BuildEvalContextJson for the `freshness_violated()`
+        // automation condition.
+        "freshness" => {
+            let dur_str = parse_max_lag_value(rest).ok_or_else(|| ParseError {
+                message: format!("@freshness: expected `max_lag=<duration>` or `<duration>`, got `{}`", rest),
+                line: Some(line),
+            })?;
+            let secs = parse_target_lag(&dur_str).map_err(|e| ParseError {
+                message: format!("@freshness: {}", e),
+                line: Some(line),
+            })?;
+            task.freshness_lag_seconds = Some(secs);
+        }
+        // Phase 16: `@check name=<NAME> "<SQL>" expect <OP> <VALUE>` data
+        // quality check. OPs: eq | gt | lt | between. Sugar:
+        // `expect_not_null` (= `expect_type=not_null`). Stored on the Task
+        // and promoted at register time to __orch__.asset_checks.
+        "check" => {
+            let check = parse_check_header(rest, line)?;
+            task.checks.push(check);
+        }
+        // Phase 16: per-asset severity. `error` (default) blocks downstream
+        // tasks when a check fails; `warn` only logs.
+        "check_severity" => {
+            let v = rest.trim().to_ascii_lowercase();
+            if v != "error" && v != "warn" {
+                return Err(ParseError {
+                    message: format!("@check_severity: expected `error` or `warn`, got `{}`", rest),
+                    line: Some(line),
+                });
+            }
+            task.check_severity = Some(v);
+        }
         _ => {}
     }
 
     Ok(())
+}
+
+// Phase 16: pull a duration out of `@freshness max_lag=60min` (kv form)
+// or `@freshness 60min` (bare shortcut). Returns the raw duration token,
+// to be handed to `parse_target_lag`.
+fn parse_max_lag_value(rest: &str) -> Option<String> {
+    let s = rest.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // kv form: prefer max_lag= if present.
+    for (k, v) in parse_inline_kv(s) {
+        if k == "max_lag" {
+            let v = v.trim();
+            if v.is_empty() { return None; }
+            return Some(v.to_string());
+        }
+    }
+    // Bare form: the whole rest is the duration. Reject any `=` so we
+    // don't silently accept `foo=bar`-style typos.
+    if s.contains('=') {
+        return None;
+    }
+    Some(s.to_string())
+}
+
+// Phase 16: parse a `@check` header into an AssetCheck.
+//
+// Forms:
+//   name=<NAME> "<SQL>" expect eq <V>
+//   name=<NAME> "<SQL>" expect gt <V>
+//   name=<NAME> "<SQL>" expect lt <V>
+//   name=<NAME> "<SQL>" expect between <LO>,<HI>
+//   name=<NAME> "<SQL>" expect_not_null
+fn parse_check_header(rest: &str, line: usize) -> Result<AssetCheck, ParseError> {
+    let s = rest.trim_start();
+    // 1) name=<NAME>
+    let s = s
+        .strip_prefix("name=")
+        .or_else(|| s.strip_prefix("name ="))
+        .ok_or_else(|| ParseError {
+            message: format!("@check: expected `name=<NAME>` prefix, got: {}", rest),
+            line: Some(line),
+        })?;
+    let (name, after_name) = split_first_word(s);
+    if name.is_empty() {
+        return Err(ParseError {
+            message: "@check: empty name".into(),
+            line: Some(line),
+        });
+    }
+    let name = name.trim_matches('"').to_string();
+
+    // 2) "<SQL>"  — find the opening quote anywhere in the remainder
+    let after_name = after_name.trim_start();
+    let q_start = after_name.find('"').ok_or_else(|| ParseError {
+        message: "@check: expected quoted SQL".into(),
+        line: Some(line),
+    })?;
+    let after_q = &after_name[q_start + 1..];
+    let q_end = after_q.find('"').ok_or_else(|| ParseError {
+        message: "@check: unterminated SQL string".into(),
+        line: Some(line),
+    })?;
+    let sql = after_q[..q_end].to_string();
+    let tail = after_q[q_end + 1..].trim_start();
+
+    // 3) expect <OP> <VALUE> | expect_not_null
+    let (verb, after_verb) = split_first_word(tail);
+    match verb {
+        "expect_not_null" => Ok(AssetCheck {
+            name,
+            sql,
+            expect_type: "not_null".to_string(),
+            expect_value: String::new(),
+        }),
+        "expect" => {
+            let (op, op_rest) = split_first_word(after_verb);
+            let op = op.to_ascii_lowercase();
+            let value = op_rest.trim();
+            match op.as_str() {
+                "eq" | "gt" | "lt" => {
+                    if value.is_empty() {
+                        return Err(ParseError {
+                            message: format!("@check: `expect {}` requires a value", op),
+                            line: Some(line),
+                        });
+                    }
+                    Ok(AssetCheck {
+                        name,
+                        sql,
+                        expect_type: op,
+                        expect_value: value.to_string(),
+                    })
+                }
+                "between" => {
+                    // Accept "lo,hi" or "lo, hi"
+                    let parts: Vec<&str> = value.splitn(2, ',').map(|p| p.trim()).collect();
+                    if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+                        return Err(ParseError {
+                            message: format!(
+                                "@check: `expect between` requires `<low>,<high>`, got `{}`",
+                                value
+                            ),
+                            line: Some(line),
+                        });
+                    }
+                    Ok(AssetCheck {
+                        name,
+                        sql,
+                        expect_type: "between".to_string(),
+                        expect_value: format!("{},{}", parts[0], parts[1]),
+                    })
+                }
+                _ => Err(ParseError {
+                    message: format!(
+                        "@check: unknown op `{}` (expected eq|gt|lt|between)",
+                        op
+                    ),
+                    line: Some(line),
+                }),
+            }
+        }
+        _ => Err(ParseError {
+            message: format!(
+                "@check: expected `expect <op> <value>` or `expect_not_null`, got `{}`",
+                tail
+            ),
+            line: Some(line),
+        }),
+    }
+}
+
+// Phase 16 back-compat: lift a Phase-0 `@test "<SQL>" expect [_gt|_lt] <N>`
+// or `@test "<SQL>" expect_empty|expect_non_empty` into an AssetCheck so it
+// also lands in __orch__.asset_checks. Returns None when the assertion
+// doesn't map cleanly onto a scalar comparison (the legacy
+// `__orch__.tests` table still handles those via PRAGMA orch_test).
+fn test_to_asset_check(tt: &TaskTest, idx: usize) -> Option<AssetCheck> {
+    let mut parts = tt.assertion.split_whitespace();
+    let verb = parts.next()?;
+    let value: String = parts.collect::<Vec<_>>().join(" ");
+    let (expect_type, expect_value) = match verb {
+        "expect" => ("eq", value),
+        "expect_gt" => ("gt", value),
+        "expect_lt" => ("lt", value),
+        _ => return None,
+    };
+    if expect_value.is_empty() {
+        return None;
+    }
+    Some(AssetCheck {
+        name: format!("test_{}", idx),
+        sql: tt.query.clone(),
+        expect_type: expect_type.to_string(),
+        expect_value,
+    })
 }
 
 fn split_first_word(s: &str) -> (&str, &str) {
@@ -469,6 +677,158 @@ mod tests {
         let err = parse_sql_file(sql, None).expect_err("should fail");
         assert!(err.message.contains("@target_lag"), "got: {}", err.message);
         assert_eq!(err.line, Some(2));
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 16: @freshness / @check / @check_severity header parsing
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parses_freshness_kv() {
+        let sql = "-- @name t\n-- @freshness max_lag=60min\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert_eq!(task.freshness_lag_seconds, Some(3600));
+    }
+
+    #[test]
+    fn parses_freshness_bare_shortcut() {
+        let sql = "-- @name t\n-- @freshness 30s\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert_eq!(task.freshness_lag_seconds, Some(30));
+    }
+
+    #[test]
+    fn parses_freshness_seconds_integer() {
+        let sql = "-- @name t\n-- @freshness max_lag=120\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert_eq!(task.freshness_lag_seconds, Some(120));
+    }
+
+    #[test]
+    fn rejects_bad_freshness() {
+        let sql = "-- @name t\n-- @freshness max_lag=five-minutes\nSELECT 1;\n";
+        let err = parse_sql_file(sql, None).expect_err("should fail");
+        assert!(err.message.contains("@freshness"), "got: {}", err.message);
+        assert_eq!(err.line, Some(2));
+    }
+
+    #[test]
+    fn rejects_empty_freshness() {
+        let sql = "-- @name t\n-- @freshness\nSELECT 1;\n";
+        let err = parse_sql_file(sql, None).expect_err("should fail");
+        assert!(err.message.contains("@freshness"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn task_without_freshness_is_none() {
+        let sql = "-- @name t\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert!(task.freshness_lag_seconds.is_none());
+    }
+
+    #[test]
+    fn parses_check_eq() {
+        let sql = "-- @name t\n-- @check name=no_nulls \"SELECT COUNT(*) FROM x WHERE c IS NULL\" expect eq 0\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert_eq!(task.checks.len(), 1);
+        let c = &task.checks[0];
+        assert_eq!(c.name, "no_nulls");
+        assert_eq!(c.sql, "SELECT COUNT(*) FROM x WHERE c IS NULL");
+        assert_eq!(c.expect_type, "eq");
+        assert_eq!(c.expect_value, "0");
+    }
+
+    #[test]
+    fn parses_check_gt() {
+        let sql = "-- @name t\n-- @check name=positive_rev \"SELECT MIN(rev) FROM ${asset}\" expect gt 0\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert_eq!(task.checks.len(), 1);
+        let c = &task.checks[0];
+        assert_eq!(c.name, "positive_rev");
+        assert!(c.sql.contains("${asset}"));
+        assert_eq!(c.expect_type, "gt");
+        assert_eq!(c.expect_value, "0");
+    }
+
+    #[test]
+    fn parses_check_lt() {
+        let sql = "-- @name t\n-- @check name=under_cap \"SELECT MAX(v) FROM ${asset}\" expect lt 1000\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        let c = &task.checks[0];
+        assert_eq!(c.expect_type, "lt");
+        assert_eq!(c.expect_value, "1000");
+    }
+
+    #[test]
+    fn parses_check_between() {
+        let sql = "-- @name t\n-- @check name=sane_range \"SELECT AVG(v) FROM ${asset}\" expect between 1, 100\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        let c = &task.checks[0];
+        assert_eq!(c.expect_type, "between");
+        assert_eq!(c.expect_value, "1,100");
+    }
+
+    #[test]
+    fn parses_check_not_null_sugar() {
+        let sql = "-- @name t\n-- @check name=present \"SELECT MAX(v) FROM ${asset}\" expect_not_null\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        let c = &task.checks[0];
+        assert_eq!(c.expect_type, "not_null");
+        assert!(c.expect_value.is_empty());
+    }
+
+    #[test]
+    fn rejects_check_without_name() {
+        let sql = "-- @name t\n-- @check \"SELECT 1\" expect eq 1\nSELECT 1;\n";
+        let err = parse_sql_file(sql, None).expect_err("should fail");
+        assert!(err.message.contains("@check"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn rejects_check_with_unknown_op() {
+        let sql = "-- @name t\n-- @check name=x \"SELECT 1\" expect ge 1\nSELECT 1;\n";
+        let err = parse_sql_file(sql, None).expect_err("should fail");
+        assert!(err.message.contains("@check"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn rejects_check_between_missing_high() {
+        let sql = "-- @name t\n-- @check name=x \"SELECT 1\" expect between 1\nSELECT 1;\n";
+        let err = parse_sql_file(sql, None).expect_err("should fail");
+        assert!(err.message.contains("@check"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn parses_check_severity_error() {
+        let sql = "-- @name t\n-- @check_severity error\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert_eq!(task.check_severity.as_deref(), Some("error"));
+    }
+
+    #[test]
+    fn parses_check_severity_warn_case_insensitive() {
+        let sql = "-- @name t\n-- @check_severity WARN\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert_eq!(task.check_severity.as_deref(), Some("warn"));
+    }
+
+    #[test]
+    fn rejects_bad_check_severity() {
+        let sql = "-- @name t\n-- @check_severity loud\nSELECT 1;\n";
+        let err = parse_sql_file(sql, None).expect_err("should fail");
+        assert!(err.message.contains("@check_severity"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn legacy_test_header_also_promoted_to_check() {
+        let sql = "-- @name t\n-- @test \"SELECT COUNT(*) FROM x\" expect_gt 0\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert_eq!(task.tests.len(), 1, "back-compat: tests still populated");
+        assert_eq!(task.checks.len(), 1, "and promoted to checks");
+        let c = &task.checks[0];
+        assert_eq!(c.name, "test_0");
+        assert_eq!(c.expect_type, "gt");
+        assert_eq!(c.expect_value, "0");
     }
 
     #[test]

@@ -41,6 +41,8 @@ SUBCOMMANDS:
     sensor stop                                 Stop the automation sensor thread
     sensor status                               Show running flag + last tick stats
     sensor set-interval <seconds>               Change the sensor polling interval
+    check run <asset> [--json]                  Execute all declared checks for <asset>
+    check history <asset> [--limit N] [--json]  Recent asset_check_results rows
     help                     Show this help
 
 GLOBAL FLAGS:
@@ -808,6 +810,62 @@ fn cmd_sensor(args: &Args) -> i32 {
     }
 }
 
+// =============================================================================
+// Phase 16: `duck-orch check ...` subcommands (run | history).
+// =============================================================================
+
+fn cmd_check(args: &Args) -> i32 {
+    let sub = args.rest.first().map(|s| s.as_str()).unwrap_or("");
+    match sub {
+        "run" => {
+            if args.rest.len() < 2 {
+                eprintln!("check run: missing <asset>");
+                return 2;
+            }
+            let asset = &args.rest[1];
+            let sql = format!("PRAGMA orch_check_run({});", sql_escape(asset));
+            let (out, err, code) = match run_sql(args, &sql, args.json) {
+                Ok(r) => r,
+                Err(e) => { eprintln!("{}", e); return 2; }
+            };
+            if !err.is_empty() { eprintln!("{}", err); }
+            print!("{}", out);
+            code
+        }
+        "history" => {
+            if args.rest.len() < 2 {
+                eprintln!("check history: missing <asset>");
+                return 2;
+            }
+            let asset = args.rest[1].clone();
+            let mut tail: Vec<String> = args.rest.iter().skip(2).cloned().collect();
+            let limit: i64 = extract_flag_value(&mut tail, "--limit")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(50);
+            let sql = format!(
+                "PRAGMA orch_check_history({}, {});",
+                sql_escape(&asset),
+                limit
+            );
+            let (out, err, code) = match run_sql(args, &sql, args.json) {
+                Ok(r) => r,
+                Err(e) => { eprintln!("{}", e); return 2; }
+            };
+            if !err.is_empty() { eprintln!("{}", err); }
+            print!("{}", out);
+            code
+        }
+        "" => {
+            eprintln!("check: missing subcommand (run|history)");
+            2
+        }
+        other => {
+            eprintln!("unknown check subcommand: {}", other);
+            2
+        }
+    }
+}
+
 fn main() {
     let args = match parse_args() {
         Ok(a) => a,
@@ -827,6 +885,7 @@ fn main() {
         "schedule" => cmd_schedule(&args),
         "automation" => cmd_automation(&args),
         "sensor" => cmd_sensor(&args),
+        "check" => cmd_check(&args),
         "help" | "" => { print!("{}", HELP); 0 }
         other => { eprintln!("unknown subcommand: {}", other); print!("{}", HELP); 2 }
     };
