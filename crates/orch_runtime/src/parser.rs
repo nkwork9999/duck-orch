@@ -126,6 +126,28 @@ fn apply_header(task: &mut Task, content: &str, line: usize) -> Result<(), Parse
             })?;
             task.params.push(spec);
         }
+        // Phase 13: Asset 一級化 headers. `@asset` mirrors `@task` and parses
+        // `name=value`; the rest are scalar/CSV style like other headers.
+        "asset" => {
+            let mut got = false;
+            for (k, v) in parse_inline_kv(rest) {
+                if k == "name" {
+                    task.asset_name = Some(v.to_string());
+                    got = true;
+                }
+            }
+            if !got {
+                let bare = rest.trim().trim_matches('"');
+                if !bare.is_empty() {
+                    task.asset_name = Some(bare.to_string());
+                }
+            }
+        }
+        "asset_kind" => task.asset_kind = Some(rest.trim().to_string()),
+        "asset_group" => task.asset_group = Some(rest.trim().to_string()),
+        "asset_owner" => task.asset_owner = Some(rest.trim().to_string()),
+        "asset_description" => task.asset_description = Some(rest.trim().to_string()),
+        "asset_tags" => task.asset_tags = split_csv(rest),
         _ => {}
     }
 
@@ -209,5 +231,99 @@ mod tests {
         let sql = "-- @name plain\nSELECT 1;\n";
         let task = parse_sql_file(sql, None).expect("parse ok");
         assert!(task.params.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 13: Asset header parsing
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parses_asset_name_kv() {
+        let sql = "-- @name t\n-- @asset name=analytics.user_stats\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert_eq!(task.asset_name.as_deref(), Some("analytics.user_stats"));
+    }
+
+    #[test]
+    fn parses_asset_name_bare() {
+        // Tolerate `-- @asset analytics.user_stats` without name= prefix
+        let sql = "-- @name t\n-- @asset analytics.user_stats\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert_eq!(task.asset_name.as_deref(), Some("analytics.user_stats"));
+    }
+
+    #[test]
+    fn parses_asset_kind() {
+        let sql = "-- @name t\n-- @asset_kind view\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert_eq!(task.asset_kind.as_deref(), Some("view"));
+    }
+
+    #[test]
+    fn parses_asset_group() {
+        let sql = "-- @name t\n-- @asset_group sales\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert_eq!(task.asset_group.as_deref(), Some("sales"));
+    }
+
+    #[test]
+    fn parses_asset_owner() {
+        let sql = "-- @name t\n-- @asset_owner data@example.com\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert_eq!(task.asset_owner.as_deref(), Some("data@example.com"));
+    }
+
+    #[test]
+    fn parses_asset_description() {
+        let sql = "-- @name t\n-- @asset_description Active users by country\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert_eq!(
+            task.asset_description.as_deref(),
+            Some("Active users by country")
+        );
+    }
+
+    #[test]
+    fn parses_asset_tags_csv() {
+        let sql = "-- @name t\n-- @asset_tags daily, sales, kpi\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert_eq!(task.asset_tags, vec!["daily", "sales", "kpi"]);
+    }
+
+    #[test]
+    fn task_without_asset_headers_is_empty() {
+        let sql = "-- @name t\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert!(task.asset_name.is_none());
+        assert!(task.asset_kind.is_none());
+        assert!(task.asset_group.is_none());
+        assert!(task.asset_owner.is_none());
+        assert!(task.asset_description.is_none());
+        assert!(task.asset_tags.is_empty());
+    }
+
+    #[test]
+    fn parses_full_asset_header_bundle() {
+        let sql = "\
+-- @name user_stats
+-- @asset name=analytics.user_stats
+-- @asset_kind table
+-- @asset_group sales
+-- @asset_owner data-team@example.com
+-- @asset_description Active users by country
+-- @asset_tags daily,kpi
+SELECT 1;
+";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert_eq!(task.name, "user_stats");
+        assert_eq!(task.asset_name.as_deref(), Some("analytics.user_stats"));
+        assert_eq!(task.asset_kind.as_deref(), Some("table"));
+        assert_eq!(task.asset_group.as_deref(), Some("sales"));
+        assert_eq!(task.asset_owner.as_deref(), Some("data-team@example.com"));
+        assert_eq!(
+            task.asset_description.as_deref(),
+            Some("Active users by country")
+        );
+        assert_eq!(task.asset_tags, vec!["daily", "kpi"]);
     }
 }

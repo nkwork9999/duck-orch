@@ -307,6 +307,29 @@ pub extern "C" fn orch_substitute_vars(
 }
 
 // ---------------------------------------------------------------------------
+// Phase 13: Asset code_version (sql hash) helper
+// ---------------------------------------------------------------------------
+
+/// Compute the canonical `code_version` string (FNV-1a 64-bit hex of the
+/// trimmed SQL body) for a task. Returned via the same leaked-buffer FFI
+/// convention so the C++ Asset auto-population path can stash it in
+/// `__orch__.assets.code_version`.
+#[unsafe(no_mangle)]
+pub extern "C" fn orch_sql_code_version(
+    sql_ptr: *const u8,
+    sql_len: usize,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        let sql = unsafe { read_str(sql_ptr, sql_len) };
+        let v = orch_common::sql_code_version(sql);
+        write_out(v, out_ptr, out_len)
+    }))
+    .unwrap_or(-1)
+}
+
+// ---------------------------------------------------------------------------
 // OpenLineage (orch_ol)
 // ---------------------------------------------------------------------------
 

@@ -289,6 +289,39 @@ CREATE TABLE __orch__.column_lineage (
     description VARCHAR,
     discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Phase 13: Asset 一級化 — Asset, Materialization history, Asset edges.
+CREATE TABLE IF NOT EXISTS __orch__.assets (
+    name VARCHAR PRIMARY KEY,
+    kind VARCHAR,
+    location VARCHAR,
+    group_name VARCHAR,
+    owner VARCHAR,
+    description VARCHAR,
+    code_version VARCHAR,
+    defined_by_task VARCHAR,
+    tags VARCHAR[],
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS __orch__.asset_materializations (
+    asset_name VARCHAR,
+    partition_key VARCHAR DEFAULT '__default__',
+    materialized_at TIMESTAMP,
+    run_id UUID,
+    rows BIGINT,
+    bytes BIGINT,
+    status VARCHAR,
+    PRIMARY KEY (asset_name, partition_key, materialized_at)
+);
+
+CREATE TABLE IF NOT EXISTS __orch__.asset_edges (
+    upstream_asset VARCHAR,
+    downstream_asset VARCHAR,
+    via_task VARCHAR,
+    edge_type VARCHAR,
+    PRIMARY KEY (upstream_asset, downstream_asset, via_task)
+);
 )";
 
 static void EnsureOrchSchema(Connection &con) {
@@ -341,6 +374,20 @@ static string SqlArrayLiteral(yyjson_ns::yyjson_val *arr) {
 	}
 	oss << "]::VARCHAR[]";
 	return oss.str();
+}
+
+// Phase 13: compute the canonical code_version (FNV-1a 64-bit hex) for a SQL
+// body via the Rust shim, so the Asset row reflects a stable fingerprint of
+// the task definition. Returns empty string on Rust-side failure.
+static string ComputeCodeVersion(const string &sql_body) {
+	bool ok = false;
+	auto v = CallRustString(
+	    [&](uint8_t **op, size_t *ol) {
+		    return orch_sql_code_version(
+		        reinterpret_cast<const uint8_t *>(sql_body.c_str()), sql_body.size(), op, ol);
+	        },
+	    ok);
+	return ok ? v : string();
 }
 
 static void OrchRegisterPragma(ClientContext &context, const FunctionParameters &parameters) {
@@ -434,6 +481,75 @@ static void OrchRegisterPragma(ClientContext &context, const FunctionParameters 
 					    << SqlEscape(yyjson_ns::yyjson_get_str(a) ? yyjson_ns::yyjson_get_str(a) : "")
 					    << ");\n";
 					counter++;
+				}
+			}
+
+			// ----------------------------------------------------------
+			// Phase 13: Asset auto-population.
+			// If the task carries an explicit `@asset` header, upsert one
+			// Asset row. Otherwise, fall back to `@outputs`: one Asset row
+			// per output table (kind='table'), preserving Phase 0-9
+			// behavior as a zero-config default.
+			// ----------------------------------------------------------
+			string task_sql = get_str("sql");
+			string code_version = ComputeCodeVersion(task_sql);
+			string task_desc = get_str("description");
+			string task_owner = get_str("owner");
+			string asset_name = get_str("asset_name");
+			string asset_kind = get_str("asset_kind");
+			string asset_group = get_str("asset_group");
+			string asset_owner = get_str("asset_owner");
+			string asset_desc = get_str("asset_description");
+			auto asset_tags_json = yyjson_ns::yyjson_obj_get(t, "asset_tags");
+			auto outputs_json = yyjson_ns::yyjson_obj_get(t, "outputs");
+
+			// Helper to render the upsert for one Asset row. Re-registering a
+			// task UPDATEs the row (preserves created_at via DO UPDATE).
+			auto emit_asset_upsert = [&](const string &a_name,
+			                              const string &a_kind,
+			                              const string &a_group,
+			                              const string &a_owner,
+			                              const string &a_desc,
+			                              const string &tags_literal) {
+				sql << "INSERT INTO __orch__.assets "
+				    << "(name, kind, location, group_name, owner, description, "
+				    << "code_version, defined_by_task, tags) VALUES ("
+				    << SqlEscape(a_name) << ", "
+				    << SqlEscape(a_kind) << ", "
+				    << "NULL, "
+				    << (a_group.empty() ? string("NULL") : SqlEscape(a_group)) << ", "
+				    << (a_owner.empty() ? string("NULL") : SqlEscape(a_owner)) << ", "
+				    << (a_desc.empty() ? string("NULL") : SqlEscape(a_desc)) << ", "
+				    << SqlEscape(code_version) << ", "
+				    << SqlEscape(name) << ", "
+				    << tags_literal
+				    << ") ON CONFLICT (name) DO UPDATE SET "
+				    << "kind=EXCLUDED.kind, "
+				    << "group_name=EXCLUDED.group_name, "
+				    << "owner=EXCLUDED.owner, "
+				    << "description=EXCLUDED.description, "
+				    << "code_version=EXCLUDED.code_version, "
+				    << "defined_by_task=EXCLUDED.defined_by_task, "
+				    << "tags=EXCLUDED.tags;\n";
+			};
+
+			if (!asset_name.empty()) {
+				string kind = asset_kind.empty() ? string("table") : asset_kind;
+				string owner = asset_owner.empty() ? task_owner : asset_owner;
+				string desc = asset_desc.empty() ? task_desc : asset_desc;
+				string tags_lit = SqlArrayLiteral(asset_tags_json);
+				emit_asset_upsert(asset_name, kind, asset_group, owner, desc, tags_lit);
+			} else if (outputs_json && yyjson_ns::yyjson_is_arr(outputs_json)) {
+				// Backward-compat: each @outputs entry becomes its own Asset.
+				size_t oidx, omax;
+				yyjson_ns::yyjson_val *ov;
+				yyjson_arr_foreach(outputs_json, oidx, omax, ov) {
+					const char *s = yyjson_ns::yyjson_get_str(ov);
+					if (!s || !*s) continue;
+					string out_name(s);
+					string tags_lit = SqlArrayLiteral(asset_tags_json);
+					emit_asset_upsert(out_name, string("table"), asset_group,
+					                   task_owner, task_desc, tags_lit);
 				}
 			}
 		}
@@ -682,6 +798,21 @@ static bool RunSingleTask(Connection &con, const TaskRow &task, const string &pi
 		    << "', 'success', 0, " << retry_count << ", "
 		    << (new_watermark.empty() ? string("NULL") : ("'" + new_watermark + "'")) << ");";
 		con.Query(ins.str());
+
+		// Phase 13: record successful materialization for every Asset this
+		// task produces. Sourced from __orch__.assets where defined_by_task
+		// matches — covers both the explicit `@asset` row and the per-output
+		// backward-compat fan-out from `@outputs`.
+		{
+			std::ostringstream mat;
+			mat << "INSERT OR IGNORE INTO __orch__.asset_materializations "
+			    << "(asset_name, partition_key, materialized_at, run_id, rows, bytes, status) "
+			    << "SELECT name, '__default__', TIMESTAMP '" << finished << "', "
+			    << "CAST(" << SqlEscape(run_uuid) << " AS UUID), NULL, NULL, 'success' "
+			    << "FROM __orch__.assets WHERE defined_by_task = "
+			    << SqlEscape(task.name) << ";";
+			con.Query(mat.str());
+		}
 		// Phase column-lineage: extract column-level dependencies from the task SQL
 		// (uses DuckDB's catalog DESCRIBE for SELECT * resolution).
 		string cl_json;
@@ -720,6 +851,21 @@ static bool RunSingleTask(Connection &con, const TaskRow &task, const string &pi
 		    << SqlEscape(task.name) << ", '" << started << "', '" << finished << "', 'failed', "
 		    << SqlEscape(error_msg) << ", " << retry_count << ");";
 		con.Query(ins.str());
+
+		// Phase 13: record a 'failed' materialization row for each declared
+		// Asset so failures show up in `asset materializations` history
+		// (CLI lands in milestone 2 but the data is captured now).
+		{
+			std::ostringstream mat;
+			mat << "INSERT OR IGNORE INTO __orch__.asset_materializations "
+			    << "(asset_name, partition_key, materialized_at, run_id, rows, bytes, status) "
+			    << "SELECT name, '__default__', TIMESTAMP '" << finished << "', "
+			    << "CAST(" << SqlEscape(run_uuid) << " AS UUID), NULL, NULL, 'failed' "
+			    << "FROM __orch__.assets WHERE defined_by_task = "
+			    << SqlEscape(task.name) << ";";
+			con.Query(mat.str());
+		}
+
 		EmitOlEvent(OlEventJson("FAIL", finished, run_uuid, pipeline_run_id, g_orch_namespace,
 		                         task.name, task_inputs, task_outputs, error_msg));
 	}

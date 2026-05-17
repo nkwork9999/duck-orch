@@ -64,4 +64,8 @@ int32_t orch_ol_emit(const uint8_t *ptr, size_t len);
 int32_t orch_topo_layers(const uint8_t *tasks_json_ptr, size_t tasks_json_len,
                           uint8_t **out_ptr, size_t *out_len);
 
+// Phase 13: canonical SQL code_version (FNV-1a 64-bit hex) for Asset rows.
+int32_t orch_sql_code_version(const uint8_t *sql_ptr, size_t sql_len,
+                               uint8_t **out_ptr, size_t *out_len);
+
 }
