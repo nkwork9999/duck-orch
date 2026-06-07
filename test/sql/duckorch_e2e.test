@@ -1,0 +1,95 @@
+# name: test/sql/duckorch_e2e.test
+# description: exercise register -> run -> lineage -> asset -> automation -> check
+# group: [sql]
+
+require duckorch
+
+statement ok
+CREATE SCHEMA raw;
+
+statement ok
+CREATE SCHEMA analytics;
+
+statement ok
+CREATE TABLE raw.users (
+    id INTEGER,
+    country VARCHAR,
+    deleted_at TIMESTAMP
+);
+
+statement ok
+INSERT INTO raw.users VALUES
+    (1, 'JP', NULL),
+    (2, 'US', NULL),
+    (3, 'JP', TIMESTAMP '2026-01-01 00:00:00');
+
+statement ok
+PRAGMA orch_init;
+
+statement ok
+PRAGMA orch_register('test/fixtures/e2e_tasks');
+
+query I
+SELECT COUNT(*)::INTEGER FROM __orch__.tasks;
+----
+2
+
+query I
+SELECT COUNT(*)::INTEGER FROM __orch__.assets WHERE group_name = 'e2e';
+----
+2
+
+query II
+SELECT COUNT(*)::INTEGER AS checks,
+       COUNT(*) FILTER (WHERE severity = 'error')::INTEGER AS error_checks
+FROM __orch__.asset_checks
+WHERE asset_name = 'analytics.user_stats';
+----
+1	1
+
+statement ok
+PRAGMA orch_run;
+
+query II
+SELECT country, users::INTEGER
+FROM analytics.user_stats
+ORDER BY country;
+----
+JP	1
+US	1
+
+query TI
+SELECT status, COUNT(*)::INTEGER
+FROM __orch__.runs
+GROUP BY status
+ORDER BY status;
+----
+success	2
+
+query I
+SELECT COUNT(*)::INTEGER
+FROM __orch__.asset_edges
+WHERE upstream_asset = 'analytics.clean_users'
+  AND downstream_asset = 'analytics.user_stats';
+----
+1
+
+query IT
+SELECT COUNT(*)::INTEGER,
+       MAX(automation_condition)
+FROM __orch__.assets
+WHERE name = 'analytics.user_stats';
+----
+1	on_missing()
+
+statement ok
+PRAGMA orch_check_run('analytics.user_stats');
+
+query TTI
+SELECT check_name, status, actual_value::INTEGER
+FROM __orch__.asset_check_results
+WHERE asset_name = 'analytics.user_stats'
+ORDER BY executed_at DESC
+LIMIT 1;
+----
+positive_users	pass	1
