@@ -10,11 +10,20 @@
 //              | NOT condition                    // ! also accepted
 //              | ( condition )
 //
-//   atom      := eager()              // also bare `eager`
-//              | on_cron(<cron-expr>) // quoted or bare
+//   atom      := eager()                    // also bare `eager`
+//              | on_cron(<cron-expr>)        // wall-clock cron tick
+//              | on_interval(<duration>)     // elapsed-time interval (SQLMesh-style)
 //              | on_missing()
 //              | freshness_violated()
 //              | in_progress()
+//
+// `on_interval` vs `on_cron`:
+//   on_cron("0 6 * * *")  fires when a scheduled wall-clock tick falls between
+//                          own_last_materialized_at and now.
+//   on_interval("1d")     fires when now - own_last_materialized_at >= 1 day,
+//                          regardless of what time of day it is.  This is the
+//                          SQLMesh / Snowflake TARGET_LAG style: data-driven
+//                          recency check, not wall-clock alignment.
 //
 // Precedence (highest to lowest): NOT > AND > OR. So
 // `eager AND NOT in_progress` parses as `eager AND (NOT in_progress())`.
@@ -40,6 +49,9 @@ use std::str::FromStr;
 pub enum AutomationCondition {
     Eager,
     OnCron(String),
+    /// Fires when `now - own_last_materialized_at >= interval_seconds`.
+    /// Stores the parsed duration in seconds. Never materialized => always fires.
+    OnInterval(u64),
     OnMissing,
     FreshnessViolated,
     InProgress,
@@ -69,7 +81,7 @@ impl std::fmt::Display for AutomationParseError {
             AutomationParseError::UnknownAtom(s) => {
                 write!(
                     f,
-                    "@automation: unknown atom `{}` (expected eager|on_cron|on_missing|freshness_violated|in_progress)",
+                    "@automation: unknown atom `{}` (expected eager|on_cron|on_interval|on_missing|freshness_violated|in_progress)",
                     s
                 )
             }
@@ -362,6 +374,18 @@ fn build_atom(name: &str, arg: Option<String>) -> Result<AutomationCondition, Au
                 .map_err(|_| AutomationParseError::BadCron(a.clone()))?;
             Ok(AutomationCondition::OnCron(a))
         }
+        "on_interval" => {
+            let a = arg.ok_or(AutomationParseError::MissingArg("on_interval"))?;
+            if a.is_empty() {
+                return Err(AutomationParseError::MissingArg("on_interval"));
+            }
+            let secs = parse_target_lag(&a)
+                .map_err(|_| AutomationParseError::BadDuration(a.clone()))?;
+            if secs == 0 {
+                return Err(AutomationParseError::BadDuration(a));
+            }
+            Ok(AutomationCondition::OnInterval(secs))
+        }
         other => Err(AutomationParseError::UnknownAtom(other.to_string())),
     }
 }
@@ -411,6 +435,7 @@ impl AutomationCondition {
         match self {
             AutomationCondition::Eager => "eager()".into(),
             AutomationCondition::OnCron(expr) => format!("on_cron(\"{}\")", expr),
+            AutomationCondition::OnInterval(secs) => format!("on_interval(\"{}s\")", secs),
             AutomationCondition::OnMissing => "on_missing()".into(),
             AutomationCondition::FreshnessViolated => "freshness_violated()".into(),
             AutomationCondition::InProgress => "in_progress()".into(),
@@ -590,6 +615,20 @@ fn evaluate_inner(cond: &AutomationCondition, ctx: &EvalContext) -> (bool, Strin
                     format!("cron `{}` next tick at {} > now {}", expr, t.naive_utc(), ctx.now),
                 ),
                 None => (false, format!("cron `{}` produced no upcoming tick", expr)),
+            }
+        }
+        AutomationCondition::OnInterval(secs) => {
+            match ctx.own_last_materialized_at {
+                None => (true, format!("on_interval({}s): never materialized", secs)),
+                Some(last) => {
+                    let elapsed = (ctx.now - last).num_seconds();
+                    if elapsed >= 0 && (elapsed as u64) >= *secs {
+                        (true, format!("on_interval({}s): {}s elapsed since last run", secs, elapsed))
+                    } else {
+                        (false, format!("on_interval({}s): only {}s elapsed, next in {}s",
+                            secs, elapsed.max(0), (*secs as i64 - elapsed).max(0)))
+                    }
+                }
             }
         }
         AutomationCondition::OnMissing => {
@@ -1017,6 +1056,79 @@ mod tests {
         let cond = AutomationCondition::Eager;
         let (met, reason) = evaluate(&cond, &ctx);
         assert!(met, "expected pass, reason: {}", reason);
+    }
+
+    // -------------------- on_interval --------------------
+
+    #[test]
+    fn parses_on_interval_minutes() {
+        let c = parse_automation("on_interval(\"5min\")").unwrap();
+        assert_eq!(c, AutomationCondition::OnInterval(300));
+    }
+
+    #[test]
+    fn parses_on_interval_days() {
+        let c = parse_automation("on_interval(\"1d\")").unwrap();
+        assert_eq!(c, AutomationCondition::OnInterval(86_400));
+    }
+
+    #[test]
+    fn rejects_on_interval_zero() {
+        assert!(parse_automation("on_interval(\"0s\")").is_err());
+    }
+
+    #[test]
+    fn rejects_on_interval_no_arg() {
+        assert!(parse_automation("on_interval()").is_err());
+    }
+
+    #[test]
+    fn on_interval_fires_when_never_materialized() {
+        let ctx = ctx_at("2026-05-17");
+        let cond = parse_automation("on_interval(\"1d\")").unwrap();
+        let (met, reason) = evaluate(&cond, &ctx);
+        assert!(met, "never materialized should fire: {}", reason);
+    }
+
+    #[test]
+    fn on_interval_fires_when_interval_elapsed() {
+        let mut ctx = ctx_at("2026-05-17");
+        // last run 25h ago; interval is 1d (86400s) => should fire
+        ctx.own_last_materialized_at = Some(ts("2026-05-16 11:00:00"));
+        let cond = parse_automation("on_interval(\"1d\")").unwrap();
+        let (met, reason) = evaluate(&cond, &ctx);
+        assert!(met, "25h elapsed, 1d interval should fire: {}", reason);
+    }
+
+    #[test]
+    fn on_interval_does_not_fire_before_interval() {
+        let mut ctx = ctx_at("2026-05-17");
+        // last run 1h ago; interval is 1d => should NOT fire
+        ctx.own_last_materialized_at = Some(ts("2026-05-17 11:00:00"));
+        let cond = parse_automation("on_interval(\"1d\")").unwrap();
+        let (met, reason) = evaluate(&cond, &ctx);
+        assert!(!met, "1h elapsed, 1d interval should NOT fire: {}", reason);
+    }
+
+    #[test]
+    fn on_interval_dsl_roundtrip() {
+        let src = "on_interval(\"86400s\")";
+        let c = parse_automation(src).unwrap();
+        let s = c.serialize_dsl();
+        let c2 = parse_automation(&s).unwrap();
+        assert_eq!(c, c2);
+    }
+
+    #[test]
+    fn on_interval_not_affected_by_wall_clock_time() {
+        // Unlike on_cron, on_interval fires purely based on elapsed time,
+        // not alignment to a specific wall-clock time.
+        let mut ctx = EvalContext::at(ts("2026-05-17 03:00:00")); // 3am
+        // last run was yesterday 3am — exactly 24h = 86400s elapsed
+        ctx.own_last_materialized_at = Some(ts("2026-05-16 03:00:00"));
+        let cond = parse_automation("on_interval(\"1d\")").unwrap();
+        let (met, reason) = evaluate(&cond, &ctx);
+        assert!(met, "exactly 1d elapsed at off-peak hour should fire: {}", reason);
     }
 
     #[test]
