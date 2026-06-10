@@ -592,6 +592,69 @@ pub extern "C" fn orch_automation_parse(
     .unwrap_or(-1)
 }
 
+// ---------------------------------------------------------------------------
+// Shared JSON → EvalContext helper (used by both FFI functions and tests)
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct RawCtx {
+    upstream_max_materialized_at: Option<String>,
+    own_last_materialized_at: Option<String>,
+    missing_partition_count: u64,
+    now: Option<String>,
+    freshness_lag_seconds: Option<u64>,
+    in_progress: bool,
+    target_lag_seconds: Option<u64>,
+    last_evaluated_at: Option<String>,
+    /// SQLMesh-style: already-computed intervals [[start_ts, end_ts], ...]
+    stored_intervals: Vec<[i64; 2]>,
+    /// Epoch seconds: earliest timestamp to track intervals from.
+    interval_start_ts: Option<i64>,
+}
+
+fn parse_ts(s: &str) -> Option<chrono::NaiveDateTime> {
+    for fmt in [
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S",
+    ] {
+        if let Ok(t) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
+            return Some(t);
+        }
+    }
+    None
+}
+
+fn eval_ctx_from_json(ctx_json: &str) -> Result<orch_common::EvalContext, String> {
+    let raw: RawCtx = if ctx_json.is_empty() {
+        RawCtx::default()
+    } else {
+        serde_json::from_str(ctx_json)
+            .map_err(|e| format!("invalid eval context json: {}", e))?
+    };
+    let opt_ts = |s: Option<String>| s.as_deref().and_then(parse_ts);
+    let stored = raw.stored_intervals.iter().map(|p| (p[0], p[1])).collect();
+    let now = raw
+        .now
+        .as_deref()
+        .and_then(parse_ts)
+        .unwrap_or_else(|| chrono::Utc::now().naive_utc());
+    Ok(orch_common::EvalContext {
+        upstream_max_materialized_at: opt_ts(raw.upstream_max_materialized_at),
+        own_last_materialized_at: opt_ts(raw.own_last_materialized_at),
+        missing_partition_count: raw.missing_partition_count,
+        now,
+        freshness_lag_seconds: raw.freshness_lag_seconds,
+        in_progress: raw.in_progress,
+        target_lag_seconds: raw.target_lag_seconds,
+        last_evaluated_at: opt_ts(raw.last_evaluated_at),
+        stored_intervals: stored,
+        interval_start_ts: raw.interval_start_ts,
+    })
+}
+
 /// Evaluate an automation condition against a context snapshot.
 ///
 /// `cond_dsl`: the DSL string stored on `__orch__.assets.automation_condition`.
@@ -623,68 +686,9 @@ pub extern "C" fn orch_automation_evaluate(
             }
         };
 
-        #[derive(serde::Deserialize, Default)]
-        #[serde(default)]
-        struct RawCtx {
-            upstream_max_materialized_at: Option<String>,
-            own_last_materialized_at: Option<String>,
-            missing_partition_count: u64,
-            now: Option<String>,
-            freshness_lag_seconds: Option<u64>,
-            in_progress: bool,
-            target_lag_seconds: Option<u64>,
-            last_evaluated_at: Option<String>,
-            /// SQLMesh-style: already-computed intervals [[start_ts, end_ts], ...]
-            stored_intervals: Vec<[i64; 2]>,
-            /// Epoch seconds: earliest timestamp to track intervals from.
-            interval_start_ts: Option<i64>,
-        }
-
-        let raw: RawCtx = if ctx_json.is_empty() {
-            RawCtx::default()
-        } else {
-            match serde_json::from_str(ctx_json) {
-                Ok(v) => v,
-                Err(e) => {
-                    return err_to_buf(
-                        &format!("invalid eval context json: {}", e),
-                        out_ptr,
-                        out_len,
-                    );
-                }
-            }
-        };
-
-        fn parse_ts(s: &str) -> Option<chrono::NaiveDateTime> {
-            for fmt in [
-                "%Y-%m-%d %H:%M:%S%.f",
-                "%Y-%m-%d %H:%M:%S",
-                "%Y-%m-%dT%H:%M:%S%.f",
-                "%Y-%m-%dT%H:%M:%S",
-            ] {
-                if let Ok(t) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
-                    return Some(t);
-                }
-            }
-            None
-        }
-        fn opt_ts(s: Option<String>) -> Option<chrono::NaiveDateTime> {
-            s.and_then(|v| parse_ts(&v))
-        }
-
-        let stored = raw.stored_intervals.iter().map(|p| (p[0], p[1])).collect();
-        let now = opt_ts(raw.now.clone()).unwrap_or_else(|| chrono::Utc::now().naive_utc());
-        let ctx = orch_common::EvalContext {
-            upstream_max_materialized_at: opt_ts(raw.upstream_max_materialized_at),
-            own_last_materialized_at: opt_ts(raw.own_last_materialized_at),
-            missing_partition_count: raw.missing_partition_count,
-            now,
-            freshness_lag_seconds: raw.freshness_lag_seconds,
-            in_progress: raw.in_progress,
-            target_lag_seconds: raw.target_lag_seconds,
-            last_evaluated_at: opt_ts(raw.last_evaluated_at),
-            stored_intervals: stored,
-            interval_start_ts: raw.interval_start_ts,
+        let ctx = match eval_ctx_from_json(ctx_json) {
+            Ok(c) => c,
+            Err(e) => return err_to_buf(&e, out_ptr, out_len),
         };
         let (met, reason) = orch_common::evaluate_automation(&cond, &ctx);
         let v = serde_json::json!({
@@ -726,79 +730,209 @@ pub extern "C" fn orch_missing_intervals_for(
             }
         };
 
-        #[derive(serde::Deserialize, Default)]
-        #[serde(default)]
-        struct RawCtx {
-            upstream_max_materialized_at: Option<String>,
-            own_last_materialized_at: Option<String>,
-            missing_partition_count: u64,
-            now: Option<String>,
-            freshness_lag_seconds: Option<u64>,
-            in_progress: bool,
-            target_lag_seconds: Option<u64>,
-            last_evaluated_at: Option<String>,
-            stored_intervals: Vec<[i64; 2]>,
-            interval_start_ts: Option<i64>,
-        }
-
-        let raw: RawCtx = if ctx_json.is_empty() {
-            RawCtx::default()
-        } else {
-            match serde_json::from_str(ctx_json) {
-                Ok(v) => v,
-                Err(e) => {
-                    return err_to_buf(
-                        &format!("invalid eval context json: {}", e),
-                        out_ptr,
-                        out_len,
-                    );
-                }
-            }
-        };
-
-        fn parse_ts(s: &str) -> Option<chrono::NaiveDateTime> {
-            for fmt in [
-                "%Y-%m-%d %H:%M:%S%.f",
-                "%Y-%m-%d %H:%M:%S",
-                "%Y-%m-%dT%H:%M:%S%.f",
-                "%Y-%m-%dT%H:%M:%S",
-            ] {
-                if let Ok(t) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
-                    return Some(t);
-                }
-            }
-            None
-        }
-
-        let stored = raw.stored_intervals.iter().map(|p| (p[0], p[1])).collect();
-        let now = raw
-            .now
-            .as_deref()
-            .and_then(|s| parse_ts(s))
-            .unwrap_or_else(|| chrono::Utc::now().naive_utc());
-        let ctx = orch_common::EvalContext {
-            upstream_max_materialized_at: raw
-                .upstream_max_materialized_at
-                .as_deref()
-                .and_then(|s| parse_ts(s)),
-            own_last_materialized_at: raw
-                .own_last_materialized_at
-                .as_deref()
-                .and_then(|s| parse_ts(s)),
-            missing_partition_count: raw.missing_partition_count,
-            now,
-            freshness_lag_seconds: raw.freshness_lag_seconds,
-            in_progress: raw.in_progress,
-            target_lag_seconds: raw.target_lag_seconds,
-            last_evaluated_at: raw.last_evaluated_at.as_deref().and_then(|s| parse_ts(s)),
-            stored_intervals: stored,
-            interval_start_ts: raw.interval_start_ts,
+        let ctx = match eval_ctx_from_json(ctx_json) {
+            Ok(c) => c,
+            Err(e) => return err_to_buf(&e, out_ptr, out_len),
         };
         let missing = orch_common::missing_intervals_for(&cond, &ctx);
         let arr: Vec<[i64; 2]> = missing.iter().map(|&(s, e)| [s, e]).collect();
         write_out(serde_json::to_string(&arr).unwrap_or_default(), out_ptr, out_len)
     }))
     .unwrap_or(-1)
+}
+
+// ---------------------------------------------------------------------------
+// Tests for eval_ctx_from_json + FFI contract
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orch_common::{evaluate_automation, missing_intervals_for, parse_automation};
+
+    // Helper: build a minimal context JSON string.
+    fn ctx(fields: &str) -> String {
+        format!("{{\"now\":\"2026-06-10 12:00:00\",{}}}", fields)
+    }
+
+    // -----------------------------------------------------------------------
+    // eval_ctx_from_json — JSON contract
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn empty_json_gives_defaults() {
+        let ec = eval_ctx_from_json("").unwrap();
+        assert!(ec.stored_intervals.is_empty());
+        assert!(ec.interval_start_ts.is_none());
+        assert!(ec.own_last_materialized_at.is_none());
+    }
+
+    #[test]
+    fn parses_stored_intervals() {
+        let json = ctx("\"stored_intervals\":[[0,86400],[172800,259200]]");
+        let ec = eval_ctx_from_json(&json).unwrap();
+        assert_eq!(ec.stored_intervals, vec![(0, 86_400), (172_800, 259_200)]);
+    }
+
+    #[test]
+    fn parses_interval_start_ts() {
+        let json = ctx("\"interval_start_ts\":1749513600");
+        let ec = eval_ctx_from_json(&json).unwrap();
+        assert_eq!(ec.interval_start_ts, Some(1_749_513_600));
+    }
+
+    #[test]
+    fn parses_iso_timestamps() {
+        let json = ctx("\"own_last_materialized_at\":\"2026-06-09 00:00:00\"");
+        let ec = eval_ctx_from_json(&json).unwrap();
+        assert!(ec.own_last_materialized_at.is_some());
+    }
+
+    #[test]
+    fn rejects_bad_json() {
+        assert!(eval_ctx_from_json("{not valid json}").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // on_interval evaluate — via eval_ctx_from_json
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn on_interval_false_when_fully_stored() {
+        // 2026-06-10 00:00 UTC epoch = 1781049600; now = 12:00 same day.
+        // Stored covers the whole day → no missing interval → condition_met false.
+        let start: i64 = 1_781_049_600; // 2026-06-10 00:00 UTC
+        let end = start + 86_400;
+        let json = format!(
+            "{{\"now\":\"2026-06-10 12:00:00\",\
+              \"stored_intervals\":[[{},{}]],\
+              \"interval_start_ts\":{}}}",
+            start, end, start
+        );
+        let cond = parse_automation("on_interval(\"daily\")").unwrap();
+        let ctx = eval_ctx_from_json(&json).unwrap();
+        let (met, _) = evaluate_automation(&cond, &ctx);
+        assert!(!met, "fully stored day should not fire");
+    }
+
+    #[test]
+    fn on_interval_true_when_day_missing() {
+        // interval_start_ts = 2026-06-08 00:00; now = 2026-06-10 12:00.
+        // Nothing stored → 2 missing days → condition_met true.
+        let start: i64 = 1_780_876_800; // 2026-06-08 00:00 UTC
+        let json = format!(
+            "{{\"now\":\"2026-06-10 12:00:00\",\
+              \"stored_intervals\":[],\
+              \"interval_start_ts\":{}}}",
+            start
+        );
+        let cond = parse_automation("on_interval(\"daily\")").unwrap();
+        let ctx = eval_ctx_from_json(&json).unwrap();
+        let (met, _) = evaluate_automation(&cond, &ctx);
+        assert!(met, "2 missing days should fire");
+    }
+
+    // -----------------------------------------------------------------------
+    // missing_intervals_for — via eval_ctx_from_json
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn missing_returns_empty_when_fully_covered() {
+        let start: i64 = 1_781_049_600; // 2026-06-10 00:00 UTC
+        let end = start + 86_400;
+        let json = format!(
+            "{{\"now\":\"2026-06-10 12:00:00\",\
+              \"stored_intervals\":[[{},{}]],\
+              \"interval_start_ts\":{}}}",
+            start, end, start
+        );
+        let cond = parse_automation("on_interval(\"daily\")").unwrap();
+        let ctx = eval_ctx_from_json(&json).unwrap();
+        let missing = missing_intervals_for(&cond, &ctx);
+        assert!(missing.is_empty(), "fully covered: {:?}", missing);
+    }
+
+    #[test]
+    fn missing_returns_two_days_when_both_absent() {
+        let start: i64 = 1_780_876_800; // 2026-06-08 00:00 UTC
+        let json = format!(
+            "{{\"now\":\"2026-06-10 12:00:00\",\
+              \"stored_intervals\":[],\
+              \"interval_start_ts\":{}}}",
+            start
+        );
+        let cond = parse_automation("on_interval(\"daily\")").unwrap();
+        let ctx = eval_ctx_from_json(&json).unwrap();
+        let missing = missing_intervals_for(&cond, &ctx);
+        assert_eq!(missing.len(), 2, "expected 2 missing days: {:?}", missing);
+        assert_eq!(missing[0].0, start);
+        assert_eq!(missing[1].0, start + 86_400);
+    }
+
+    #[test]
+    fn missing_returns_gap_in_middle() {
+        // Day 0 and day 2 stored; day 1 missing.
+        let d0: i64 = 1_780_876_800; // 2026-06-08 00:00 UTC
+        let d1 = d0 + 86_400;
+        let d2 = d0 + 2 * 86_400;
+        let d3 = d0 + 3 * 86_400;
+        let json = format!(
+            "{{\"now\":\"2026-06-11 12:00:00\",\
+              \"stored_intervals\":[[{d0},{d1}],[{d2},{d3}]],\
+              \"interval_start_ts\":{d0}}}"
+        );
+        let cond = parse_automation("on_interval(\"daily\")").unwrap();
+        let ctx = eval_ctx_from_json(&json).unwrap();
+        let missing = missing_intervals_for(&cond, &ctx);
+        assert_eq!(missing, vec![(d1, d2)], "only middle day should be missing");
+    }
+
+    #[test]
+    fn missing_empty_for_eager_condition() {
+        let json = ctx("\"stored_intervals\":[]");
+        let cond = parse_automation("eager").unwrap();
+        let ctx = eval_ctx_from_json(&json).unwrap();
+        let missing = missing_intervals_for(&cond, &ctx);
+        assert!(missing.is_empty(), "non-interval condition returns no intervals");
+    }
+
+    #[test]
+    fn on_interval_and_not_in_progress_gate() {
+        // on_interval fires but in_progress is true → AND gate blocks it.
+        let start: i64 = 1_780_876_800; // 2026-06-08 00:00 UTC
+        let json = format!(
+            "{{\"now\":\"2026-06-10 12:00:00\",\
+              \"stored_intervals\":[],\
+              \"interval_start_ts\":{},\
+              \"in_progress\":true}}",
+            start
+        );
+        let cond = parse_automation("on_interval(\"daily\") AND NOT in_progress()").unwrap();
+        let ctx = eval_ctx_from_json(&json).unwrap();
+        let (met, reason) = evaluate_automation(&cond, &ctx);
+        assert!(!met, "in_progress gate should block: {}", reason);
+    }
+
+    #[test]
+    fn hourly_missing_intervals() {
+        // 3 hours of tracking, nothing stored → 3 missing 1h intervals.
+        // now = epoch + 3h + 30min; interval_start_ts = epoch
+        let start: i64 = 0;
+        let now_ts = 3 * 3600 + 1800; // 3.5 hours after epoch
+        // Use a fixed ISO timestamp: 1970-01-01 03:30:00
+        let json = format!(
+            "{{\"now\":\"1970-01-01 03:30:00\",\
+              \"stored_intervals\":[],\
+              \"interval_start_ts\":{}}}",
+            start
+        );
+        let cond = parse_automation("on_interval(\"hourly\")").unwrap();
+        let ctx = eval_ctx_from_json(&json).unwrap();
+        let missing = missing_intervals_for(&cond, &ctx);
+        // floor(3.5h) = 3h → intervals [0,1h), [1h,2h), [2h,3h) = 3 intervals
+        let _ = now_ts; // used above for clarity
+        assert_eq!(missing.len(), 3, "3 missing hours: {:?}", missing);
+    }
 }
 
 /// Parse a `@target_lag` duration string and return its value in seconds
