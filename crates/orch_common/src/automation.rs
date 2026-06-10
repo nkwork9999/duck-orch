@@ -17,6 +17,14 @@
 //              | freshness_violated()
 //              | in_progress()
 //
+// `on_interval` vs `on_cron`:
+//   on_cron("0 6 * * *")  fires when a scheduled wall-clock tick falls between
+//                          own_last_materialized_at and now.
+//   on_interval("1d")     fires when now - own_last_materialized_at >= 1 day,
+//                          regardless of what time of day it is.  This is the
+//                          SQLMesh / Snowflake TARGET_LAG style: data-driven
+//                          recency check, not wall-clock alignment.
+//
 // Precedence (highest to lowest): NOT > AND > OR. So
 // `eager AND NOT in_progress` parses as `eager AND (NOT in_progress())`.
 //
@@ -1214,6 +1222,91 @@ mod tests {
         let cond = AutomationCondition::Eager;
         let (met, reason) = evaluate(&cond, &ctx);
         assert!(met, "expected pass, reason: {}", reason);
+    }
+
+    // -------------------- on_interval --------------------
+
+    #[test]
+    fn parses_on_interval_minutes() {
+        let c = parse_automation("on_interval(\"5min\")").unwrap();
+        assert_eq!(c, AutomationCondition::OnInterval(IntervalUnit::Minutes(5)));
+    }
+
+    #[test]
+    fn parses_on_interval_days() {
+        let c = parse_automation("on_interval(\"1d\")").unwrap();
+        assert_eq!(c, AutomationCondition::OnInterval(IntervalUnit::Daily));
+    }
+
+    #[test]
+    fn rejects_on_interval_unknown_unit() {
+        assert!(parse_automation("on_interval(\"0s\")").is_err());
+    }
+
+    #[test]
+    fn rejects_on_interval_no_arg() {
+        assert!(parse_automation("on_interval()").is_err());
+    }
+
+    #[test]
+    fn on_interval_fires_when_never_materialized() {
+        let mut ctx = ctx_at("2026-05-17");
+        // No stored intervals, no start configured — falls back to floor(now)-1 step,
+        // so the most recent complete daily interval is missing.
+        ctx.interval_start_ts = Some(
+            ts("2026-05-16 00:00:00").and_utc().timestamp(),
+        );
+        let cond = parse_automation("on_interval(\"1d\")").unwrap();
+        let (met, reason) = evaluate(&cond, &ctx);
+        assert!(met, "never materialized should fire: {}", reason);
+    }
+
+    #[test]
+    fn on_interval_fires_when_interval_elapsed() {
+        let mut ctx = ctx_at("2026-05-18");
+        // last materialization was on 2026-05-16; interval_start_ts anchors from
+        // 2026-05-16, so the 2026-05-17 daily slot is missing => fires.
+        ctx.own_last_materialized_at = Some(ts("2026-05-16 11:00:00"));
+        ctx.interval_start_ts = Some(ts("2026-05-16 00:00:00").and_utc().timestamp());
+        let cond = parse_automation("on_interval(\"1d\")").unwrap();
+        let (met, reason) = evaluate(&cond, &ctx);
+        assert!(met, "daily interval elapsed should fire: {}", reason);
+    }
+
+    #[test]
+    fn on_interval_does_not_fire_when_up_to_date() {
+        use crate::interval::Interval;
+        let mut ctx = ctx_at("2026-05-17");
+        // The only complete daily interval before now (2026-05-17 12:00) is
+        // 2026-05-16. Mark it as stored => nothing missing.
+        let day_start = ts("2026-05-16 00:00:00").and_utc().timestamp();
+        let day_end = ts("2026-05-17 00:00:00").and_utc().timestamp();
+        ctx.stored_intervals = vec![(day_start, day_end)];
+        ctx.interval_start_ts = Some(day_start);
+        let cond = parse_automation("on_interval(\"1d\")").unwrap();
+        let (met, reason) = evaluate(&cond, &ctx);
+        assert!(!met, "all intervals up to date should NOT fire: {}", reason);
+    }
+
+    #[test]
+    fn on_interval_dsl_roundtrip() {
+        let src = "on_interval(\"daily\")";
+        let c = parse_automation(src).unwrap();
+        let s = c.serialize_dsl();
+        let c2 = parse_automation(&s).unwrap();
+        assert_eq!(c, c2);
+    }
+
+    #[test]
+    fn on_interval_not_wall_clock_aligned() {
+        // on_interval is data-driven (which intervals are missing?), not
+        // wall-clock aligned. Firing at 3am vs noon does not matter.
+        let mut ctx = EvalContext::at(ts("2026-05-17 03:00:00"));
+        // Anchor from 2026-05-15; 2026-05-16 daily slot is complete and missing.
+        ctx.interval_start_ts = Some(ts("2026-05-15 00:00:00").and_utc().timestamp());
+        let cond = parse_automation("on_interval(\"1d\")").unwrap();
+        let (met, reason) = evaluate(&cond, &ctx);
+        assert!(met, "daily interval should fire regardless of wall-clock hour: {}", reason);
     }
 
     #[test]
