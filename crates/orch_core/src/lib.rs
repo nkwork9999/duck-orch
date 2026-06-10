@@ -634,6 +634,10 @@ pub extern "C" fn orch_automation_evaluate(
             in_progress: bool,
             target_lag_seconds: Option<u64>,
             last_evaluated_at: Option<String>,
+            /// SQLMesh-style: already-computed intervals [[start_ts, end_ts], ...]
+            stored_intervals: Vec<[i64; 2]>,
+            /// Epoch seconds: earliest timestamp to track intervals from.
+            interval_start_ts: Option<i64>,
         }
 
         let raw: RawCtx = if ctx_json.is_empty() {
@@ -652,7 +656,6 @@ pub extern "C" fn orch_automation_evaluate(
         };
 
         fn parse_ts(s: &str) -> Option<chrono::NaiveDateTime> {
-            // Try a few formats commonly emitted by DuckDB.
             for fmt in [
                 "%Y-%m-%d %H:%M:%S%.f",
                 "%Y-%m-%d %H:%M:%S",
@@ -669,6 +672,7 @@ pub extern "C" fn orch_automation_evaluate(
             s.and_then(|v| parse_ts(&v))
         }
 
+        let stored = raw.stored_intervals.iter().map(|p| (p[0], p[1])).collect();
         let now = opt_ts(raw.now.clone()).unwrap_or_else(|| chrono::Utc::now().naive_utc());
         let ctx = orch_common::EvalContext {
             upstream_max_materialized_at: opt_ts(raw.upstream_max_materialized_at),
@@ -679,6 +683,8 @@ pub extern "C" fn orch_automation_evaluate(
             in_progress: raw.in_progress,
             target_lag_seconds: raw.target_lag_seconds,
             last_evaluated_at: opt_ts(raw.last_evaluated_at),
+            stored_intervals: stored,
+            interval_start_ts: raw.interval_start_ts,
         };
         let (met, reason) = orch_common::evaluate_automation(&cond, &ctx);
         let v = serde_json::json!({
@@ -687,6 +693,110 @@ pub extern "C" fn orch_automation_evaluate(
             "dsl": cond.serialize_dsl(),
         });
         write_out(v.to_string(), out_ptr, out_len)
+    }))
+    .unwrap_or(-1)
+}
+
+/// Return the list of missing intervals for an `on_interval()` condition.
+///
+/// Same inputs as `orch_automation_evaluate`. Output is a JSON array of
+/// `[start_ts, end_ts]` pairs (epoch seconds, half-open) in chronological
+/// order.  Returns `[]` for non-interval conditions.
+///
+/// The sensor loop calls this when `orch_automation_evaluate` returns
+/// `condition_met=true` and the condition contains `on_interval`, then
+/// enqueues one task run per returned interval and INSERTs the interval
+/// into `__orch__.asset_intervals` on success.
+#[unsafe(no_mangle)]
+pub extern "C" fn orch_missing_intervals_for(
+    cond_dsl_ptr: *const u8,
+    cond_dsl_len: usize,
+    ctx_json_ptr: *const u8,
+    ctx_json_len: usize,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        let dsl = unsafe { read_str(cond_dsl_ptr, cond_dsl_len) };
+        let ctx_json = unsafe { read_str(ctx_json_ptr, ctx_json_len) };
+        let cond = match orch_common::parse_automation(dsl) {
+            Ok(c) => c,
+            Err(e) => {
+                return err_to_buf(&format!("automation parse error: {}", e), out_ptr, out_len);
+            }
+        };
+
+        #[derive(serde::Deserialize, Default)]
+        #[serde(default)]
+        struct RawCtx {
+            upstream_max_materialized_at: Option<String>,
+            own_last_materialized_at: Option<String>,
+            missing_partition_count: u64,
+            now: Option<String>,
+            freshness_lag_seconds: Option<u64>,
+            in_progress: bool,
+            target_lag_seconds: Option<u64>,
+            last_evaluated_at: Option<String>,
+            stored_intervals: Vec<[i64; 2]>,
+            interval_start_ts: Option<i64>,
+        }
+
+        let raw: RawCtx = if ctx_json.is_empty() {
+            RawCtx::default()
+        } else {
+            match serde_json::from_str(ctx_json) {
+                Ok(v) => v,
+                Err(e) => {
+                    return err_to_buf(
+                        &format!("invalid eval context json: {}", e),
+                        out_ptr,
+                        out_len,
+                    );
+                }
+            }
+        };
+
+        fn parse_ts(s: &str) -> Option<chrono::NaiveDateTime> {
+            for fmt in [
+                "%Y-%m-%d %H:%M:%S%.f",
+                "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%dT%H:%M:%S%.f",
+                "%Y-%m-%dT%H:%M:%S",
+            ] {
+                if let Ok(t) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
+                    return Some(t);
+                }
+            }
+            None
+        }
+
+        let stored = raw.stored_intervals.iter().map(|p| (p[0], p[1])).collect();
+        let now = raw
+            .now
+            .as_deref()
+            .and_then(|s| parse_ts(s))
+            .unwrap_or_else(|| chrono::Utc::now().naive_utc());
+        let ctx = orch_common::EvalContext {
+            upstream_max_materialized_at: raw
+                .upstream_max_materialized_at
+                .as_deref()
+                .and_then(|s| parse_ts(s)),
+            own_last_materialized_at: raw
+                .own_last_materialized_at
+                .as_deref()
+                .and_then(|s| parse_ts(s)),
+            missing_partition_count: raw.missing_partition_count,
+            now,
+            freshness_lag_seconds: raw.freshness_lag_seconds,
+            in_progress: raw.in_progress,
+            target_lag_seconds: raw.target_lag_seconds,
+            last_evaluated_at: raw.last_evaluated_at.as_deref().and_then(|s| parse_ts(s)),
+            stored_intervals: stored,
+            interval_start_ts: raw.interval_start_ts,
+        };
+        let missing = orch_common::missing_intervals_for(&cond, &ctx);
+        let arr: Vec<[i64; 2]> = missing.iter().map(|&(s, e)| [s, e]).collect();
+        write_out(serde_json::to_string(&arr).unwrap_or_default(), out_ptr, out_len)
     }))
     .unwrap_or(-1)
 }

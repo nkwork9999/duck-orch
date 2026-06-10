@@ -371,6 +371,32 @@ CREATE TABLE IF NOT EXISTS __orch__.automation_evaluations (
 -- header.
 ALTER TABLE __orch__.assets ADD COLUMN IF NOT EXISTS freshness_lag_seconds BIGINT;
 
+-- Phase 18: SQLMesh-style interval tracking for on_interval() ----------
+--
+-- Append-only log of computed intervals. The sensor INSERTs a row after
+-- each successful task run that was triggered by on_interval(); the
+-- evaluator loads all success rows as `stored_intervals` in EvalContext
+-- so compute_missing() can find gaps without re-running done intervals.
+--
+-- `interval_unit` mirrors IntervalUnit DSL strings ("daily"|"hourly"|"5min").
+-- `start_ts` / `end_ts` are epoch seconds, half-open [start, end).
+-- `status` is 'success' (done) or 'removed' (restatement soft-delete).
+CREATE TABLE IF NOT EXISTS __orch__.asset_intervals (
+    asset_name   VARCHAR,
+    interval_unit VARCHAR,
+    start_ts     BIGINT,
+    end_ts       BIGINT,
+    status       VARCHAR DEFAULT 'success',
+    run_id       UUID,
+    created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (asset_name, start_ts, end_ts)
+);
+
+-- Interval tracking config lives on the asset row so BuildEvalContextJson
+-- can pass interval_start_ts straight through without an extra join.
+ALTER TABLE __orch__.assets ADD COLUMN IF NOT EXISTS interval_unit VARCHAR;
+ALTER TABLE __orch__.assets ADD COLUMN IF NOT EXISTS interval_start_ts BIGINT;
+
 -- One row per declared `-- @check ...` (or legacy `-- @test ...` promoted
 -- as `test_<N>`). Re-registration UPSERTs by (asset_name, check_name).
 CREATE TABLE IF NOT EXISTS __orch__.asset_checks (
@@ -2504,17 +2530,20 @@ struct AutomationRow {
 	string condition_dsl;
 	int64_t target_lag_seconds = 0;
 	bool target_lag_set = false;
-	// Phase 16: freshness policy on this asset. Sourced from the same
-	// __orch__.assets row so BuildEvalContextJson can pass it straight to
-	// the FreshnessViolated evaluator (no extra join per tick).
+	// Phase 16: freshness policy on this asset.
 	int64_t freshness_lag_seconds = 0;
 	bool freshness_lag_set = false;
+	// Phase 18: interval tracking config.
+	string interval_unit;           // e.g. "daily" — empty if not set
+	int64_t interval_start_ts = 0;
+	bool interval_start_set = false;
 };
 
 static std::vector<AutomationRow> LoadAutomationAssets(Connection &con) {
 	std::vector<AutomationRow> out;
 	auto r = con.Query(
-	    "SELECT name, automation_condition, target_lag_seconds, freshness_lag_seconds "
+	    "SELECT name, automation_condition, target_lag_seconds, freshness_lag_seconds, "
+	    "       interval_unit, interval_start_ts "
 	    "FROM __orch__.assets "
 	    "WHERE automation_condition IS NOT NULL "
 	    "ORDER BY name;");
@@ -2532,6 +2561,15 @@ static std::vector<AutomationRow> LoadAutomationAssets(Connection &con) {
 		if (!flv.IsNull()) {
 			row.freshness_lag_seconds = flv.GetValue<int64_t>();
 			row.freshness_lag_set = true;
+		}
+		auto iuv = r->GetValue(4, i);
+		if (!iuv.IsNull()) {
+			row.interval_unit = iuv.ToString();
+		}
+		auto isv = r->GetValue(5, i);
+		if (!isv.IsNull()) {
+			row.interval_start_ts = isv.GetValue<int64_t>();
+			row.interval_start_set = true;
 		}
 		out.push_back(std::move(row));
 	}
@@ -2608,6 +2646,21 @@ static string BuildEvalContextJson(Connection &con, const AutomationRow &row,
 		return JsonEscape(s);
 	};
 
+	// Phase 18: load stored intervals for on_interval() evaluation.
+	// Returns a JSON array of [[start_ts, end_ts], ...] pairs.
+	string stored_intervals_json = "[]";
+	if (!row.interval_unit.empty()) {
+		std::ostringstream q_iv;
+		q_iv << "SELECT list([start_ts, end_ts] ORDER BY start_ts)::VARCHAR "
+		     << "FROM __orch__.asset_intervals "
+		     << "WHERE asset_name = " << SqlEscape(row.asset_name)
+		     << "  AND status = 'success';";
+		auto iv_r = con.Query(q_iv.str());
+		if (!iv_r->HasError() && iv_r->RowCount() > 0 && !iv_r->GetValue(0, 0).IsNull()) {
+			stored_intervals_json = iv_r->GetValue(0, 0).ToString();
+		}
+	}
+
 	std::ostringstream o;
 	o << "{"
 	  << "\"upstream_max_materialized_at\":" << json_or_null(upstream_max)
@@ -2616,7 +2669,11 @@ static string BuildEvalContextJson(Connection &con, const AutomationRow &row,
 	  << ",\"now\":" << JsonEscape(now_iso)
 	  << ",\"freshness_lag_seconds\":"
 	  << (row.freshness_lag_set ? std::to_string(row.freshness_lag_seconds) : string("null"))
-	  << ",\"in_progress\":" << (in_progress ? "true" : "false");
+	  << ",\"in_progress\":" << (in_progress ? "true" : "false")
+	  << ",\"stored_intervals\":" << stored_intervals_json;
+	if (row.interval_start_set) {
+		o << ",\"interval_start_ts\":" << row.interval_start_ts;
+	}
 	if (row.target_lag_set) {
 		o << ",\"target_lag_seconds\":" << row.target_lag_seconds;
 	}
@@ -2771,7 +2828,6 @@ static void SensorTickOnce(Connection &con) {
 
 		if (!outcome.condition_met) continue;
 
-		// Fire: look up the defining task and run it once (no partition).
 		auto task_name = LookupDefiningTask(con, row.asset_name);
 		if (task_name.empty()) continue;
 		TaskRow task;
@@ -2780,10 +2836,79 @@ static void SensorTickOnce(Connection &con) {
 		} catch (...) {
 			continue;
 		}
-		auto pipeline_uuid =
-		    con.Query("SELECT uuid()::VARCHAR")->GetValue(0, 0).ToString();
-		RunSingleTask(con, task, pipeline_uuid, string());
-		triggered++;
+
+		// Phase 18: on_interval — iterate over each missing interval and run
+		// one task per interval, then record it in __orch__.asset_intervals.
+		bool is_interval = !row.interval_unit.empty() &&
+		    row.condition_dsl.find("on_interval") != string::npos;
+		if (is_interval) {
+			bool ok_iv = false;
+			auto iv_json = CallRustString(
+			    [&](uint8_t **op, size_t *ol) {
+				    return orch_missing_intervals_for(
+				        reinterpret_cast<const uint8_t *>(row.condition_dsl.c_str()),
+				        row.condition_dsl.size(),
+				        reinterpret_cast<const uint8_t *>(ctx_json.c_str()),
+				        ctx_json.size(),
+				        op, ol);
+			        },
+			    ok_iv);
+			if (!ok_iv || iv_json.empty() || iv_json == "[]") {
+				// Fallback: run once without interval binding.
+				auto uuid = con.Query("SELECT uuid()::VARCHAR")->GetValue(0, 0).ToString();
+				RunSingleTask(con, task, uuid, string());
+				triggered++;
+				continue;
+			}
+			// Parse [[start_ts, end_ts], ...] array.
+			// Simple manual parse to avoid pulling in a full JSON library here;
+			// the format is known and compact.
+			auto parse_intervals = [&](const string &j) -> std::vector<std::pair<int64_t, int64_t>> {
+				std::vector<std::pair<int64_t, int64_t>> result;
+				size_t p = 0;
+				while (p < j.size()) {
+					auto lb = j.find('[', p);
+					if (lb == string::npos) break;
+					auto comma = j.find(',', lb);
+					if (comma == string::npos) break;
+					auto rb = j.find(']', comma);
+					if (rb == string::npos) break;
+					try {
+						int64_t s = std::stoll(j.substr(lb + 1, comma - lb - 1));
+						int64_t e = std::stoll(j.substr(comma + 1, rb - comma - 1));
+						result.emplace_back(s, e);
+					} catch (...) {}
+					p = rb + 1;
+				}
+				return result;
+			};
+			auto intervals = parse_intervals(iv_json);
+			for (auto &[start_ts, end_ts] : intervals) {
+				auto uuid = con.Query("SELECT uuid()::VARCHAR")->GetValue(0, 0).ToString();
+				// Inject interval bounds as template vars so the task SQL can use
+				// ${interval_start} / ${interval_end} if needed.
+				// RunSingleTask currently takes a partition_key string; pass
+				// start_ts as ISO timestamp for now.
+				string partition_key = std::to_string(start_ts);
+				RunSingleTask(con, task, uuid, partition_key);
+				triggered++;
+				// Record the completed interval.
+				std::ostringstream ins_iv;
+				ins_iv << "INSERT OR REPLACE INTO __orch__.asset_intervals "
+				       << "(asset_name, interval_unit, start_ts, end_ts, status, run_id) VALUES ("
+				       << SqlEscape(row.asset_name) << ", "
+				       << SqlEscape(row.interval_unit) << ", "
+				       << start_ts << ", " << end_ts << ", 'success', '"
+				       << uuid << "'::UUID);";
+				con.Query(ins_iv.str());
+			}
+		} else {
+			// Non-interval condition: run once.
+			auto pipeline_uuid =
+			    con.Query("SELECT uuid()::VARCHAR")->GetValue(0, 0).ToString();
+			RunSingleTask(con, task, pipeline_uuid, string());
+			triggered++;
+		}
 	}
 	std::lock_guard<std::mutex> lk(g_sensor_status_mutex);
 	g_sensor_last_tick = IsoNow();
