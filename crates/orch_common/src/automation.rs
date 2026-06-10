@@ -10,8 +10,9 @@
 //              | NOT condition                    // ! also accepted
 //              | ( condition )
 //
-//   atom      := eager()              // also bare `eager`
-//              | on_cron(<cron-expr>) // quoted or bare
+//   atom      := eager()                      // also bare `eager`
+//              | on_cron(<cron-expr>)          // wall-clock cron tick
+//              | on_interval(<interval-unit>)  // SQLMesh-style interval tracking
 //              | on_missing()
 //              | freshness_violated()
 //              | in_progress()
@@ -23,14 +24,17 @@
 // `serialize_dsl` round-trips an AST back to a canonical string for storage
 // on `__orch__.assets.automation_condition`.
 //
-// The evaluator is stateless: it takes an `EvalContext` snapshot the sensor
-// builds from DB state and returns `(bool, reason_string)`. The reason is a
-// short human note surfaced via the simulate pragma / CLI.
+// Evaluator:
+//   `evaluate(cond, ctx)`           → (bool, reason)   — "should we run?"
+//   `missing_intervals_for(cond, ctx)` → Vec<Interval> — for on_interval: which
+//                                        intervals to process (may be >1 for backfill)
 
 use chrono::{Duration as ChronoDuration, NaiveDateTime, TimeZone, Utc};
 use cron::Schedule;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
+
+use crate::interval::{compute_missing, merge_intervals, Interval, IntervalUnit};
 
 // ---------------------------------------------------------------------------
 // AST
@@ -40,6 +44,11 @@ use std::str::FromStr;
 pub enum AutomationCondition {
     Eager,
     OnCron(String),
+    /// SQLMesh-style interval tracking. Fires when one or more intervals of the
+    /// given unit are missing from `EvalContext::stored_intervals`.
+    /// Unlike `on_cron`, this is purely data-driven: "which intervals haven't
+    /// been computed yet?" rather than "did a wall-clock tick happen?".
+    OnInterval(IntervalUnit),
     OnMissing,
     FreshnessViolated,
     InProgress,
@@ -69,7 +78,7 @@ impl std::fmt::Display for AutomationParseError {
             AutomationParseError::UnknownAtom(s) => {
                 write!(
                     f,
-                    "@automation: unknown atom `{}` (expected eager|on_cron|on_missing|freshness_violated|in_progress)",
+                    "@automation: unknown atom `{}` (expected eager|on_cron|on_interval|on_missing|freshness_violated|in_progress)",
                     s
                 )
             }
@@ -362,6 +371,15 @@ fn build_atom(name: &str, arg: Option<String>) -> Result<AutomationCondition, Au
                 .map_err(|_| AutomationParseError::BadCron(a.clone()))?;
             Ok(AutomationCondition::OnCron(a))
         }
+        "on_interval" => {
+            let a = arg.ok_or(AutomationParseError::MissingArg("on_interval"))?;
+            if a.is_empty() {
+                return Err(AutomationParseError::MissingArg("on_interval"));
+            }
+            let unit = IntervalUnit::from_str(&a)
+                .ok_or_else(|| AutomationParseError::BadDuration(a.clone()))?;
+            Ok(AutomationCondition::OnInterval(unit))
+        }
         other => Err(AutomationParseError::UnknownAtom(other.to_string())),
     }
 }
@@ -411,6 +429,9 @@ impl AutomationCondition {
         match self {
             AutomationCondition::Eager => "eager()".into(),
             AutomationCondition::OnCron(expr) => format!("on_cron(\"{}\")", expr),
+            AutomationCondition::OnInterval(unit) => {
+                format!("on_interval(\"{}\")", unit.to_dsl_str())
+            }
             AutomationCondition::OnMissing => "on_missing()".into(),
             AutomationCondition::FreshnessViolated => "freshness_violated()".into(),
             AutomationCondition::InProgress => "in_progress()".into(),
@@ -516,6 +537,17 @@ pub struct EvalContext {
     /// used by the current evaluator — the throttle is anchored on the last
     /// *successful run* instead, matching Dagster semantics.
     pub last_evaluated_at: Option<NaiveDateTime>,
+
+    // --- SQLMesh-style interval tracking (used by on_interval) ---
+
+    /// Already-computed intervals for this asset, loaded from
+    /// `__orch__.asset_intervals`. Must be merged (non-overlapping, sorted)
+    /// before being placed here; pass through `merge_intervals` first.
+    pub stored_intervals: Vec<Interval>,
+    /// The earliest timestamp from which intervals should be tracked for this
+    /// asset (equivalent to SQLMesh's model `start` date). Epoch seconds UTC.
+    /// `None` means "use own_last_materialized_at as anchor" (legacy fallback).
+    pub interval_start_ts: Option<i64>,
 }
 
 impl EvalContext {
@@ -592,6 +624,23 @@ fn evaluate_inner(cond: &AutomationCondition, ctx: &EvalContext) -> (bool, Strin
                 None => (false, format!("cron `{}` produced no upcoming tick", expr)),
             }
         }
+        AutomationCondition::OnInterval(unit) => {
+            let missing = interval_gaps(unit, ctx);
+            if missing.is_empty() {
+                (false, format!("on_interval({}): all intervals up to date", unit.to_dsl_str()))
+            } else {
+                (
+                    true,
+                    format!(
+                        "on_interval({}): {} interval(s) missing, next [{}, {})",
+                        unit.to_dsl_str(),
+                        missing.len(),
+                        missing[0].0,
+                        missing[0].1,
+                    ),
+                )
+            }
+        }
         AutomationCondition::OnMissing => {
             if ctx.missing_partition_count > 0 {
                 (true, format!("{} partition(s) missing", ctx.missing_partition_count))
@@ -652,6 +701,68 @@ fn evaluate_inner(cond: &AutomationCondition, ctx: &EvalContext) -> (bool, Strin
             let (v, r) = evaluate_inner(inner, ctx);
             (!v, format!("NOT ({})", r))
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Interval gap helper
+// ---------------------------------------------------------------------------
+
+/// Compute missing intervals for an `OnInterval` condition from the context.
+///
+/// Uses `ctx.stored_intervals` as the "already done" set and `ctx.now` as
+/// the exclusive end.  The inclusive start is `ctx.interval_start_ts` when
+/// set, otherwise falls back to the floor of `ctx.own_last_materialized_at`
+/// (legacy: treat last run as "everything before this was done").
+fn interval_gaps(unit: &IntervalUnit, ctx: &EvalContext) -> Vec<Interval> {
+    let now_ts = ctx.now.and_utc().timestamp();
+    let start_ts = match ctx.interval_start_ts {
+        Some(ts) => ts,
+        None => match ctx.own_last_materialized_at {
+            // Legacy fallback: last materialization = all prior intervals done.
+            Some(last) => {
+                let last_ts = last.and_utc().timestamp();
+                unit.floor(last_ts) + unit.step_secs()
+            }
+            // Never run and no start configured → track from floor(now) - 1 step
+            // so at least the most recent complete interval is caught.
+            None => unit.floor(now_ts) - unit.step_secs(),
+        },
+    };
+    let end_ts = unit.floor(now_ts); // exclude the currently-in-progress interval
+    if start_ts >= end_ts {
+        return vec![];
+    }
+    let stored = merge_intervals(ctx.stored_intervals.clone());
+    compute_missing(*unit, &stored, start_ts, end_ts)
+}
+
+/// For `OnInterval` conditions: return the list of intervals that should be
+/// processed (in chronological order).  The sensor loop can iterate this list
+/// and enqueue one task execution per interval.
+///
+/// Returns an empty vec for non-interval conditions (use `evaluate` instead).
+pub fn missing_intervals_for(cond: &AutomationCondition, ctx: &EvalContext) -> Vec<Interval> {
+    match cond {
+        AutomationCondition::OnInterval(unit) => interval_gaps(unit, ctx),
+        AutomationCondition::And(l, r) => {
+            // Intersect: only return intervals where both sides agree.
+            // Non-interval side acts as a gate (if it's false, no intervals).
+            let (lv, _) = evaluate(l, ctx);
+            let (rv, _) = evaluate(r, ctx);
+            match (l.as_ref(), r.as_ref()) {
+                (AutomationCondition::OnInterval(_), _) if rv => missing_intervals_for(l, ctx),
+                (_, AutomationCondition::OnInterval(_)) if lv => missing_intervals_for(r, ctx),
+                _ => vec![],
+            }
+        }
+        AutomationCondition::Or(l, r) => {
+            // Union of missing intervals from both sides.
+            let mut combined = missing_intervals_for(l, ctx);
+            combined.extend(missing_intervals_for(r, ctx));
+            merge_intervals(combined)
+        }
+        _ => vec![],
     }
 }
 
