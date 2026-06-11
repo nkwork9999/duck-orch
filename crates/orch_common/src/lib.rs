@@ -18,7 +18,9 @@ pub use automation::{
     AutomationCondition, AutomationParseError, EvalContext,
 };
 pub use hash::{fnv1a_64, sql_code_version};
-pub use interval::{compute_missing, expand_range, merge_intervals, Interval, IntervalUnit};
+pub use interval::{
+    compute_missing, expand_range, merge_intervals, parse_interval_start, Interval, IntervalUnit,
+};
 pub use partition::{parse_partition_decl, PartitionDef, PartitionParseError};
 pub use snowflake::{parse_one_create_dynamic, parse_snowflake_dump, SnowflakeDynamicBlock};
 pub use task::{AssetCheck, ParamSpec, ParamType, Task, TaskTest};

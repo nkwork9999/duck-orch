@@ -232,7 +232,10 @@ struct Parser<'a> {
 
 impl<'a> Parser<'a> {
     fn new(src: &'a str) -> Self {
-        Self { lx: Lexer::new(src), peeked: None }
+        Self {
+            lx: Lexer::new(src),
+            peeked: None,
+        }
     }
 
     fn peek(&mut self) -> Result<&(usize, Tok), AutomationParseError> {
@@ -355,7 +358,10 @@ impl<'a> Parser<'a> {
     }
 }
 
-fn build_atom(name: &str, arg: Option<String>) -> Result<AutomationCondition, AutomationParseError> {
+fn build_atom(
+    name: &str,
+    arg: Option<String>,
+) -> Result<AutomationCondition, AutomationParseError> {
     match name {
         "eager" => Ok(AutomationCondition::Eager),
         "on_missing" => Ok(AutomationCondition::OnMissing),
@@ -420,6 +426,20 @@ pub fn parse_automation(s: &str) -> Result<AutomationCondition, AutomationParseE
 // ---------------------------------------------------------------------------
 
 impl AutomationCondition {
+    /// Walk the AST and return the first `OnInterval` unit, if any. Used at
+    /// parse time to populate `Task::interval_unit` so the C++ registration
+    /// path can write `__orch__.assets.interval_unit` without re-parsing.
+    pub fn first_interval_unit(&self) -> Option<IntervalUnit> {
+        match self {
+            AutomationCondition::OnInterval(unit) => Some(*unit),
+            AutomationCondition::And(l, r) | AutomationCondition::Or(l, r) => {
+                l.first_interval_unit().or_else(|| r.first_interval_unit())
+            }
+            AutomationCondition::Not(inner) => inner.first_interval_unit(),
+            _ => None,
+        }
+    }
+
     /// Canonical DSL form. Used to store the condition string on
     /// `__orch__.assets.automation_condition`. Always wraps atoms in `()` so
     /// re-parsing is unambiguous; precedence-required parentheses are
@@ -539,7 +559,6 @@ pub struct EvalContext {
     pub last_evaluated_at: Option<NaiveDateTime>,
 
     // --- SQLMesh-style interval tracking (used by on_interval) ---
-
     /// Already-computed intervals for this asset, loaded from
     /// `__orch__.asset_intervals`. Must be merged (non-overlapping, sorted)
     /// before being placed here; pass through `merge_intervals` first.
@@ -548,11 +567,20 @@ pub struct EvalContext {
     /// asset (equivalent to SQLMesh's model `start` date). Epoch seconds UTC.
     /// `None` means "use own_last_materialized_at as anchor" (legacy fallback).
     pub interval_start_ts: Option<i64>,
+    /// Re-process the last N intervals whenever a newer interval is missing
+    /// (late-arriving data; SQLMesh model `lookback`). `0` disables.
+    pub lookback: u32,
+    /// Include the current, incomplete interval when computing gaps
+    /// (SQLMesh `allow_partials`). Default false: only complete intervals.
+    pub allow_partials: bool,
 }
 
 impl EvalContext {
     pub fn at(now: NaiveDateTime) -> Self {
-        Self { now, ..Self::default() }
+        Self {
+            now,
+            ..Self::default()
+        }
     }
 }
 
@@ -579,10 +607,7 @@ pub fn evaluate(cond: &AutomationCondition, ctx: &EvalContext) -> (bool, String)
         if elapsed >= 0 && (elapsed as u64) < lag {
             return (
                 false,
-                format!(
-                    "throttled: last run {}s ago < target_lag {}s",
-                    elapsed, lag
-                ),
+                format!("throttled: last run {}s ago < target_lag {}s", elapsed, lag),
             );
         }
     }
@@ -591,9 +616,15 @@ pub fn evaluate(cond: &AutomationCondition, ctx: &EvalContext) -> (bool, String)
 
 fn evaluate_inner(cond: &AutomationCondition, ctx: &EvalContext) -> (bool, String) {
     match cond {
-        AutomationCondition::Eager => match (ctx.upstream_max_materialized_at, ctx.own_last_materialized_at) {
+        AutomationCondition::Eager => match (
+            ctx.upstream_max_materialized_at,
+            ctx.own_last_materialized_at,
+        ) {
             (None, _) => (false, "no upstream materialization".into()),
-            (Some(up), None) => (true, format!("upstream updated {} (own never materialized)", up)),
+            (Some(up), None) => (
+                true,
+                format!("upstream updated {} (own never materialized)", up),
+            ),
             (Some(up), Some(own)) => {
                 if up > own {
                     (true, format!("upstream updated {} > own last {}", up, own))
@@ -614,12 +645,23 @@ fn evaluate_inner(cond: &AutomationCondition, ctx: &EvalContext) -> (bool, Strin
             let now_utc = Utc.from_utc_datetime(&ctx.now);
             let next = sched.after(&anchor_utc).next();
             match next {
-                Some(t) if t <= now_utc => {
-                    (true, format!("cron `{}` ticked at {} (anchor {})", expr, t.naive_utc(), anchor))
-                }
+                Some(t) if t <= now_utc => (
+                    true,
+                    format!(
+                        "cron `{}` ticked at {} (anchor {})",
+                        expr,
+                        t.naive_utc(),
+                        anchor
+                    ),
+                ),
                 Some(t) => (
                     false,
-                    format!("cron `{}` next tick at {} > now {}", expr, t.naive_utc(), ctx.now),
+                    format!(
+                        "cron `{}` next tick at {} > now {}",
+                        expr,
+                        t.naive_utc(),
+                        ctx.now
+                    ),
                 ),
                 None => (false, format!("cron `{}` produced no upcoming tick", expr)),
             }
@@ -627,7 +669,13 @@ fn evaluate_inner(cond: &AutomationCondition, ctx: &EvalContext) -> (bool, Strin
         AutomationCondition::OnInterval(unit) => {
             let missing = interval_gaps(unit, ctx);
             if missing.is_empty() {
-                (false, format!("on_interval({}): all intervals up to date", unit.to_dsl_str()))
+                (
+                    false,
+                    format!(
+                        "on_interval({}): all intervals up to date",
+                        unit.to_dsl_str()
+                    ),
+                )
             } else {
                 (
                     true,
@@ -643,29 +691,34 @@ fn evaluate_inner(cond: &AutomationCondition, ctx: &EvalContext) -> (bool, Strin
         }
         AutomationCondition::OnMissing => {
             if ctx.missing_partition_count > 0 {
-                (true, format!("{} partition(s) missing", ctx.missing_partition_count))
+                (
+                    true,
+                    format!("{} partition(s) missing", ctx.missing_partition_count),
+                )
             } else {
                 (false, "no missing partitions".into())
             }
         }
-        AutomationCondition::FreshnessViolated => match (ctx.freshness_lag_seconds, ctx.own_last_materialized_at) {
-            (None, _) => (false, "no freshness policy".into()),
-            (Some(_), None) => (true, "never materialized (freshness violated)".into()),
-            (Some(lag), Some(last)) => {
-                let elapsed = (ctx.now - last).num_seconds();
-                if elapsed >= 0 && (elapsed as u64) > lag {
-                    (
-                        true,
-                        format!("stale: {}s > freshness lag {}s", elapsed, lag),
-                    )
-                } else {
-                    (
-                        false,
-                        format!("fresh: {}s <= freshness lag {}s", elapsed.max(0), lag),
-                    )
+        AutomationCondition::FreshnessViolated => {
+            match (ctx.freshness_lag_seconds, ctx.own_last_materialized_at) {
+                (None, _) => (false, "no freshness policy".into()),
+                (Some(_), None) => (true, "never materialized (freshness violated)".into()),
+                (Some(lag), Some(last)) => {
+                    let elapsed = (ctx.now - last).num_seconds();
+                    if elapsed >= 0 && (elapsed as u64) > lag {
+                        (
+                            true,
+                            format!("stale: {}s > freshness lag {}s", elapsed, lag),
+                        )
+                    } else {
+                        (
+                            false,
+                            format!("fresh: {}s <= freshness lag {}s", elapsed.max(0), lag),
+                        )
+                    }
                 }
             }
-        },
+        }
         AutomationCondition::InProgress => {
             if ctx.in_progress {
                 (true, "in_progress".into())
@@ -729,12 +782,19 @@ fn interval_gaps(unit: &IntervalUnit, ctx: &EvalContext) -> Vec<Interval> {
             None => unit.floor(now_ts) - unit.step_secs(),
         },
     };
-    let end_ts = unit.floor(now_ts); // exclude the currently-in-progress interval
+    // Exclude the currently-in-progress interval unless allow_partials —
+    // then the partial interval up to `now` is also processed (SQLMesh
+    // `allow_partials`; expand_range appends the unaligned end boundary).
+    let end_ts = if ctx.allow_partials {
+        now_ts
+    } else {
+        unit.floor(now_ts)
+    };
     if start_ts >= end_ts {
         return vec![];
     }
     let stored = merge_intervals(ctx.stored_intervals.clone());
-    compute_missing(*unit, &stored, start_ts, end_ts)
+    compute_missing(*unit, &stored, start_ts, end_ts, ctx.lookback)
 }
 
 /// For `OnInterval` conditions: return the list of intervals that should be
@@ -783,17 +843,26 @@ mod tests {
 
     #[test]
     fn parses_bare_eager_shortcut() {
-        assert_eq!(parse_automation("eager").unwrap(), AutomationCondition::Eager);
+        assert_eq!(
+            parse_automation("eager").unwrap(),
+            AutomationCondition::Eager
+        );
     }
 
     #[test]
     fn parses_eager_parens() {
-        assert_eq!(parse_automation("eager()").unwrap(), AutomationCondition::Eager);
+        assert_eq!(
+            parse_automation("eager()").unwrap(),
+            AutomationCondition::Eager
+        );
     }
 
     #[test]
     fn parses_on_missing() {
-        assert_eq!(parse_automation("on_missing()").unwrap(), AutomationCondition::OnMissing);
+        assert_eq!(
+            parse_automation("on_missing()").unwrap(),
+            AutomationCondition::OnMissing
+        );
     }
 
     #[test]
@@ -806,7 +875,10 @@ mod tests {
 
     #[test]
     fn parses_in_progress() {
-        assert_eq!(parse_automation("in_progress()").unwrap(), AutomationCondition::InProgress);
+        assert_eq!(
+            parse_automation("in_progress()").unwrap(),
+            AutomationCondition::InProgress
+        );
     }
 
     #[test]
@@ -853,7 +925,10 @@ mod tests {
         match c {
             AutomationCondition::And(l, r) => {
                 assert_eq!(*l, AutomationCondition::Eager);
-                assert_eq!(*r, AutomationCondition::Not(Box::new(AutomationCondition::InProgress)));
+                assert_eq!(
+                    *r,
+                    AutomationCondition::Not(Box::new(AutomationCondition::InProgress))
+                );
             }
             other => panic!("expected And, got {:?}", other),
         }
@@ -907,19 +982,30 @@ mod tests {
 
     #[test]
     fn rejects_empty() {
-        assert!(matches!(parse_automation("   "), Err(AutomationParseError::Empty)));
+        assert!(matches!(
+            parse_automation("   "),
+            Err(AutomationParseError::Empty)
+        ));
     }
 
     #[test]
     fn rejects_unknown_atom() {
         let err = parse_automation("magic()").unwrap_err();
-        assert!(matches!(err, AutomationParseError::UnknownAtom(_)), "{:?}", err);
+        assert!(
+            matches!(err, AutomationParseError::UnknownAtom(_)),
+            "{:?}",
+            err
+        );
     }
 
     #[test]
     fn rejects_on_cron_without_arg() {
         let err = parse_automation("on_cron()").unwrap_err();
-        assert!(matches!(err, AutomationParseError::MissingArg("on_cron")), "{:?}", err);
+        assert!(
+            matches!(err, AutomationParseError::MissingArg("on_cron")),
+            "{:?}",
+            err
+        );
     }
 
     #[test]
@@ -1112,7 +1198,7 @@ mod tests {
         ctx.upstream_max_materialized_at = Some(ts("2026-05-17 11:30:00"));
         ctx.own_last_materialized_at = Some(ts("2026-05-17 11:50:00"));
         ctx.target_lag_seconds = Some(3600); // 1h throttle; 10min since last
-        // eager would otherwise return true; throttle should block.
+                                             // eager would otherwise return true; throttle should block.
         let cond = AutomationCondition::Eager;
         let (met, reason) = evaluate(&cond, &ctx);
         assert!(!met);

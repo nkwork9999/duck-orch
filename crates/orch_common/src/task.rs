@@ -72,6 +72,23 @@ pub struct Task {
     /// `'error'` at the C++ side (blocks downstream on failure); explicit
     /// `'warn'` keeps the run successful and only logs.
     pub check_severity: Option<String>,
+    /// Phase 18: canonical IntervalUnit DSL string ("daily" | "hourly" |
+    /// "5min"), derived from the first `on_interval(...)` atom in the
+    /// automation AST at parse time. Written to
+    /// `__orch__.assets.interval_unit` by the C++ upsert so the sensor loop
+    /// knows the asset is interval-tracked without re-parsing the DSL.
+    pub interval_unit: Option<String>,
+    /// Phase 18: `-- @interval_start <YYYY-MM-DD | timestamp | epoch>` —
+    /// the earliest UTC timestamp to track intervals from (SQLMesh model
+    /// `start`). Stored as epoch seconds.
+    pub interval_start_ts: Option<i64>,
+    /// Phase 18: `-- @lookback <N>` — re-process the last N intervals
+    /// whenever a newer interval is missing (late-arriving data, mirrors
+    /// SQLMesh's model `lookback`).
+    pub lookback: Option<u32>,
+    /// Phase 18: `-- @allow_partials` — include the current, incomplete
+    /// interval when computing gaps (SQLMesh `allow_partials`).
+    pub allow_partials: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

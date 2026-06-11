@@ -47,7 +47,8 @@ duck-orch dynamic migrate-from-snowflake snowflake_dump.sql
 | **Asset as first-class** | `@asset name=...` (or auto-derived from `@outputs`) promotes a task's output to `__orch__.assets`. Per-Asset materialization history, code_version hash, declared edges, owner, group, description, tags. |
 | **Partitions** | `@partitions_by daily(start=2026-01-01)` / `static(jp,us,eu)` / `multi(date=..., region=...)`. `$partition_key` is bound via DuckDB `PREPARE` (multi-statement aware) so the task SQL runs once per partition. |
 | **Backfill** | `duck-orch backfill <asset> --from D --to D \| --partition K \| --missing` with calendar-style ✅🟡❌⚪ ASCII output. |
-| **DSL Automation** | `@automation eager \| on_cron(...) \| on_missing \| freshness_violated \| in_progress` plus `&` / `\|` / `!` operators. Stateless evaluator with `target_lag_seconds` throttle wrapper. |
+| **DSL Automation** | `@automation eager \| on_cron(...) \| on_interval(...) \| on_missing \| freshness_violated \| in_progress` plus `&` / `\|` / `!` operators. Stateless evaluator with `target_lag_seconds` throttle wrapper. |
+| **Interval tracking** | SQLMesh-style: `@automation on_interval("daily")` + `@interval_start 2026-01-01` tracks *which* time intervals have been processed (`__orch__.asset_intervals`) instead of comparing wall-clock timestamps. Gaps are computed set-difference style, contiguous gaps run as one batch, and `${interval_start}` / `${interval_end}` (ISO UTC) + `${interval_start_ts}` / `${interval_end_ts}` (epoch) are substituted into the task SQL. `@lookback N` re-processes trailing intervals for late data; `@allow_partials` includes the in-progress interval. `PRAGMA orch_restate('asset', '2026-06-01', '2026-06-03')` deletes stored intervals so the next tick recomputes them. |
 | **Sensor loop** | Background `std::thread` polls every N seconds (`PRAGMA orch_sensor_set_interval`), evaluates eligible Assets via the Rust evaluator, logs to `__orch__.automation_evaluations`, and fires `RunSingleTask` when `condition_met`. |
 | **Freshness + Asset Check** | `@freshness max_lag=60min` ties into `FreshnessViolated`. `@check name=N "<SQL>" expect <op> <value>` runs at end of every successful task; `severity=error` failures block downstream. `${asset}` substituted at execution. |
 | **Snowflake `CREATE DYNAMIC ASSET`** | `PRAGMA orch_create_dynamic_asset(name, target_lag, sql)` synthesizes a task + Asset + `automation_condition='eager()'` so the sensor picks it up. `duck-orch dynamic migrate-from-snowflake <dump>` parses a Snowflake dump and registers every block (skipping `WAREHOUSE`/`REFRESH_MODE`/etc.). |
@@ -155,6 +156,12 @@ SELECT task_name, status FROM __orch__.runs ORDER BY started_at;
 -- @check name=positive "SELECT MIN(rev) FROM ${asset}" expect gt 0
 -- @check_severity error                 | warn
 
+-- Interval tracking (Phase 18, SQLMesh-style)
+-- @automation on_interval("daily")      | "hourly" | "5min" | "2h" | "3d"
+-- @interval_start 2026-01-01            track gaps from this UTC date
+-- @lookback 2                           re-process last N intervals (late data)
+-- @allow_partials                       include the in-progress interval
+
 <SQL body referencing $partition_key etc.>
 ```
 
@@ -164,6 +171,7 @@ SELECT task_name, status FROM __orch__.runs ORDER BY started_at;
 |---|---|---|
 | `$name` | new code (Phase 12+): partition keys, typed params | DuckDB native `PREPARE` + named bind, multi-statement aware |
 | `${asset}` | identifier interpolation in `@check` SQL | plain string substitution |
+| `${interval_start}` / `${interval_end}` | Phase 18 `on_interval()` runs: quoted ISO UTC timestamp literal (`WHERE ts >= ${interval_start}` works as-is); `${interval_start_ts}` / `${interval_end_ts}` give bare epoch seconds | plain string substitution |
 | `{{ var }}` | legacy `@incremental_by` (Phase 7) | self-contained 33-line substitution (no Jinja crate); kept for back-compat, **not used in new features** |
 
 Supported `{{}}` variables: `{{ last_processed_at }}`, `{{ now }}`, `{{ run_id }}`.

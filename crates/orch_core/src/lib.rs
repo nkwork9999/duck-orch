@@ -157,7 +157,11 @@ pub extern "C" fn orch_extract_column_lineage(
             serde_json::from_str(schema_json).unwrap_or_default()
         };
         let result = orch_lineage::column::extract_column_lineage(sql, &schema);
-        write_out(serde_json::to_string(&result).unwrap_or_default(), out_ptr, out_len)
+        write_out(
+            serde_json::to_string(&result).unwrap_or_default(),
+            out_ptr,
+            out_len,
+        )
     }))
     .unwrap_or(-1)
 }
@@ -196,7 +200,11 @@ pub extern "C" fn orch_build_dag(
             Err(e) => return err_to_buf(&format!("invalid tasks json: {}", e), out_ptr, out_len),
         };
         match orch_dag::build_dag(&tasks) {
-            Ok(r) => write_out(serde_json::to_string(&r).unwrap_or_default(), out_ptr, out_len),
+            Ok(r) => write_out(
+                serde_json::to_string(&r).unwrap_or_default(),
+                out_ptr,
+                out_len,
+            ),
             Err(e) => err_to_buf(&e.message, out_ptr, out_len),
         }
     }))
@@ -217,7 +225,11 @@ pub extern "C" fn orch_topo_layers(
             Err(e) => return err_to_buf(&format!("invalid tasks json: {}", e), out_ptr, out_len),
         };
         match orch_dag::topo_layers(&tasks) {
-            Ok(l) => write_out(serde_json::to_string(&l).unwrap_or_default(), out_ptr, out_len),
+            Ok(l) => write_out(
+                serde_json::to_string(&l).unwrap_or_default(),
+                out_ptr,
+                out_len,
+            ),
             Err(e) => err_to_buf(&e.message, out_ptr, out_len),
         }
     }))
@@ -241,7 +253,11 @@ pub extern "C" fn orch_downstream_of(
             Err(e) => return err_to_buf(&format!("invalid tasks json: {}", e), out_ptr, out_len),
         };
         let down = orch_dag::downstream_of(&tasks, failed);
-        write_out(serde_json::to_string(&down).unwrap_or_default(), out_ptr, out_len)
+        write_out(
+            serde_json::to_string(&down).unwrap_or_default(),
+            out_ptr,
+            out_len,
+        )
     }))
     .unwrap_or(-1)
 }
@@ -356,11 +372,7 @@ pub extern "C" fn orch_render_asset_lineage(
             match serde_json::from_str(edges_json) {
                 Ok(v) => v,
                 Err(e) => {
-                    return err_to_buf(
-                        &format!("invalid edges json: {}", e),
-                        out_ptr,
-                        out_len,
-                    );
+                    return err_to_buf(&format!("invalid edges json: {}", e), out_ptr, out_len);
                 }
             }
         };
@@ -611,6 +623,10 @@ struct RawCtx {
     stored_intervals: Vec<[i64; 2]>,
     /// Epoch seconds: earliest timestamp to track intervals from.
     interval_start_ts: Option<i64>,
+    /// Re-process the last N intervals when a newer one is missing.
+    lookback: u32,
+    /// Include the current incomplete interval when computing gaps.
+    allow_partials: bool,
 }
 
 fn parse_ts(s: &str) -> Option<chrono::NaiveDateTime> {
@@ -631,8 +647,7 @@ fn eval_ctx_from_json(ctx_json: &str) -> Result<orch_common::EvalContext, String
     let raw: RawCtx = if ctx_json.is_empty() {
         RawCtx::default()
     } else {
-        serde_json::from_str(ctx_json)
-            .map_err(|e| format!("invalid eval context json: {}", e))?
+        serde_json::from_str(ctx_json).map_err(|e| format!("invalid eval context json: {}", e))?
     };
     let opt_ts = |s: Option<String>| s.as_deref().and_then(parse_ts);
     let stored = raw.stored_intervals.iter().map(|p| (p[0], p[1])).collect();
@@ -652,6 +667,8 @@ fn eval_ctx_from_json(ctx_json: &str) -> Result<orch_common::EvalContext, String
         last_evaluated_at: opt_ts(raw.last_evaluated_at),
         stored_intervals: stored,
         interval_start_ts: raw.interval_start_ts,
+        lookback: raw.lookback,
+        allow_partials: raw.allow_partials,
     })
 }
 
@@ -678,11 +695,7 @@ pub extern "C" fn orch_automation_evaluate(
         let cond = match orch_common::parse_automation(dsl) {
             Ok(c) => c,
             Err(e) => {
-                return err_to_buf(
-                    &format!("automation parse error: {}", e),
-                    out_ptr,
-                    out_len,
-                );
+                return err_to_buf(&format!("automation parse error: {}", e), out_ptr, out_len);
             }
         };
 
@@ -736,7 +749,11 @@ pub extern "C" fn orch_missing_intervals_for(
         };
         let missing = orch_common::missing_intervals_for(&cond, &ctx);
         let arr: Vec<[i64; 2]> = missing.iter().map(|&(s, e)| [s, e]).collect();
-        write_out(serde_json::to_string(&arr).unwrap_or_default(), out_ptr, out_len)
+        write_out(
+            serde_json::to_string(&arr).unwrap_or_default(),
+            out_ptr,
+            out_len,
+        )
     }))
     .unwrap_or(-1)
 }
@@ -776,9 +793,64 @@ mod tests {
 
     #[test]
     fn parses_interval_start_ts() {
-        let json = ctx("\"interval_start_ts\":1749513600");
+        let json = ctx("\"interval_start_ts\":1781049600");
         let ec = eval_ctx_from_json(&json).unwrap();
-        assert_eq!(ec.interval_start_ts, Some(1_749_513_600));
+        assert_eq!(ec.interval_start_ts, Some(1_781_049_600));
+    }
+
+    #[test]
+    fn parses_lookback_and_allow_partials() {
+        let json = ctx("\"lookback\":2,\"allow_partials\":true");
+        let ec = eval_ctx_from_json(&json).unwrap();
+        assert_eq!(ec.lookback, 2);
+        assert!(ec.allow_partials);
+        // Defaults when absent.
+        let ec2 = eval_ctx_from_json(&ctx("\"stored_intervals\":[]")).unwrap();
+        assert_eq!(ec2.lookback, 0);
+        assert!(!ec2.allow_partials);
+    }
+
+    #[test]
+    fn lookback_repulls_trailing_interval() {
+        // Days 8,9 stored; now = 06-10 12:00 → no plain gap. But with
+        // lookback=1 the trailing day must be re-processed only when a
+        // *newer* interval is missing — fully stored ⇒ still empty.
+        let start: i64 = 1_780_876_800; // 2026-06-08 00:00 UTC
+        let json = format!(
+            "{{\"now\":\"2026-06-10 12:00:00\",\
+              \"stored_intervals\":[[{},{}]],\
+              \"interval_start_ts\":{},\"lookback\":1}}",
+            start,
+            start + 2 * 86_400,
+            start
+        );
+        let cond = parse_automation("on_interval(\"daily\")").unwrap();
+        let ctx = eval_ctx_from_json(&json).unwrap();
+        let missing = missing_intervals_for(&cond, &ctx);
+        assert!(missing.is_empty(), "fully stored + lookback: {:?}", missing);
+    }
+
+    #[test]
+    fn allow_partials_includes_current_interval() {
+        // Day 8 and 9 stored; now = 06-10 12:00. Without allow_partials the
+        // in-progress 06-10 day is excluded → empty. With it, the partial
+        // [06-10 00:00, 06-10 12:00) interval is missing.
+        let start: i64 = 1_780_876_800; // 2026-06-08 00:00 UTC
+        let day10 = start + 2 * 86_400; // 2026-06-10 00:00 UTC
+        let json = format!(
+            "{{\"now\":\"2026-06-10 12:00:00\",\
+              \"stored_intervals\":[[{},{}]],\
+              \"interval_start_ts\":{},\"allow_partials\":true}}",
+            start, day10, start
+        );
+        let cond = parse_automation("on_interval(\"daily\")").unwrap();
+        let ctx = eval_ctx_from_json(&json).unwrap();
+        let missing = missing_intervals_for(&cond, &ctx);
+        assert_eq!(
+            missing,
+            vec![(day10, day10 + 12 * 3_600)],
+            "partial day expected"
+        );
     }
 
     #[test]
@@ -893,7 +965,10 @@ mod tests {
         let cond = parse_automation("eager").unwrap();
         let ctx = eval_ctx_from_json(&json).unwrap();
         let missing = missing_intervals_for(&cond, &ctx);
-        assert!(missing.is_empty(), "non-interval condition returns no intervals");
+        assert!(
+            missing.is_empty(),
+            "non-interval condition returns no intervals"
+        );
     }
 
     #[test]
@@ -919,7 +994,7 @@ mod tests {
         // now = epoch + 3h + 30min; interval_start_ts = epoch
         let start: i64 = 0;
         let now_ts = 3 * 3600 + 1800; // 3.5 hours after epoch
-        // Use a fixed ISO timestamp: 1970-01-01 03:30:00
+                                      // Use a fixed ISO timestamp: 1970-01-01 03:30:00
         let json = format!(
             "{{\"now\":\"1970-01-01 03:30:00\",\
               \"stored_intervals\":[],\

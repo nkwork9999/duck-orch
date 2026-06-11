@@ -23,6 +23,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <ctime>
 #include <iomanip>
 #include <map>
 #include <mutex>
@@ -394,8 +395,12 @@ CREATE TABLE IF NOT EXISTS __orch__.asset_intervals (
 
 -- Interval tracking config lives on the asset row so BuildEvalContextJson
 -- can pass interval_start_ts straight through without an extra join.
+-- `lookback` / `allow_partials` mirror the SQLMesh model properties of the
+-- same names (late-data re-processing / include the in-progress interval).
 ALTER TABLE __orch__.assets ADD COLUMN IF NOT EXISTS interval_unit VARCHAR;
 ALTER TABLE __orch__.assets ADD COLUMN IF NOT EXISTS interval_start_ts BIGINT;
+ALTER TABLE __orch__.assets ADD COLUMN IF NOT EXISTS lookback INTEGER DEFAULT 0;
+ALTER TABLE __orch__.assets ADD COLUMN IF NOT EXISTS allow_partials BOOLEAN DEFAULT false;
 
 -- One row per declared `-- @check ...` (or legacy `-- @test ...` promoted
 -- as `test_<N>`). Re-registration UPSERTs by (asset_name, check_name).
@@ -672,6 +677,45 @@ static void OrchRegisterPragma(ClientContext &context, const FunctionParameters 
 				}
 			}
 
+			// Phase 18: interval tracking config. `interval_unit` is derived
+			// Rust-side from the first on_interval() atom in the automation
+			// AST; `interval_start_ts` comes from `@interval_start`;
+			// `lookback` from `@lookback`; `allow_partials` from
+			// `@allow_partials`.
+			string interval_unit = get_str("interval_unit");
+			int64_t interval_start_ts = 0;
+			bool interval_start_set = false;
+			{
+				auto iv = yyjson_ns::yyjson_obj_get(t, "interval_start_ts");
+				if (iv && !yyjson_ns::yyjson_is_null(iv)) {
+					if (yyjson_ns::yyjson_is_int(iv)) {
+						interval_start_ts = yyjson_ns::yyjson_get_int(iv);
+						interval_start_set = true;
+					} else if (yyjson_ns::yyjson_is_uint(iv)) {
+						interval_start_ts = (int64_t)yyjson_ns::yyjson_get_uint(iv);
+						interval_start_set = true;
+					}
+				}
+			}
+			int64_t lookback = 0;
+			{
+				auto lv = yyjson_ns::yyjson_obj_get(t, "lookback");
+				if (lv && !yyjson_ns::yyjson_is_null(lv)) {
+					if (yyjson_ns::yyjson_is_int(lv)) {
+						lookback = yyjson_ns::yyjson_get_int(lv);
+					} else if (yyjson_ns::yyjson_is_uint(lv)) {
+						lookback = (int64_t)yyjson_ns::yyjson_get_uint(lv);
+					}
+				}
+			}
+			bool allow_partials = false;
+			{
+				auto av = yyjson_ns::yyjson_obj_get(t, "allow_partials");
+				if (av && yyjson_ns::yyjson_is_bool(av)) {
+					allow_partials = yyjson_ns::yyjson_get_bool(av);
+				}
+			}
+
 			// Phase 16: per-asset check severity. NULL/empty => 'error'.
 			string check_severity = get_str("check_severity");
 			if (check_severity.empty()) check_severity = "error";
@@ -704,11 +748,22 @@ static void OrchRegisterPragma(ClientContext &context, const FunctionParameters 
 				string freshness_lit = freshness_lag_set
 				                           ? std::to_string(freshness_lag)
 				                           : string("NULL");
+				// Phase 18: interval tracking columns. Cleared on
+				// re-registration when the headers are dropped, so the
+				// source SQL stays authoritative (same contract as
+				// automation_condition).
+				string interval_unit_lit = interval_unit.empty()
+				                               ? string("NULL")
+				                               : SqlEscape(interval_unit);
+				string interval_start_lit = interval_start_set
+				                                ? std::to_string(interval_start_ts)
+				                                : string("NULL");
 				sql << "INSERT INTO __orch__.assets "
 				    << "(name, kind, location, group_name, owner, description, "
 				    << "code_version, defined_by_task, tags, "
 				    << "automation_condition, target_lag_seconds, "
-				    << "freshness_lag_seconds) VALUES ("
+				    << "freshness_lag_seconds, interval_unit, interval_start_ts, "
+				    << "lookback, allow_partials) VALUES ("
 				    << SqlEscape(a_name) << ", "
 				    << SqlEscape(a_kind) << ", "
 				    << "NULL, "
@@ -720,7 +775,11 @@ static void OrchRegisterPragma(ClientContext &context, const FunctionParameters 
 				    << tags_literal << ", "
 				    << automation_lit << ", "
 				    << target_lag_lit << ", "
-				    << freshness_lit
+				    << freshness_lit << ", "
+				    << interval_unit_lit << ", "
+				    << interval_start_lit << ", "
+				    << lookback << ", "
+				    << (allow_partials ? "true" : "false")
 				    << ") ON CONFLICT (name) DO UPDATE SET "
 				    << "kind=EXCLUDED.kind, "
 				    << "group_name=EXCLUDED.group_name, "
@@ -731,7 +790,11 @@ static void OrchRegisterPragma(ClientContext &context, const FunctionParameters 
 				    << "tags=EXCLUDED.tags, "
 				    << "automation_condition=EXCLUDED.automation_condition, "
 				    << "target_lag_seconds=EXCLUDED.target_lag_seconds, "
-				    << "freshness_lag_seconds=EXCLUDED.freshness_lag_seconds;\n";
+				    << "freshness_lag_seconds=EXCLUDED.freshness_lag_seconds, "
+				    << "interval_unit=EXCLUDED.interval_unit, "
+				    << "interval_start_ts=EXCLUDED.interval_start_ts, "
+				    << "lookback=EXCLUDED.lookback, "
+				    << "allow_partials=EXCLUDED.allow_partials;\n";
 			};
 
 			// Determine the "primary asset" for this task so Phase 14 can
@@ -1107,9 +1170,30 @@ RunChecksForAsset(Connection &con, const string &asset_name, const string &run_i
 // to a non-default value AND the task carries `params`, the SQL is run via
 // `PREPARE`+bind so `$partition_key` / `$partition_<dim>` resolve natively.
 // Returns true on success, false on failure.
+// Phase 18: epoch seconds → "YYYY-MM-DD HH:MM:SS" (UTC) for interval
+// template vars.
+static string IsoFromEpochUtc(int64_t ts) {
+	time_t t = (time_t)ts;
+	struct tm tmv;
+#ifdef _WIN32
+	gmtime_s(&tmv, &t);
+#else
+	gmtime_r(&t, &tmv);
+#endif
+	char buf[32];
+	strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tmv);
+	return string(buf);
+}
+
+// `interval_start` / `interval_end` (epoch seconds, half-open) are set by the
+// Phase 18 sensor when the run covers an on_interval() gap; -1 = not an
+// interval run. They surface in task SQL as `${interval_start}` /
+// `${interval_end}` (ISO UTC) and `${interval_start_ts}` /
+// `${interval_end_ts}` (epoch seconds) template vars.
 static bool RunSingleTask(Connection &con, const TaskRow &task, const string &pipeline_run_id,
                           const string &tasks_json,
-                          const string &partition_key = "__default__") {
+                          const string &partition_key = "__default__",
+                          int64_t interval_start = -1, int64_t interval_end = -1) {
 	auto run_uuid = con.Query("SELECT uuid()::VARCHAR")->GetValue(0, 0).ToString();
 	string started = IsoNow();
 
@@ -1159,6 +1243,26 @@ static bool RunSingleTask(Connection &con, const TaskRow &task, const string &pi
 	        },
 	    sub_ok);
 	if (sub_ok) sql_to_run = substituted;
+
+	// Phase 18: interval bounds for on_interval() runs. Plain `${var}`
+	// substitution (same no-Jinja mechanism as `${asset}` in @check SQL):
+	//   ${interval_start} / ${interval_end}       — quoted ISO UTC timestamp
+	//                                               literal, ready for
+	//                                               `WHERE ts >= ${interval_start}`
+	//   ${interval_start_ts} / ${interval_end_ts} — bare epoch seconds
+	if (interval_start >= 0 && interval_end > interval_start) {
+		auto replace_var = [&](const string &needle, const string &val) {
+			size_t pos = 0;
+			while ((pos = sql_to_run.find(needle, pos)) != string::npos) {
+				sql_to_run.replace(pos, needle.size(), val);
+				pos += val.size();
+			}
+		};
+		replace_var("${interval_start_ts}", std::to_string(interval_start));
+		replace_var("${interval_end_ts}", std::to_string(interval_end));
+		replace_var("${interval_start}", "'" + IsoFromEpochUtc(interval_start) + "'");
+		replace_var("${interval_end}", "'" + IsoFromEpochUtc(interval_end) + "'");
+	}
 
 	// Phase 14: when running a specific partition, build the bind map for
 	// `$partition_key` and (for Multi) `$partition_<dim>` placeholders so
@@ -2537,13 +2641,15 @@ struct AutomationRow {
 	string interval_unit;           // e.g. "daily" — empty if not set
 	int64_t interval_start_ts = 0;
 	bool interval_start_set = false;
+	int64_t lookback = 0;           // re-process trailing intervals near a gap
+	bool allow_partials = false;    // include the in-progress interval
 };
 
 static std::vector<AutomationRow> LoadAutomationAssets(Connection &con) {
 	std::vector<AutomationRow> out;
 	auto r = con.Query(
 	    "SELECT name, automation_condition, target_lag_seconds, freshness_lag_seconds, "
-	    "       interval_unit, interval_start_ts "
+	    "       interval_unit, interval_start_ts, lookback, allow_partials "
 	    "FROM __orch__.assets "
 	    "WHERE automation_condition IS NOT NULL "
 	    "ORDER BY name;");
@@ -2570,6 +2676,14 @@ static std::vector<AutomationRow> LoadAutomationAssets(Connection &con) {
 		if (!isv.IsNull()) {
 			row.interval_start_ts = isv.GetValue<int64_t>();
 			row.interval_start_set = true;
+		}
+		auto lbv = r->GetValue(6, i);
+		if (!lbv.IsNull()) {
+			row.lookback = lbv.GetValue<int64_t>();
+		}
+		auto apv = r->GetValue(7, i);
+		if (!apv.IsNull()) {
+			row.allow_partials = apv.GetValue<bool>();
 		}
 		out.push_back(std::move(row));
 	}
@@ -2670,7 +2784,9 @@ static string BuildEvalContextJson(Connection &con, const AutomationRow &row,
 	  << ",\"freshness_lag_seconds\":"
 	  << (row.freshness_lag_set ? std::to_string(row.freshness_lag_seconds) : string("null"))
 	  << ",\"in_progress\":" << (in_progress ? "true" : "false")
-	  << ",\"stored_intervals\":" << stored_intervals_json;
+	  << ",\"stored_intervals\":" << stored_intervals_json
+	  << ",\"lookback\":" << row.lookback
+	  << ",\"allow_partials\":" << (row.allow_partials ? "true" : "false");
 	if (row.interval_start_set) {
 		o << ",\"interval_start_ts\":" << row.interval_start_ts;
 	}
@@ -2860,47 +2976,92 @@ static void SensorTickOnce(Connection &con) {
 				triggered++;
 				continue;
 			}
-			// Parse [[start_ts, end_ts], ...] array.
-			// Simple manual parse to avoid pulling in a full JSON library here;
-			// the format is known and compact.
+			// Parse [[start_ts, end_ts], ...] array using yyjson. A hand-rolled
+			// bracket scanner is tempting here, but it sees the outer array's
+			// `[` as an interval start and drops the first real interval.
 			auto parse_intervals = [&](const string &j) -> std::vector<std::pair<int64_t, int64_t>> {
 				std::vector<std::pair<int64_t, int64_t>> result;
-				size_t p = 0;
-				while (p < j.size()) {
-					auto lb = j.find('[', p);
-					if (lb == string::npos) break;
-					auto comma = j.find(',', lb);
-					if (comma == string::npos) break;
-					auto rb = j.find(']', comma);
-					if (rb == string::npos) break;
-					try {
-						int64_t s = std::stoll(j.substr(lb + 1, comma - lb - 1));
-						int64_t e = std::stoll(j.substr(comma + 1, rb - comma - 1));
-						result.emplace_back(s, e);
-					} catch (...) {}
-					p = rb + 1;
+				auto doc = yyjson_ns::yyjson_read(j.c_str(), j.size(), 0);
+				if (!doc) return result;
+				auto root = yyjson_ns::yyjson_doc_get_root(doc);
+				auto read_i64 = [](yyjson_ns::yyjson_val *v, int64_t &out) {
+					if (!v) return false;
+					if (yyjson_ns::yyjson_is_int(v)) {
+						out = yyjson_ns::yyjson_get_int(v);
+						return true;
+					}
+					if (yyjson_ns::yyjson_is_uint(v)) {
+						out = (int64_t)yyjson_ns::yyjson_get_uint(v);
+						return true;
+					}
+					return false;
+				};
+				if (root && yyjson_ns::yyjson_is_arr(root)) {
+					size_t i, m;
+					yyjson_ns::yyjson_val *pair;
+					yyjson_arr_foreach(root, i, m, pair) {
+						if (!pair || !yyjson_ns::yyjson_is_arr(pair)) continue;
+						int64_t start_ts = 0;
+						int64_t end_ts = 0;
+						bool start_ok = false;
+						bool end_ok = false;
+						size_t pi, pm;
+						yyjson_ns::yyjson_val *v;
+						yyjson_arr_foreach(pair, pi, pm, v) {
+							if (pi == 0) {
+								start_ok = read_i64(v, start_ts);
+							} else if (pi == 1) {
+								end_ok = read_i64(v, end_ts);
+								break;
+							}
+						}
+						if (start_ok && end_ok && end_ts > start_ts) {
+							result.emplace_back(start_ts, end_ts);
+						}
+					}
 				}
+				yyjson_ns::yyjson_doc_free(doc);
 				return result;
 			};
 			auto intervals = parse_intervals(iv_json);
-			for (auto &[start_ts, end_ts] : intervals) {
+			// Contiguous batching (mirrors SQLMesh's scheduler
+			// compute_interval_params): group adjacent missing intervals
+			// into one task run covering [first.start, last.end), so a long
+			// backfill is one execution per contiguous gap instead of one
+			// per unit interval. Unit rows are still recorded individually
+			// so restatement (DELETE of a single row) stays precise.
+			size_t bi = 0;
+			while (bi < intervals.size()) {
+				size_t bj = bi + 1;
+				while (bj < intervals.size() &&
+				       intervals[bj].first == intervals[bj - 1].second) {
+					bj++;
+				}
+				int64_t batch_start = intervals[bi].first;
+				int64_t batch_end = intervals[bj - 1].second;
 				auto uuid = con.Query("SELECT uuid()::VARCHAR")->GetValue(0, 0).ToString();
-				// Inject interval bounds as template vars so the task SQL can use
-				// ${interval_start} / ${interval_end} if needed.
-				// RunSingleTask currently takes a partition_key string; pass
-				// start_ts as ISO timestamp for now.
-				string partition_key = std::to_string(start_ts);
-				RunSingleTask(con, task, uuid, partition_key);
+				// Interval bounds surface in the task SQL as
+				// ${interval_start} / ${interval_end} (ISO UTC) and
+				// ${interval_start_ts} / ${interval_end_ts} (epoch).
+				bool run_ok = RunSingleTask(con, task, uuid, string(), "__default__",
+				                            batch_start, batch_end);
 				triggered++;
-				// Record the completed interval.
-				std::ostringstream ins_iv;
-				ins_iv << "INSERT OR REPLACE INTO __orch__.asset_intervals "
-				       << "(asset_name, interval_unit, start_ts, end_ts, status, run_id) VALUES ("
-				       << SqlEscape(row.asset_name) << ", "
-				       << SqlEscape(row.interval_unit) << ", "
-				       << start_ts << ", " << end_ts << ", 'success', '"
-				       << uuid << "'::UUID);";
-				con.Query(ins_iv.str());
+				// Record each unit interval with the real outcome. Failed
+				// rows are excluded by BuildEvalContextJson (status =
+				// 'success' filter) so the gap re-surfaces next tick, and
+				// a later success INSERT OR REPLACEs the failed row.
+				const char *iv_status = run_ok ? "success" : "failed";
+				for (size_t k = bi; k < bj; k++) {
+					std::ostringstream ins_iv;
+					ins_iv << "INSERT OR REPLACE INTO __orch__.asset_intervals "
+					       << "(asset_name, interval_unit, start_ts, end_ts, status, run_id) VALUES ("
+					       << SqlEscape(row.asset_name) << ", "
+					       << SqlEscape(row.interval_unit) << ", "
+					       << intervals[k].first << ", " << intervals[k].second << ", '"
+					       << iv_status << "', '" << uuid << "'::UUID);";
+					con.Query(ins_iv.str());
+				}
+				bi = bj;
 			}
 		} else {
 			// Non-interval condition: run once.
@@ -3011,6 +3172,33 @@ static void OrchSensorSetIntervalPragma(ClientContext &context,
 	int64_t n = parameters.values[0].GetValue<int64_t>();
 	if (n < 1) n = 1;
 	g_sensor_interval_seconds.store(n);
+}
+
+// Phase 18: `PRAGMA orch_restate('asset', 'from', 'to')` — SQLMesh-style
+// restatement. Deletes stored interval rows overlapping [from, to) so the
+// next sensor tick recomputes (and re-runs) them. `from` / `to` accept any
+// string DuckDB can cast to TIMESTAMP ('2026-06-01', '2026-06-01 12:00:00').
+static void OrchRestatePragma(ClientContext &context,
+                                const FunctionParameters &parameters) {
+	if (parameters.values.size() < 3 || parameters.values[0].IsNull() ||
+	    parameters.values[1].IsNull() || parameters.values[2].IsNull()) {
+		throw InvalidInputException(
+		    "orch_restate requires ('asset_name', 'from_ts', 'to_ts')");
+	}
+	string asset = parameters.values[0].ToString();
+	string from = parameters.values[1].ToString();
+	string to = parameters.values[2].ToString();
+	Connection con(*context.db);
+	EnsureOrchSchema(con);
+	std::ostringstream del;
+	del << "DELETE FROM __orch__.asset_intervals "
+	    << "WHERE asset_name = " << SqlEscape(asset)
+	    << "  AND start_ts < epoch(" << SqlEscape(to) << "::TIMESTAMP)"
+	    << "  AND end_ts > epoch(" << SqlEscape(from) << "::TIMESTAMP);";
+	auto r = con.Query(del.str());
+	if (r->HasError()) {
+		throw InvalidInputException("orch_restate: " + r->GetError());
+	}
 }
 
 // ========================================================================
@@ -3871,6 +4059,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "orch_sensor_set_interval",
 	    static_cast<pragma_function_t>(OrchSensorSetIntervalPragma),
 	    {LogicalType::BIGINT}));
+	loader.RegisterFunction(PragmaFunction::PragmaCall(
+	    "orch_restate", static_cast<pragma_function_t>(OrchRestatePragma),
+	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}));
 
 	// Phase 17: Dynamic Asset surface (Snowflake compat).
 	loader.RegisterFunction(PragmaFunction::PragmaCall(

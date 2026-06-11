@@ -50,7 +50,9 @@ impl IntervalUnit {
             _ => {}
         }
         // Try "Nunit" form.
-        let split = lower.find(|c: char| !c.is_ascii_digit()).unwrap_or(lower.len());
+        let split = lower
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(lower.len());
         let num: u32 = lower[..split].parse().ok()?;
         if num == 0 {
             return None;
@@ -106,6 +108,32 @@ impl IntervalUnit {
 }
 
 // ---------------------------------------------------------------------------
+// parse_interval_start
+// ---------------------------------------------------------------------------
+
+/// Parse an `@interval_start` header value into epoch seconds (UTC).
+/// Accepts `YYYY-MM-DD`, `YYYY-MM-DD HH:MM:SS`, ISO `T` separator, or a raw
+/// epoch integer.
+pub fn parse_interval_start(s: &str) -> Option<i64> {
+    let v = s.trim();
+    if v.is_empty() {
+        return None;
+    }
+    if let Ok(epoch) = v.parse::<i64>() {
+        return Some(epoch);
+    }
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(v, "%Y-%m-%d") {
+        return Some(d.and_hms_opt(0, 0, 0)?.and_utc().timestamp());
+    }
+    for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"] {
+        if let Ok(t) = chrono::NaiveDateTime::parse_from_str(v, fmt) {
+            return Some(t.and_utc().timestamp());
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
 // expand_range
 // ---------------------------------------------------------------------------
 
@@ -128,8 +156,11 @@ pub fn expand_range(start_ts: i64, end_ts: i64, unit: IntervalUnit) -> Vec<i64> 
         timestamps.push(t);
         t += step;
     }
-    // Append exclusive end so callers can zip(ts, ts[1..]).
-    timestamps.push(t);
+    // Append exclusive end so callers can zip(ts, ts[1..]). Clip at end_ts
+    // (mirrors SQLMesh): an unaligned end produces a *partial* final
+    // interval rather than a full-width one, so allow_partials callers never
+    // record time they have not actually processed.
+    timestamps.push(t.min(end_ts));
     timestamps
 }
 
@@ -167,18 +198,23 @@ pub fn merge_intervals(mut intervals: Vec<Interval>) -> Vec<Interval> {
 /// `stored` must already be merged (non-overlapping, sorted).  Pass it
 /// through `merge_intervals` first if you are not sure.
 ///
+/// `lookback`: re-process trailing intervals near a gap — interval `i` is
+/// also considered missing when interval `i + lookback` is missing. Handles
+/// late-arriving data (mirrors SQLMesh's model `lookback`). `0` disables.
+///
 /// Mirrors SQLMesh's `compute_missing_intervals` in snapshot/definition.py.
 pub fn compute_missing(
     unit: IntervalUnit,
     stored: &[Interval],
     start_ts: i64,
     end_ts: i64,
+    lookback: u32,
 ) -> Vec<Interval> {
     let boundaries = expand_range(start_ts, end_ts, unit);
     if boundaries.len() < 2 {
         return vec![];
     }
-    let mut missing = Vec::new();
+    let mut missing: Vec<Interval> = Vec::new();
     'outer: for (&cur, &nxt) in boundaries.iter().zip(boundaries[1..].iter()) {
         for &(low, high) in stored {
             if cur >= low && nxt <= high {
@@ -191,6 +227,29 @@ pub fn compute_missing(
             }
         }
         missing.push((cur, nxt));
+    }
+    if !missing.is_empty() && lookback > 0 {
+        // SQLMesh semantics: interval i is missing if interval i+lookback is
+        // missing. Walk boundary pairs; when the pair `lookback` steps ahead
+        // is in the missing set, add this one too.
+        let lb = lookback as usize;
+        let missing_set: std::collections::BTreeSet<Interval> = missing.iter().copied().collect();
+        let mut extended = missing_set.clone();
+        for (i, (&cur, &nxt)) in boundaries.iter().zip(boundaries[1..].iter()).enumerate() {
+            let parent = boundaries.get(i + lb).zip(boundaries.get(i + lb + 1));
+            match parent {
+                // Parent beyond the range end, or parent itself missing →
+                // this interval must be re-processed too.
+                None => {
+                    extended.insert((cur, nxt));
+                }
+                Some((&ps, &pe)) if missing_set.contains(&(ps, pe)) => {
+                    extended.insert((cur, nxt));
+                }
+                _ => {}
+            }
+        }
+        return extended.into_iter().collect();
     }
     missing
 }
@@ -220,9 +279,18 @@ mod tests {
 
     #[test]
     fn parses_minutes() {
-        assert_eq!(IntervalUnit::from_str("5min"), Some(IntervalUnit::Minutes(5)));
-        assert_eq!(IntervalUnit::from_str("30m"), Some(IntervalUnit::Minutes(30)));
-        assert_eq!(IntervalUnit::from_str("2h"), Some(IntervalUnit::Minutes(120)));
+        assert_eq!(
+            IntervalUnit::from_str("5min"),
+            Some(IntervalUnit::Minutes(5))
+        );
+        assert_eq!(
+            IntervalUnit::from_str("30m"),
+            Some(IntervalUnit::Minutes(30))
+        );
+        assert_eq!(
+            IntervalUnit::from_str("2h"),
+            Some(IntervalUnit::Minutes(120))
+        );
     }
 
     #[test]
@@ -316,15 +384,15 @@ mod tests {
         let start: i64 = 0;
         let end = 3 * 86_400;
         let stored = vec![(0, end)];
-        let missing = compute_missing(IntervalUnit::Daily, &stored, start, end);
+        let missing = compute_missing(IntervalUnit::Daily, &stored, start, end, 0);
         assert!(missing.is_empty(), "fully covered: {:?}", missing);
     }
 
     #[test]
     fn all_missing_when_nothing_stored() {
-        let start: i64 = 1_749_513_600; // 2026-06-10
-        let end = start + 3 * 86_400;   // 2026-06-13
-        let missing = compute_missing(IntervalUnit::Daily, &[], start, end);
+        let start: i64 = 1_781_049_600; // 2026-06-10
+        let end = start + 3 * 86_400; // 2026-06-13
+        let missing = compute_missing(IntervalUnit::Daily, &[], start, end, 0);
         assert_eq!(missing.len(), 3);
         assert_eq!(missing[0], (start, start + 86_400));
         assert_eq!(missing[2], (start + 2 * 86_400, end));
@@ -332,13 +400,13 @@ mod tests {
 
     #[test]
     fn middle_day_missing() {
-        let d0: i64 = 1_749_513_600;
+        let d0: i64 = 1_781_049_600;
         let d1 = d0 + 86_400;
         let d2 = d0 + 2 * 86_400;
         let d3 = d0 + 3 * 86_400;
         // Day 0 and day 2 stored; day 1 missing.
         let stored = merge_intervals(vec![(d0, d1), (d2, d3)]);
-        let missing = compute_missing(IntervalUnit::Daily, &stored, d0, d3);
+        let missing = compute_missing(IntervalUnit::Daily, &stored, d0, d3, 0);
         assert_eq!(missing, vec![(d1, d2)]);
     }
 
@@ -348,8 +416,51 @@ mod tests {
         let end = 2 * 86_400;
         // Stored covers exactly [0, 2d) — no missing.
         let stored = vec![(0, 2 * 86_400)];
-        let missing = compute_missing(IntervalUnit::Daily, &stored, start, end);
+        let missing = compute_missing(IntervalUnit::Daily, &stored, start, end, 0);
         assert!(missing.is_empty());
+    }
+
+    // -------------------- lookback --------------------
+
+    #[test]
+    fn lookback_zero_is_noop() {
+        let d0: i64 = 0;
+        let stored = vec![(0, 86_400)];
+        let missing = compute_missing(IntervalUnit::Daily, &stored, d0, 2 * 86_400, 0);
+        assert_eq!(missing, vec![(86_400, 2 * 86_400)]);
+    }
+
+    #[test]
+    fn lookback_pulls_in_preceding_interval() {
+        // Days 0-2 stored, day 3 missing. lookback=1 → day 2 re-processed
+        // because day 3 (its parent) is missing.
+        let day = 86_400;
+        let stored = vec![(0, 3 * day)];
+        let missing = compute_missing(IntervalUnit::Daily, &stored, 0, 4 * day, 1);
+        assert_eq!(missing, vec![(2 * day, 3 * day), (3 * day, 4 * day)]);
+    }
+
+    #[test]
+    fn lookback_no_missing_means_no_recompute() {
+        // Everything stored → lookback must not invent work.
+        let day = 86_400;
+        let stored = vec![(0, 4 * day)];
+        let missing = compute_missing(IntervalUnit::Daily, &stored, 0, 4 * day, 2);
+        assert!(missing.is_empty(), "{:?}", missing);
+    }
+
+    #[test]
+    fn lookback_tail_intervals_added_when_gap_exists() {
+        // Day 1 missing in the middle; lookback=1 also pulls in day 0
+        // (parent day 1 missing) and the final day 3 (parent beyond range).
+        let day = 86_400;
+        let stored = merge_intervals(vec![(0, day), (2 * day, 4 * day)]);
+        let missing = compute_missing(IntervalUnit::Daily, &stored, 0, 4 * day, 1);
+        assert_eq!(
+            missing,
+            vec![(0, day), (day, 2 * day), (3 * day, 4 * day)],
+            "day0 (parent=day1 missing), day1 (gap), day3 (parent beyond end)"
+        );
     }
 
     // -------------------- dsl round-trip --------------------
