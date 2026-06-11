@@ -119,4 +119,14 @@ int32_t orch_automation_evaluate(const uint8_t *cond_dsl_ptr, size_t cond_dsl_le
 int32_t orch_target_lag_parse(const uint8_t *src_ptr, size_t src_len,
                                uint8_t **out_ptr, size_t *out_len);
 
+// `orch_missing_intervals_for` returns the list of intervals that an
+// `on_interval()` condition needs to process.  Same inputs as
+// `orch_automation_evaluate`; `ctx_json` must include `stored_intervals`
+// (JSON array of [start_ts, end_ts] pairs) and optionally `interval_start_ts`.
+// Output: JSON array of [start_ts, end_ts] pairs in chronological order.
+// Returns `[]` for non-interval conditions.
+int32_t orch_missing_intervals_for(const uint8_t *cond_dsl_ptr, size_t cond_dsl_len,
+                                    const uint8_t *ctx_json_ptr, size_t ctx_json_len,
+                                    uint8_t **out_ptr, size_t *out_len);
+
 }
