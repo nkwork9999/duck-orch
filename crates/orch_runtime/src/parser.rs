@@ -2,7 +2,8 @@
 
 use crate::binding::parse_param_decl;
 use orch_common::{
-    parse_automation, parse_partition_decl, parse_target_lag, AssetCheck, Task, TaskTest,
+    parse_automation, parse_interval_start, parse_partition_decl, parse_target_lag, AssetCheck,
+    Task, TaskTest,
 };
 use std::path::Path;
 
@@ -185,7 +186,54 @@ fn apply_header(task: &mut Task, content: &str, line: usize) -> Result<(), Parse
                 line: Some(line),
             })?;
             task.automation_dsl = Some(cond.serialize_dsl());
+            // Phase 18: surface the on_interval unit (if any) so the C++
+            // upsert can write __orch__.assets.interval_unit directly.
+            task.interval_unit = cond.first_interval_unit().map(|u| u.to_dsl_str());
             task.automation = Some(cond);
+        }
+        // Phase 18: `@interval_start <YYYY-MM-DD | YYYY-MM-DD HH:MM:SS | epoch>`
+        // — earliest UTC timestamp to track on_interval gaps from (SQLMesh
+        // model `start`). Stored as epoch seconds.
+        "interval_start" => {
+            let v = rest.trim().trim_matches('"');
+            let ts = parse_interval_start(v).ok_or_else(|| ParseError {
+                message: format!(
+                    "@interval_start: expected `YYYY-MM-DD`, `YYYY-MM-DD HH:MM:SS` or epoch seconds, got `{}`",
+                    v
+                ),
+                line: Some(line),
+            })?;
+            task.interval_start_ts = Some(ts);
+        }
+        // Phase 18: `@lookback <N>` — re-process the last N intervals when a
+        // newer interval is missing (late-arriving data, SQLMesh `lookback`).
+        "lookback" => {
+            let n: u32 = rest.trim().parse().map_err(|_| ParseError {
+                message: format!(
+                    "@lookback: expected a non-negative integer, got `{}`",
+                    rest.trim()
+                ),
+                line: Some(line),
+            })?;
+            task.lookback = Some(n);
+        }
+        // Phase 18: `@allow_partials` (bare, or `true`/`false`) — include the
+        // current incomplete interval when computing gaps.
+        "allow_partials" => {
+            let v = rest.trim().to_ascii_lowercase();
+            task.allow_partials = match v.as_str() {
+                "" | "true" => true,
+                "false" => false,
+                other => {
+                    return Err(ParseError {
+                        message: format!(
+                            "@allow_partials: expected nothing, `true` or `false`, got `{}`",
+                            other
+                        ),
+                        line: Some(line),
+                    })
+                }
+            };
         }
         // `@target_lag <duration>` — Snowflake Dynamic Tables-style throttle.
         // Internally `@target_lag 5min` is equivalent to
@@ -213,7 +261,10 @@ fn apply_header(task: &mut Task, content: &str, line: usize) -> Result<(), Parse
         // automation condition.
         "freshness" => {
             let dur_str = parse_max_lag_value(rest).ok_or_else(|| ParseError {
-                message: format!("@freshness: expected `max_lag=<duration>` or `<duration>`, got `{}`", rest),
+                message: format!(
+                    "@freshness: expected `max_lag=<duration>` or `<duration>`, got `{}`",
+                    rest
+                ),
                 line: Some(line),
             })?;
             let secs = parse_target_lag(&dur_str).map_err(|e| ParseError {
@@ -236,7 +287,10 @@ fn apply_header(task: &mut Task, content: &str, line: usize) -> Result<(), Parse
             let v = rest.trim().to_ascii_lowercase();
             if v != "error" && v != "warn" {
                 return Err(ParseError {
-                    message: format!("@check_severity: expected `error` or `warn`, got `{}`", rest),
+                    message: format!(
+                        "@check_severity: expected `error` or `warn`, got `{}`",
+                        rest
+                    ),
                     line: Some(line),
                 });
             }
@@ -260,7 +314,9 @@ fn parse_max_lag_value(rest: &str) -> Option<String> {
     for (k, v) in parse_inline_kv(s) {
         if k == "max_lag" {
             let v = v.trim();
-            if v.is_empty() { return None; }
+            if v.is_empty() {
+                return None;
+            }
             return Some(v.to_string());
         }
     }
@@ -361,10 +417,7 @@ fn parse_check_header(rest: &str, line: usize) -> Result<AssetCheck, ParseError>
                     })
                 }
                 _ => Err(ParseError {
-                    message: format!(
-                        "@check: unknown op `{}` (expected eq|gt|lt|between)",
-                        op
-                    ),
+                    message: format!("@check: unknown op `{}` (expected eq|gt|lt|between)", op),
                     line: Some(line),
                 }),
             }
@@ -459,7 +512,8 @@ mod tests {
 
     #[test]
     fn parses_param_header() {
-        let sql = "-- @name my_task\n-- @param partition_key:DATE\n-- @param count:INT\nSELECT 1;\n";
+        let sql =
+            "-- @name my_task\n-- @param partition_key:DATE\n-- @param count:INT\nSELECT 1;\n";
         let task = parse_sql_file(sql, None).expect("parse ok");
         assert_eq!(task.name, "my_task");
         assert_eq!(task.params.len(), 2);
@@ -576,7 +630,10 @@ mod tests {
         let task = parse_sql_file(sql, None).expect("parse ok");
         match task.partitions {
             Some(orch_common::PartitionDef::Static(ref v)) => {
-                assert_eq!(v, &vec!["jp".to_string(), "us".to_string(), "eu".to_string()]);
+                assert_eq!(
+                    v,
+                    &vec!["jp".to_string(), "us".to_string(), "eu".to_string()]
+                );
             }
             other => panic!("expected Static, got {:?}", other),
         }
@@ -599,7 +656,11 @@ mod tests {
     fn rejects_bad_partitions_by() {
         let sql = "-- @name t\n-- @partitions_by hourly(start=2026-01-01)\nSELECT 1;\n";
         let err = parse_sql_file(sql, None).expect_err("should fail");
-        assert!(err.message.contains("@partitions_by"), "got: {}", err.message);
+        assert!(
+            err.message.contains("@partitions_by"),
+            "got: {}",
+            err.message
+        );
         assert_eq!(err.line, Some(2));
     }
 
@@ -645,6 +706,82 @@ mod tests {
         let err = parse_sql_file(sql, None).expect_err("should fail");
         assert!(err.message.contains("@automation"), "got: {}", err.message);
         assert_eq!(err.line, Some(2));
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 18: interval tracking headers
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn automation_on_interval_sets_interval_unit() {
+        let sql = "-- @name t\n-- @automation on_interval(\"daily\")\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert_eq!(task.interval_unit.as_deref(), Some("daily"));
+    }
+
+    #[test]
+    fn automation_without_on_interval_leaves_unit_none() {
+        let sql = "-- @name t\n-- @automation eager\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert!(task.interval_unit.is_none());
+    }
+
+    #[test]
+    fn interval_unit_found_inside_and() {
+        let sql =
+            "-- @name t\n-- @automation on_interval(\"hourly\") AND NOT in_progress()\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert_eq!(task.interval_unit.as_deref(), Some("hourly"));
+    }
+
+    #[test]
+    fn parses_interval_start_date() {
+        let sql = "-- @name t\n-- @interval_start 2026-06-08\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert_eq!(task.interval_start_ts, Some(1_780_876_800)); // 2026-06-08 00:00 UTC
+    }
+
+    #[test]
+    fn parses_interval_start_epoch() {
+        let sql = "-- @name t\n-- @interval_start 1780876800\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert_eq!(task.interval_start_ts, Some(1_780_876_800));
+    }
+
+    #[test]
+    fn rejects_bad_interval_start() {
+        let sql = "-- @name t\n-- @interval_start not-a-date\nSELECT 1;\n";
+        let err = parse_sql_file(sql, None).expect_err("should fail");
+        assert!(
+            err.message.contains("@interval_start"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn parses_lookback() {
+        let sql = "-- @name t\n-- @lookback 2\nSELECT 1;\n";
+        let task = parse_sql_file(sql, None).expect("parse ok");
+        assert_eq!(task.lookback, Some(2));
+    }
+
+    #[test]
+    fn rejects_negative_lookback() {
+        let sql = "-- @name t\n-- @lookback -1\nSELECT 1;\n";
+        assert!(parse_sql_file(sql, None).is_err());
+    }
+
+    #[test]
+    fn parses_allow_partials_bare_and_explicit() {
+        let bare = "-- @name t\n-- @allow_partials\nSELECT 1;\n";
+        assert!(parse_sql_file(bare, None).expect("parse ok").allow_partials);
+        let explicit = "-- @name t\n-- @allow_partials false\nSELECT 1;\n";
+        assert!(
+            !parse_sql_file(explicit, None)
+                .expect("parse ok")
+                .allow_partials
+        );
     }
 
     #[test]
@@ -816,7 +953,11 @@ mod tests {
     fn rejects_bad_check_severity() {
         let sql = "-- @name t\n-- @check_severity loud\nSELECT 1;\n";
         let err = parse_sql_file(sql, None).expect_err("should fail");
-        assert!(err.message.contains("@check_severity"), "got: {}", err.message);
+        assert!(
+            err.message.contains("@check_severity"),
+            "got: {}",
+            err.message
+        );
     }
 
     #[test]

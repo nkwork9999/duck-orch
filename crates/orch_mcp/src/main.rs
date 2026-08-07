@@ -66,6 +66,40 @@ pub struct RunPipelineRequest {
 fn default_true() -> bool { true }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct IngestPreviewRequest {
+    /// Path or glob of the JSON source (a local file for now).
+    pub path: String,
+    /// Target table, optionally qualified: `raw.orders` or `lake.raw.orders`.
+    pub target: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct IngestRunRequest {
+    /// Path or glob of the JSON source.
+    pub path: String,
+    /// Target table, optionally qualified.
+    pub target: String,
+    /// `append` (default), `replace` or `merge`. `merge` needs primary_key.
+    #[serde(default)]
+    pub disposition: Option<String>,
+    /// Comma-separated key columns, required by `merge`.
+    #[serde(default)]
+    pub primary_key: Option<String>,
+    /// If true (default), only show the tables the load would produce.
+    /// Only when explicitly false does this tool write anything.
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct IngestSchemaRequest {
+    /// Dataset name, e.g. `raw.orders`. Omit for every dataset.
+    #[serde(default)]
+    pub dataset: Option<String>,
+}
+
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RegisterTaskRequest {
     /// Filesystem path to a directory of .sql task files (the CLI's
     /// `register <dir>` argument). Raw SQL strings are rejected.
@@ -402,7 +436,98 @@ impl DuckOrchServer {
         let body = serde_json::json!({ "ok": true, "name": req.name, "cron": req.cron, "output": out });
         ok_text(body.to_string())
     }
+
+    #[tool(
+        name = "preview_ingest",
+        description = "Show the parent/child tables and columns a JSON source would produce, without writing. Wraps `duck-orch ingest preview`. Read-only."
+    )]
+    pub async fn preview_ingest(
+        &self,
+        Parameters(req): Parameters<IngestPreviewRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let out = run_cli(&["ingest", "preview", &req.path, &req.target], true)
+            .map_err(to_mcp_err)?;
+        let body = serde_json::json!({
+            "path": req.path,
+            "target": req.target,
+            "plan": serde_json::from_str::<serde_json::Value>(&out)
+                .unwrap_or(serde_json::Value::String(out.clone())),
+        });
+        ok_text(body.to_string())
+    }
+
+    #[tool(
+        name = "run_ingest",
+        description = "Load a JSON source into normalized tables. Defaults to dry_run=true, which only previews the shape; pass dry_run=false to actually write. Wraps `duck-orch ingest run`."
+    )]
+    pub async fn run_ingest(
+        &self,
+        Parameters(req): Parameters<IngestRunRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        if req.dry_run {
+            let out = run_cli(&["ingest", "preview", &req.path, &req.target], true)
+                .map_err(to_mcp_err)?;
+            let body = serde_json::json!({
+                "dry_run": true,
+                "note": "nothing was written; pass dry_run=false to load",
+                "plan": serde_json::from_str::<serde_json::Value>(&out)
+                    .unwrap_or(serde_json::Value::String(out.clone())),
+            });
+            return ok_text(body.to_string());
+        }
+        let mut argv: Vec<String> = vec![
+            "ingest".into(),
+            "run".into(),
+            req.path.clone(),
+            req.target.clone(),
+        ];
+        if let Some(d) = &req.disposition {
+            argv.push("--disposition".into());
+            argv.push(d.clone());
+        }
+        if let Some(k) = &req.primary_key {
+            argv.push("--primary-key".into());
+            argv.push(k.clone());
+        }
+        let refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+        let out = run_cli(&refs, true).map_err(to_mcp_err)?;
+        let body = serde_json::json!({
+            "dry_run": false,
+            "summary": serde_json::from_str::<serde_json::Value>(&out)
+                .unwrap_or(serde_json::Value::String(out.clone())),
+        });
+        ok_text(body.to_string())
+    }
+
+    #[tool(
+        name = "ingest_schema_history",
+        description = "Schema ledger for ingested datasets: versions and what each one changed. Wraps `duck-orch ingest schema` / `ingest changes`. Read-only."
+    )]
+    pub async fn ingest_schema_history(
+        &self,
+        Parameters(req): Parameters<IngestSchemaRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut versions_args: Vec<String> = vec!["ingest".into(), "schema".into()];
+        let mut changes_args: Vec<String> = vec!["ingest".into(), "changes".into()];
+        if let Some(d) = &req.dataset {
+            versions_args.push(d.clone());
+            changes_args.push(d.clone());
+        }
+        let vrefs: Vec<&str> = versions_args.iter().map(|s| s.as_str()).collect();
+        let crefs: Vec<&str> = changes_args.iter().map(|s| s.as_str()).collect();
+        let versions = run_cli(&vrefs, true).map_err(to_mcp_err)?;
+        let changes = run_cli(&crefs, true).unwrap_or_default();
+        let body = serde_json::json!({
+            "dataset": req.dataset,
+            "versions": serde_json::from_str::<serde_json::Value>(&versions)
+                .unwrap_or(serde_json::Value::Null),
+            "changes": serde_json::from_str::<serde_json::Value>(&changes)
+                .unwrap_or(serde_json::Value::Null),
+        });
+        ok_text(body.to_string())
+    }
 }
+
 
 #[tool_handler]
 impl ServerHandler for DuckOrchServer {

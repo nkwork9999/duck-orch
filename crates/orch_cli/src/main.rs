@@ -49,6 +49,20 @@ SUBCOMMANDS:
                                                 Register one dynamic asset from inline SQL
     dynamic create-from-sql <file>              Parse Snowflake-style file, register each block
     dynamic migrate-from-snowflake <file>       Alias of create-from-sql
+    ingest preview <path> <target>              Show the tables a JSON source would produce
+    ingest run <path> <target> [--disposition append|replace|merge]
+                                                [--primary-key <cols>] [--max-nesting N]
+    ingest http <url> <target> [--secret <name> | --token <t>]
+                                                [--paginate none|page|offset|cursor|link]
+                                                [--records-path <p>] [--cursor-path <p>]
+                                                [--cursor-param <q>] [--page-param <q>]
+                                                [--resource <r>] [--max-pages N]
+                                                [--disposition <d>] [--primary-key <cols>]
+    ingest schema [<dataset>]                   Schema ledger versions
+    ingest changes [<dataset>]                  What each version changed
+    ingest loads [--limit N]                    Load history (including failures)
+    ingest state                                Resume cursors per source/resource
+    ingest reset <source> <resource>            Forget a cursor
     help                     Show this help
 
 GLOBAL FLAGS:
@@ -879,6 +893,173 @@ fn cmd_check(args: &Args) -> i32 {
 // pre-parse the source file via `orch_common::snowflake::parse_snowflake_dump`.
 // =============================================================================
 
+
+// ---------------------------------------------------------------------------
+// ingest (Phase 19)
+// ---------------------------------------------------------------------------
+
+/// Render an optional named pragma argument, e.g. `, disposition='merge'`.
+fn named_arg(name: &str, value: &Option<String>) -> String {
+    match value {
+        Some(v) if !v.is_empty() => format!(", {} = {}", name, sql_escape(v)),
+        _ => String::new(),
+    }
+}
+
+fn emit(args: &Args, sql: &str) -> i32 {
+    let (out, err, code) = match run_sql(args, sql, args.json) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{}", e);
+            return 2;
+        }
+    };
+    if !err.is_empty() {
+        eprintln!("{}", err);
+    }
+    print!("{}", out);
+    code
+}
+
+fn cmd_ingest(args: &Args) -> i32 {
+    let sub = args.rest.first().map(|s| s.as_str()).unwrap_or("");
+    let mut tail: Vec<String> = args.rest.iter().skip(1).cloned().collect();
+
+    match sub {
+        "preview" | "run" | "http" => {
+            let max_nesting = extract_flag_value(&mut tail, "--max-nesting");
+            let disposition = extract_flag_value(&mut tail, "--disposition");
+            let primary_key = extract_flag_value(&mut tail, "--primary-key");
+            let paginate = extract_flag_value(&mut tail, "--paginate");
+            let records_path = extract_flag_value(&mut tail, "--records-path");
+            let cursor_path = extract_flag_value(&mut tail, "--cursor-path");
+            let cursor_param = extract_flag_value(&mut tail, "--cursor-param");
+            let page_param = extract_flag_value(&mut tail, "--page-param");
+            let resource = extract_flag_value(&mut tail, "--resource");
+            let secret = extract_flag_value(&mut tail, "--secret");
+            let token = extract_flag_value(&mut tail, "--token");
+            let max_pages = extract_flag_value(&mut tail, "--max-pages");
+
+            if tail.len() < 2 {
+                eprintln!("ingest {}: needs <source> <target>", sub);
+                return 2;
+            }
+            let source = &tail[0];
+            let target = &tail[1];
+
+            let nesting = match &max_nesting {
+                Some(v) if !v.is_empty() => format!(", max_nesting = {}", v),
+                _ => String::new(),
+            };
+
+            let sql = match sub {
+                "preview" => format!(
+                    "PRAGMA orch_ingest_preview({}, {}{});",
+                    sql_escape(source),
+                    sql_escape(target),
+                    nesting
+                ),
+                "run" => format!(
+                    "PRAGMA orch_ingest_run({}, {}{}{}{});",
+                    sql_escape(source),
+                    sql_escape(target),
+                    named_arg("disposition", &disposition),
+                    named_arg("primary_key", &primary_key),
+                    nesting
+                ),
+                _ => {
+                    let pages = match &max_pages {
+                        Some(v) if !v.is_empty() => format!(", max_pages = {}", v),
+                        _ => String::new(),
+                    };
+                    format!(
+                        "PRAGMA orch_ingest_http({}, {}{}{}{}{}{}{}{}{}{}{}{});",
+                        sql_escape(source),
+                        sql_escape(target),
+                        named_arg("disposition", &disposition),
+                        named_arg("primary_key", &primary_key),
+                        named_arg("paginate", &paginate),
+                        named_arg("records_path", &records_path),
+                        named_arg("cursor_path", &cursor_path),
+                        named_arg("cursor_param", &cursor_param),
+                        named_arg("page_param", &page_param),
+                        named_arg("resource", &resource),
+                        named_arg("secret", &secret),
+                        named_arg("token", &token),
+                        format!("{}{}", nesting, pages)
+                    )
+                }
+            };
+            emit(args, &sql)
+        }
+        "schema" => {
+            let filter = tail
+                .first()
+                .map(|d| format!(" WHERE dataset = {}", sql_escape(d)))
+                .unwrap_or_default();
+            emit(
+                args,
+                &format!(
+                    "SELECT dataset, version, parent_dataset, schema_hash, created_at \
+                     FROM __orch__.ingest_schemas{} ORDER BY dataset, version;",
+                    filter
+                ),
+            )
+        }
+        "changes" => {
+            let filter = tail
+                .first()
+                .map(|d| format!(" WHERE dataset = {}", sql_escape(d)))
+                .unwrap_or_default();
+            emit(
+                args,
+                &format!(
+                    "SELECT dataset, version, change_kind, column_name, from_type, to_type, \
+                     applied_at FROM __orch__.ingest_schema_changes{} ORDER BY applied_at;",
+                    filter
+                ),
+            )
+        }
+        "loads" => {
+            let limit: i64 = extract_flag_value(&mut tail, "--limit")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(50);
+            emit(
+                args,
+                &format!(
+                    "SELECT load_id, source_kind, source, dataset, write_disposition, status, \
+                     tables_written, rows_inserted, rows_deleted, truncated, started_at, \
+                     error_message FROM __orch__.ingest_loads ORDER BY started_at DESC LIMIT {};",
+                    limit
+                ),
+            )
+        }
+        "state" => emit(args, "PRAGMA orch_ingest_state;"),
+        "reset" => {
+            if tail.len() < 2 {
+                eprintln!("ingest reset: needs <source> <resource>");
+                return 2;
+            }
+            emit(
+                args,
+                &format!(
+                    "PRAGMA orch_ingest_reset({}, {});",
+                    sql_escape(&tail[0]),
+                    sql_escape(&tail[1])
+                ),
+            )
+        }
+        "" => {
+            eprintln!("ingest: missing subcommand (preview|run|http|schema|changes|loads|state|reset)");
+            2
+        }
+        other => {
+            eprintln!("ingest: unknown subcommand '{}'", other);
+            2
+        }
+    }
+}
+
 fn cmd_dynamic(args: &Args) -> i32 {
     let sub = args.rest.first().map(|s| s.as_str()).unwrap_or("");
     match sub {
@@ -1059,6 +1240,7 @@ fn main() {
         "sensor" => cmd_sensor(&args),
         "check" => cmd_check(&args),
         "dynamic" => cmd_dynamic(&args),
+        "ingest" => cmd_ingest(&args),
         "help" | "" => { print!("{}", HELP); 0 }
         other => { eprintln!("unknown subcommand: {}", other); print!("{}", HELP); 2 }
     };

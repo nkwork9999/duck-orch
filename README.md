@@ -47,7 +47,8 @@ duck-orch dynamic migrate-from-snowflake snowflake_dump.sql
 | **Asset as first-class** | `@asset name=...` (or auto-derived from `@outputs`) promotes a task's output to `__orch__.assets`. Per-Asset materialization history, code_version hash, declared edges, owner, group, description, tags. |
 | **Partitions** | `@partitions_by daily(start=2026-01-01)` / `static(jp,us,eu)` / `multi(date=..., region=...)`. `$partition_key` is bound via DuckDB `PREPARE` (multi-statement aware) so the task SQL runs once per partition. |
 | **Backfill** | `duck-orch backfill <asset> --from D --to D \| --partition K \| --missing` with calendar-style ✅🟡❌⚪ ASCII output. |
-| **DSL Automation** | `@automation eager \| on_cron(...) \| on_missing \| freshness_violated \| in_progress` plus `&` / `\|` / `!` operators. Stateless evaluator with `target_lag_seconds` throttle wrapper. |
+| **DSL Automation** | `@automation eager \| on_cron(...) \| on_interval(...) \| on_missing \| freshness_violated \| in_progress` plus `&` / `\|` / `!` operators. Stateless evaluator with `target_lag_seconds` throttle wrapper. |
+| **Interval tracking** | SQLMesh-style: `@automation on_interval("daily")` + `@interval_start 2026-01-01` tracks *which* time intervals have been processed (`__orch__.asset_intervals`) instead of comparing wall-clock timestamps. Gaps are computed set-difference style, contiguous gaps run as one batch, and `${interval_start}` / `${interval_end}` (ISO UTC) + `${interval_start_ts}` / `${interval_end_ts}` (epoch) are substituted into the task SQL. `@lookback N` re-processes trailing intervals for late data; `@allow_partials` includes the in-progress interval. `PRAGMA orch_restate('asset', '2026-06-01', '2026-06-03')` deletes stored intervals so the next tick recomputes them. |
 | **Sensor loop** | Background `std::thread` polls every N seconds (`PRAGMA orch_sensor_set_interval`), evaluates eligible Assets via the Rust evaluator, logs to `__orch__.automation_evaluations`, and fires `RunSingleTask` when `condition_met`. |
 | **Freshness + Asset Check** | `@freshness max_lag=60min` ties into `FreshnessViolated`. `@check name=N "<SQL>" expect <op> <value>` runs at end of every successful task; `severity=error` failures block downstream. `${asset}` substituted at execution. |
 | **Snowflake `CREATE DYNAMIC ASSET`** | `PRAGMA orch_create_dynamic_asset(name, target_lag, sql)` synthesizes a task + Asset + `automation_condition='eager()'` so the sensor picks it up. `duck-orch dynamic migrate-from-snowflake <dump>` parses a Snowflake dump and registers every block (skipping `WAREHOUSE`/`REFRESH_MODE`/etc.). |
@@ -155,6 +156,12 @@ SELECT task_name, status FROM __orch__.runs ORDER BY started_at;
 -- @check name=positive "SELECT MIN(rev) FROM ${asset}" expect gt 0
 -- @check_severity error                 | warn
 
+-- Interval tracking (Phase 18, SQLMesh-style)
+-- @automation on_interval("daily")      | "hourly" | "5min" | "2h" | "3d"
+-- @interval_start 2026-01-01            track gaps from this UTC date
+-- @lookback 2                           re-process last N intervals (late data)
+-- @allow_partials                       include the in-progress interval
+
 <SQL body referencing $partition_key etc.>
 ```
 
@@ -164,6 +171,7 @@ SELECT task_name, status FROM __orch__.runs ORDER BY started_at;
 |---|---|---|
 | `$name` | new code (Phase 12+): partition keys, typed params | DuckDB native `PREPARE` + named bind, multi-statement aware |
 | `${asset}` | identifier interpolation in `@check` SQL | plain string substitution |
+| `${interval_start}` / `${interval_end}` | Phase 18 `on_interval()` runs: quoted ISO UTC timestamp literal (`WHERE ts >= ${interval_start}` works as-is); `${interval_start_ts}` / `${interval_end_ts}` give bare epoch seconds | plain string substitution |
 | `{{ var }}` | legacy `@incremental_by` (Phase 7) | self-contained 33-line substitution (no Jinja crate); kept for back-compat, **not used in new features** |
 
 Supported `{{}}` variables: `{{ last_processed_at }}`, `{{ now }}`, `{{ run_id }}`.
@@ -236,6 +244,16 @@ duck-orch [--db <path>] [--ext <path>] <subcommand> [--json]
   dynamic create <name> --target-lag <dur> --sql <inline>
   dynamic create-from-sql <file>       Parse Snowflake-style file, register each block
   dynamic migrate-from-snowflake <file>      Alias of create-from-sql
+
+# JSON ingestion (Phase 19)
+  ingest preview <path> <target>       Tables the source would produce; writes nothing
+  ingest run <path> <target> [--disposition append|replace|merge]
+                                       [--primary-key <cols>] [--max-nesting N]
+  ingest http <url> <target> [--secret <name> | --token <t>] [--paginate ...]
+  ingest schema [<dataset>]            Schema ledger versions
+  ingest changes [<dataset>]           What each version changed
+  ingest loads [--limit N]             Load history, failures included
+  ingest state / ingest reset <source> <resource>
 ```
 
 Pass `--json` to any subcommand for Claude / agent-parseable output.
@@ -336,7 +354,47 @@ SELECT * FROM __orch__.asset_partitions;             -- Phase 14
 SELECT * FROM __orch__.automation_evaluations;       -- Phase 15
 SELECT * FROM __orch__.asset_checks;                 -- Phase 16
 SELECT * FROM __orch__.asset_check_results;          -- Phase 16
+SELECT * FROM __orch__.ingest_schemas;               -- Phase 19
+SELECT * FROM __orch__.ingest_schema_changes;        -- Phase 19
+SELECT * FROM __orch__.ingest_loads;                 -- Phase 19
+SELECT * FROM __orch__.ingest_state;                 -- Phase 19
+SELECT * FROM __orch__.ingest_fetches;               -- Phase 19
 ```
+
+### JSON ingestion (Phase 19)
+
+Nested JSON becomes flat parent/child tables, and a schema ledger absorbs
+columns that appear later. Type inference is DuckDB's own: the source is read
+through `read_json` and the resulting types drive the normalization.
+
+```sql
+-- see the shape first; nothing is written
+PRAGMA orch_ingest_preview('orders.jsonl', 'raw.orders');
+
+-- load a file source
+PRAGMA orch_ingest_run('orders/*.jsonl', 'raw.orders');
+PRAGMA orch_ingest_run('orders.jsonl', 'raw.orders',
+                       disposition = 'merge', primary_key = 'id');
+
+-- load an API, resuming from the cursor the previous run stored
+CREATE SECRET orders_api (TYPE http, BEARER_TOKEN '...');
+PRAGMA orch_ingest_http('https://api.example.com/orders', 'raw.orders',
+                        secret = 'orders_api', paginate = 'cursor',
+                        records_path = 'data', cursor_path = 'meta.next',
+                        cursor_param = 'cursor', resource = 'orders');
+
+PRAGMA orch_ingest_state;
+PRAGMA orch_ingest_reset('https://api.example.com/orders', 'orders');
+```
+
+| | |
+|---|---|
+| **Normalization** | Structs flatten into the parent (`customer__name`); arrays become child tables (`orders__items`). Control columns `_orch_id` / `_orch_parent_id` / `_orch_index` / `_orch_load_id` link and order the rows. `max_nesting` (default 3) caps how deep child tables go; anything deeper stays a JSON string column. |
+| **Schema ledger** | `ingest_schemas` gains a version only when the shape actually moves. Added columns and widening types (`INTEGER → BIGINT`, anything → `VARCHAR`) are absorbed with `ALTER`; an incompatible change fails the load with the column named. Columns that vanish stay and take NULLs. |
+| **Dispositions** | `append` (default), `replace` (keep only this load), `merge` (needs `primary_key`; replaces earlier rows whose key came back, children included). |
+| **HTTP** | `none` / `page` / `offset` / `cursor` / `link` pagination, bearer token from a DuckDB secret, resume cursor in `ingest_state`, per-page log in `ingest_fetches`. A `max_pages` ceiling is reported as `truncated`, never silently. |
+| **Destination** | A three-part target (`lake.raw.orders`) loads into an attached catalog, so a DuckLake lakehouse is just a different target. |
+| **Lineage** | Loaded tables register as Assets with a materialization per load, parent→child asset edges, and a `file://` / `http://` upstream in `lineage_edges`. |
 
 ---
 

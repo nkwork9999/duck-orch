@@ -19,10 +19,16 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
+#include "duckdb/main/secret/secret_manager.hpp"
+#include "duckdb/main/secret/secret.hpp"
+#include "duckdb/catalog/catalog_transaction.hpp"
 #include "yyjson.hpp"
 
+#include <array>
 #include <atomic>
+#include <cstdlib>
 #include <chrono>
+#include <ctime>
 #include <iomanip>
 #include <map>
 #include <mutex>
@@ -371,6 +377,36 @@ CREATE TABLE IF NOT EXISTS __orch__.automation_evaluations (
 -- header.
 ALTER TABLE __orch__.assets ADD COLUMN IF NOT EXISTS freshness_lag_seconds BIGINT;
 
+-- Phase 18: SQLMesh-style interval tracking for on_interval() ----------
+--
+-- Append-only log of computed intervals. The sensor INSERTs a row after
+-- each successful task run that was triggered by on_interval(); the
+-- evaluator loads all success rows as `stored_intervals` in EvalContext
+-- so compute_missing() can find gaps without re-running done intervals.
+--
+-- `interval_unit` mirrors IntervalUnit DSL strings ("daily"|"hourly"|"5min").
+-- `start_ts` / `end_ts` are epoch seconds, half-open [start, end).
+-- `status` is 'success' (done) or 'removed' (restatement soft-delete).
+CREATE TABLE IF NOT EXISTS __orch__.asset_intervals (
+    asset_name   VARCHAR,
+    interval_unit VARCHAR,
+    start_ts     BIGINT,
+    end_ts       BIGINT,
+    status       VARCHAR DEFAULT 'success',
+    run_id       UUID,
+    created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (asset_name, start_ts, end_ts)
+);
+
+-- Interval tracking config lives on the asset row so BuildEvalContextJson
+-- can pass interval_start_ts straight through without an extra join.
+-- `lookback` / `allow_partials` mirror the SQLMesh model properties of the
+-- same names (late-data re-processing / include the in-progress interval).
+ALTER TABLE __orch__.assets ADD COLUMN IF NOT EXISTS interval_unit VARCHAR;
+ALTER TABLE __orch__.assets ADD COLUMN IF NOT EXISTS interval_start_ts BIGINT;
+ALTER TABLE __orch__.assets ADD COLUMN IF NOT EXISTS lookback INTEGER DEFAULT 0;
+ALTER TABLE __orch__.assets ADD COLUMN IF NOT EXISTS allow_partials BOOLEAN DEFAULT false;
+
 -- One row per declared `-- @check ...` (or legacy `-- @test ...` promoted
 -- as `test_<N>`). Re-registration UPSERTs by (asset_name, check_name).
 CREATE TABLE IF NOT EXISTS __orch__.asset_checks (
@@ -395,6 +431,81 @@ CREATE TABLE IF NOT EXISTS __orch__.asset_check_results (
     status VARCHAR,              -- 'pass' | 'fail'
     actual_value VARCHAR,
     PRIMARY KEY (asset_name, check_name, executed_at)
+);
+
+-- Phase 19 (ingestion, P0) -------------------------------------------------
+-- One row per distinct shape a normalized table has had. A new version is
+-- only appended when the column set actually changes, so re-running an
+-- unchanged load leaves the ledger alone.
+CREATE TABLE IF NOT EXISTS __orch__.ingest_schemas (
+    dataset VARCHAR,
+    version INTEGER,
+    schema_hash VARCHAR,
+    parent_dataset VARCHAR,
+    columns_json VARCHAR,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (dataset, version)
+);
+
+-- What changed at each version, and the DDL that absorbed it. `column_removed`
+-- rows carry no DDL: the column stays and takes NULLs.
+CREATE TABLE IF NOT EXISTS __orch__.ingest_schema_changes (
+    dataset VARCHAR,
+    version INTEGER,
+    change_kind VARCHAR,         -- 'table_created' | 'column_added'
+                                 -- | 'column_removed' | 'type_widened'
+    column_name VARCHAR,
+    from_type VARCHAR,
+    to_type VARCHAR,
+    ddl VARCHAR,
+    applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- One row per `PRAGMA orch_ingest_run`. load_id is the prefix of every
+-- `_orch_id` written by that load, so rows can always be traced back.
+CREATE TABLE IF NOT EXISTS __orch__.ingest_loads (
+    load_id VARCHAR PRIMARY KEY,
+    source VARCHAR,
+    dataset VARCHAR,
+    write_disposition VARCHAR,   -- 'append' | 'replace' | 'merge'
+    tables_written INTEGER,
+    rows_inserted BIGINT,
+    started_at TIMESTAMP,
+    finished_at TIMESTAMP,
+    status VARCHAR,              -- 'success' | 'failed'
+    error_message VARCHAR
+);
+-- No DEFAULT clauses here on purpose: every write sets these explicitly, and
+-- an ALTER carrying a default expression is what DuckDB struggles to replay
+-- from an unclean WAL.
+ALTER TABLE __orch__.ingest_loads ADD COLUMN IF NOT EXISTS rows_deleted BIGINT;
+ALTER TABLE __orch__.ingest_loads ADD COLUMN IF NOT EXISTS source_kind VARCHAR;
+ALTER TABLE __orch__.ingest_loads ADD COLUMN IF NOT EXISTS truncated BOOLEAN;
+
+-- Resume state for sources that hand out a cursor instead of a time window.
+-- Time-windowed sources use the existing interval tracking instead; the two
+-- never both own the same resource.
+CREATE TABLE IF NOT EXISTS __orch__.ingest_state (
+    source VARCHAR,
+    resource VARCHAR,
+    cursor_value VARCHAR,
+    cursor_kind VARCHAR,         -- 'cursor' | 'page' | 'offset' | 'link'
+    last_load_id VARCHAR,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (source, resource)
+);
+
+-- One row per HTTP request made by an ingest. Kept so a partial fetch can be
+-- explained after the fact.
+CREATE TABLE IF NOT EXISTS __orch__.ingest_fetches (
+    load_id VARCHAR,
+    page INTEGER,
+    url VARCHAR,
+    http_status INTEGER,
+    bytes BIGINT,
+    records BIGINT,
+    file_path VARCHAR,
+    fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 )";
 
@@ -646,6 +757,45 @@ static void OrchRegisterPragma(ClientContext &context, const FunctionParameters 
 				}
 			}
 
+			// Phase 18: interval tracking config. `interval_unit` is derived
+			// Rust-side from the first on_interval() atom in the automation
+			// AST; `interval_start_ts` comes from `@interval_start`;
+			// `lookback` from `@lookback`; `allow_partials` from
+			// `@allow_partials`.
+			string interval_unit = get_str("interval_unit");
+			int64_t interval_start_ts = 0;
+			bool interval_start_set = false;
+			{
+				auto iv = yyjson_ns::yyjson_obj_get(t, "interval_start_ts");
+				if (iv && !yyjson_ns::yyjson_is_null(iv)) {
+					if (yyjson_ns::yyjson_is_int(iv)) {
+						interval_start_ts = yyjson_ns::yyjson_get_int(iv);
+						interval_start_set = true;
+					} else if (yyjson_ns::yyjson_is_uint(iv)) {
+						interval_start_ts = (int64_t)yyjson_ns::yyjson_get_uint(iv);
+						interval_start_set = true;
+					}
+				}
+			}
+			int64_t lookback = 0;
+			{
+				auto lv = yyjson_ns::yyjson_obj_get(t, "lookback");
+				if (lv && !yyjson_ns::yyjson_is_null(lv)) {
+					if (yyjson_ns::yyjson_is_int(lv)) {
+						lookback = yyjson_ns::yyjson_get_int(lv);
+					} else if (yyjson_ns::yyjson_is_uint(lv)) {
+						lookback = (int64_t)yyjson_ns::yyjson_get_uint(lv);
+					}
+				}
+			}
+			bool allow_partials = false;
+			{
+				auto av = yyjson_ns::yyjson_obj_get(t, "allow_partials");
+				if (av && yyjson_ns::yyjson_is_bool(av)) {
+					allow_partials = yyjson_ns::yyjson_get_bool(av);
+				}
+			}
+
 			// Phase 16: per-asset check severity. NULL/empty => 'error'.
 			string check_severity = get_str("check_severity");
 			if (check_severity.empty()) check_severity = "error";
@@ -678,11 +828,22 @@ static void OrchRegisterPragma(ClientContext &context, const FunctionParameters 
 				string freshness_lit = freshness_lag_set
 				                           ? std::to_string(freshness_lag)
 				                           : string("NULL");
+				// Phase 18: interval tracking columns. Cleared on
+				// re-registration when the headers are dropped, so the
+				// source SQL stays authoritative (same contract as
+				// automation_condition).
+				string interval_unit_lit = interval_unit.empty()
+				                               ? string("NULL")
+				                               : SqlEscape(interval_unit);
+				string interval_start_lit = interval_start_set
+				                                ? std::to_string(interval_start_ts)
+				                                : string("NULL");
 				sql << "INSERT INTO __orch__.assets "
 				    << "(name, kind, location, group_name, owner, description, "
 				    << "code_version, defined_by_task, tags, "
 				    << "automation_condition, target_lag_seconds, "
-				    << "freshness_lag_seconds) VALUES ("
+				    << "freshness_lag_seconds, interval_unit, interval_start_ts, "
+				    << "lookback, allow_partials) VALUES ("
 				    << SqlEscape(a_name) << ", "
 				    << SqlEscape(a_kind) << ", "
 				    << "NULL, "
@@ -694,7 +855,11 @@ static void OrchRegisterPragma(ClientContext &context, const FunctionParameters 
 				    << tags_literal << ", "
 				    << automation_lit << ", "
 				    << target_lag_lit << ", "
-				    << freshness_lit
+				    << freshness_lit << ", "
+				    << interval_unit_lit << ", "
+				    << interval_start_lit << ", "
+				    << lookback << ", "
+				    << (allow_partials ? "true" : "false")
 				    << ") ON CONFLICT (name) DO UPDATE SET "
 				    << "kind=EXCLUDED.kind, "
 				    << "group_name=EXCLUDED.group_name, "
@@ -705,7 +870,11 @@ static void OrchRegisterPragma(ClientContext &context, const FunctionParameters 
 				    << "tags=EXCLUDED.tags, "
 				    << "automation_condition=EXCLUDED.automation_condition, "
 				    << "target_lag_seconds=EXCLUDED.target_lag_seconds, "
-				    << "freshness_lag_seconds=EXCLUDED.freshness_lag_seconds;\n";
+				    << "freshness_lag_seconds=EXCLUDED.freshness_lag_seconds, "
+				    << "interval_unit=EXCLUDED.interval_unit, "
+				    << "interval_start_ts=EXCLUDED.interval_start_ts, "
+				    << "lookback=EXCLUDED.lookback, "
+				    << "allow_partials=EXCLUDED.allow_partials;\n";
 			};
 
 			// Determine the "primary asset" for this task so Phase 14 can
@@ -1081,9 +1250,30 @@ RunChecksForAsset(Connection &con, const string &asset_name, const string &run_i
 // to a non-default value AND the task carries `params`, the SQL is run via
 // `PREPARE`+bind so `$partition_key` / `$partition_<dim>` resolve natively.
 // Returns true on success, false on failure.
+// Phase 18: epoch seconds → "YYYY-MM-DD HH:MM:SS" (UTC) for interval
+// template vars.
+static string IsoFromEpochUtc(int64_t ts) {
+	time_t t = (time_t)ts;
+	struct tm tmv;
+#ifdef _WIN32
+	gmtime_s(&tmv, &t);
+#else
+	gmtime_r(&t, &tmv);
+#endif
+	char buf[32];
+	strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tmv);
+	return string(buf);
+}
+
+// `interval_start` / `interval_end` (epoch seconds, half-open) are set by the
+// Phase 18 sensor when the run covers an on_interval() gap; -1 = not an
+// interval run. They surface in task SQL as `${interval_start}` /
+// `${interval_end}` (ISO UTC) and `${interval_start_ts}` /
+// `${interval_end_ts}` (epoch seconds) template vars.
 static bool RunSingleTask(Connection &con, const TaskRow &task, const string &pipeline_run_id,
                           const string &tasks_json,
-                          const string &partition_key = "__default__") {
+                          const string &partition_key = "__default__",
+                          int64_t interval_start = -1, int64_t interval_end = -1) {
 	auto run_uuid = con.Query("SELECT uuid()::VARCHAR")->GetValue(0, 0).ToString();
 	string started = IsoNow();
 
@@ -1133,6 +1323,26 @@ static bool RunSingleTask(Connection &con, const TaskRow &task, const string &pi
 	        },
 	    sub_ok);
 	if (sub_ok) sql_to_run = substituted;
+
+	// Phase 18: interval bounds for on_interval() runs. Plain `${var}`
+	// substitution (same no-Jinja mechanism as `${asset}` in @check SQL):
+	//   ${interval_start} / ${interval_end}       — quoted ISO UTC timestamp
+	//                                               literal, ready for
+	//                                               `WHERE ts >= ${interval_start}`
+	//   ${interval_start_ts} / ${interval_end_ts} — bare epoch seconds
+	if (interval_start >= 0 && interval_end > interval_start) {
+		auto replace_var = [&](const string &needle, const string &val) {
+			size_t pos = 0;
+			while ((pos = sql_to_run.find(needle, pos)) != string::npos) {
+				sql_to_run.replace(pos, needle.size(), val);
+				pos += val.size();
+			}
+		};
+		replace_var("${interval_start_ts}", std::to_string(interval_start));
+		replace_var("${interval_end_ts}", std::to_string(interval_end));
+		replace_var("${interval_start}", "'" + IsoFromEpochUtc(interval_start) + "'");
+		replace_var("${interval_end}", "'" + IsoFromEpochUtc(interval_end) + "'");
+	}
 
 	// Phase 14: when running a specific partition, build the bind map for
 	// `$partition_key` and (for Multi) `$partition_<dim>` placeholders so
@@ -2504,17 +2714,22 @@ struct AutomationRow {
 	string condition_dsl;
 	int64_t target_lag_seconds = 0;
 	bool target_lag_set = false;
-	// Phase 16: freshness policy on this asset. Sourced from the same
-	// __orch__.assets row so BuildEvalContextJson can pass it straight to
-	// the FreshnessViolated evaluator (no extra join per tick).
+	// Phase 16: freshness policy on this asset.
 	int64_t freshness_lag_seconds = 0;
 	bool freshness_lag_set = false;
+	// Phase 18: interval tracking config.
+	string interval_unit;           // e.g. "daily" — empty if not set
+	int64_t interval_start_ts = 0;
+	bool interval_start_set = false;
+	int64_t lookback = 0;           // re-process trailing intervals near a gap
+	bool allow_partials = false;    // include the in-progress interval
 };
 
 static std::vector<AutomationRow> LoadAutomationAssets(Connection &con) {
 	std::vector<AutomationRow> out;
 	auto r = con.Query(
-	    "SELECT name, automation_condition, target_lag_seconds, freshness_lag_seconds "
+	    "SELECT name, automation_condition, target_lag_seconds, freshness_lag_seconds, "
+	    "       interval_unit, interval_start_ts, lookback, allow_partials "
 	    "FROM __orch__.assets "
 	    "WHERE automation_condition IS NOT NULL "
 	    "ORDER BY name;");
@@ -2532,6 +2747,23 @@ static std::vector<AutomationRow> LoadAutomationAssets(Connection &con) {
 		if (!flv.IsNull()) {
 			row.freshness_lag_seconds = flv.GetValue<int64_t>();
 			row.freshness_lag_set = true;
+		}
+		auto iuv = r->GetValue(4, i);
+		if (!iuv.IsNull()) {
+			row.interval_unit = iuv.ToString();
+		}
+		auto isv = r->GetValue(5, i);
+		if (!isv.IsNull()) {
+			row.interval_start_ts = isv.GetValue<int64_t>();
+			row.interval_start_set = true;
+		}
+		auto lbv = r->GetValue(6, i);
+		if (!lbv.IsNull()) {
+			row.lookback = lbv.GetValue<int64_t>();
+		}
+		auto apv = r->GetValue(7, i);
+		if (!apv.IsNull()) {
+			row.allow_partials = apv.GetValue<bool>();
 		}
 		out.push_back(std::move(row));
 	}
@@ -2608,6 +2840,21 @@ static string BuildEvalContextJson(Connection &con, const AutomationRow &row,
 		return JsonEscape(s);
 	};
 
+	// Phase 18: load stored intervals for on_interval() evaluation.
+	// Returns a JSON array of [[start_ts, end_ts], ...] pairs.
+	string stored_intervals_json = "[]";
+	if (!row.interval_unit.empty()) {
+		std::ostringstream q_iv;
+		q_iv << "SELECT list([start_ts, end_ts] ORDER BY start_ts)::VARCHAR "
+		     << "FROM __orch__.asset_intervals "
+		     << "WHERE asset_name = " << SqlEscape(row.asset_name)
+		     << "  AND status = 'success';";
+		auto iv_r = con.Query(q_iv.str());
+		if (!iv_r->HasError() && iv_r->RowCount() > 0 && !iv_r->GetValue(0, 0).IsNull()) {
+			stored_intervals_json = iv_r->GetValue(0, 0).ToString();
+		}
+	}
+
 	std::ostringstream o;
 	o << "{"
 	  << "\"upstream_max_materialized_at\":" << json_or_null(upstream_max)
@@ -2616,7 +2863,13 @@ static string BuildEvalContextJson(Connection &con, const AutomationRow &row,
 	  << ",\"now\":" << JsonEscape(now_iso)
 	  << ",\"freshness_lag_seconds\":"
 	  << (row.freshness_lag_set ? std::to_string(row.freshness_lag_seconds) : string("null"))
-	  << ",\"in_progress\":" << (in_progress ? "true" : "false");
+	  << ",\"in_progress\":" << (in_progress ? "true" : "false")
+	  << ",\"stored_intervals\":" << stored_intervals_json
+	  << ",\"lookback\":" << row.lookback
+	  << ",\"allow_partials\":" << (row.allow_partials ? "true" : "false");
+	if (row.interval_start_set) {
+		o << ",\"interval_start_ts\":" << row.interval_start_ts;
+	}
 	if (row.target_lag_set) {
 		o << ",\"target_lag_seconds\":" << row.target_lag_seconds;
 	}
@@ -2771,7 +3024,6 @@ static void SensorTickOnce(Connection &con) {
 
 		if (!outcome.condition_met) continue;
 
-		// Fire: look up the defining task and run it once (no partition).
 		auto task_name = LookupDefiningTask(con, row.asset_name);
 		if (task_name.empty()) continue;
 		TaskRow task;
@@ -2780,10 +3032,124 @@ static void SensorTickOnce(Connection &con) {
 		} catch (...) {
 			continue;
 		}
-		auto pipeline_uuid =
-		    con.Query("SELECT uuid()::VARCHAR")->GetValue(0, 0).ToString();
-		RunSingleTask(con, task, pipeline_uuid, string());
-		triggered++;
+
+		// Phase 18: on_interval — iterate over each missing interval and run
+		// one task per interval, then record it in __orch__.asset_intervals.
+		bool is_interval = !row.interval_unit.empty() &&
+		    row.condition_dsl.find("on_interval") != string::npos;
+		if (is_interval) {
+			bool ok_iv = false;
+			auto iv_json = CallRustString(
+			    [&](uint8_t **op, size_t *ol) {
+				    return orch_missing_intervals_for(
+				        reinterpret_cast<const uint8_t *>(row.condition_dsl.c_str()),
+				        row.condition_dsl.size(),
+				        reinterpret_cast<const uint8_t *>(ctx_json.c_str()),
+				        ctx_json.size(),
+				        op, ol);
+			        },
+			    ok_iv);
+			if (!ok_iv || iv_json.empty() || iv_json == "[]") {
+				// Fallback: run once without interval binding.
+				auto uuid = con.Query("SELECT uuid()::VARCHAR")->GetValue(0, 0).ToString();
+				RunSingleTask(con, task, uuid, string());
+				triggered++;
+				continue;
+			}
+			// Parse [[start_ts, end_ts], ...] array using yyjson. A hand-rolled
+			// bracket scanner is tempting here, but it sees the outer array's
+			// `[` as an interval start and drops the first real interval.
+			auto parse_intervals = [&](const string &j) -> std::vector<std::pair<int64_t, int64_t>> {
+				std::vector<std::pair<int64_t, int64_t>> result;
+				auto doc = yyjson_ns::yyjson_read(j.c_str(), j.size(), 0);
+				if (!doc) return result;
+				auto root = yyjson_ns::yyjson_doc_get_root(doc);
+				auto read_i64 = [](yyjson_ns::yyjson_val *v, int64_t &out) {
+					if (!v) return false;
+					if (yyjson_ns::yyjson_is_int(v)) {
+						out = yyjson_ns::yyjson_get_int(v);
+						return true;
+					}
+					if (yyjson_ns::yyjson_is_uint(v)) {
+						out = (int64_t)yyjson_ns::yyjson_get_uint(v);
+						return true;
+					}
+					return false;
+				};
+				if (root && yyjson_ns::yyjson_is_arr(root)) {
+					size_t i, m;
+					yyjson_ns::yyjson_val *pair;
+					yyjson_arr_foreach(root, i, m, pair) {
+						if (!pair || !yyjson_ns::yyjson_is_arr(pair)) continue;
+						int64_t start_ts = 0;
+						int64_t end_ts = 0;
+						bool start_ok = false;
+						bool end_ok = false;
+						size_t pi, pm;
+						yyjson_ns::yyjson_val *v;
+						yyjson_arr_foreach(pair, pi, pm, v) {
+							if (pi == 0) {
+								start_ok = read_i64(v, start_ts);
+							} else if (pi == 1) {
+								end_ok = read_i64(v, end_ts);
+								break;
+							}
+						}
+						if (start_ok && end_ok && end_ts > start_ts) {
+							result.emplace_back(start_ts, end_ts);
+						}
+					}
+				}
+				yyjson_ns::yyjson_doc_free(doc);
+				return result;
+			};
+			auto intervals = parse_intervals(iv_json);
+			// Contiguous batching (mirrors SQLMesh's scheduler
+			// compute_interval_params): group adjacent missing intervals
+			// into one task run covering [first.start, last.end), so a long
+			// backfill is one execution per contiguous gap instead of one
+			// per unit interval. Unit rows are still recorded individually
+			// so restatement (DELETE of a single row) stays precise.
+			size_t bi = 0;
+			while (bi < intervals.size()) {
+				size_t bj = bi + 1;
+				while (bj < intervals.size() &&
+				       intervals[bj].first == intervals[bj - 1].second) {
+					bj++;
+				}
+				int64_t batch_start = intervals[bi].first;
+				int64_t batch_end = intervals[bj - 1].second;
+				auto uuid = con.Query("SELECT uuid()::VARCHAR")->GetValue(0, 0).ToString();
+				// Interval bounds surface in the task SQL as
+				// ${interval_start} / ${interval_end} (ISO UTC) and
+				// ${interval_start_ts} / ${interval_end_ts} (epoch).
+				bool run_ok = RunSingleTask(con, task, uuid, string(), "__default__",
+				                            batch_start, batch_end);
+				triggered++;
+				// Record each unit interval with the real outcome. Failed
+				// rows are excluded by BuildEvalContextJson (status =
+				// 'success' filter) so the gap re-surfaces next tick, and
+				// a later success INSERT OR REPLACEs the failed row.
+				const char *iv_status = run_ok ? "success" : "failed";
+				for (size_t k = bi; k < bj; k++) {
+					std::ostringstream ins_iv;
+					ins_iv << "INSERT OR REPLACE INTO __orch__.asset_intervals "
+					       << "(asset_name, interval_unit, start_ts, end_ts, status, run_id) VALUES ("
+					       << SqlEscape(row.asset_name) << ", "
+					       << SqlEscape(row.interval_unit) << ", "
+					       << intervals[k].first << ", " << intervals[k].second << ", '"
+					       << iv_status << "', '" << uuid << "'::UUID);";
+					con.Query(ins_iv.str());
+				}
+				bi = bj;
+			}
+		} else {
+			// Non-interval condition: run once.
+			auto pipeline_uuid =
+			    con.Query("SELECT uuid()::VARCHAR")->GetValue(0, 0).ToString();
+			RunSingleTask(con, task, pipeline_uuid, string());
+			triggered++;
+		}
 	}
 	std::lock_guard<std::mutex> lk(g_sensor_status_mutex);
 	g_sensor_last_tick = IsoNow();
@@ -2886,6 +3252,33 @@ static void OrchSensorSetIntervalPragma(ClientContext &context,
 	int64_t n = parameters.values[0].GetValue<int64_t>();
 	if (n < 1) n = 1;
 	g_sensor_interval_seconds.store(n);
+}
+
+// Phase 18: `PRAGMA orch_restate('asset', 'from', 'to')` — SQLMesh-style
+// restatement. Deletes stored interval rows overlapping [from, to) so the
+// next sensor tick recomputes (and re-runs) them. `from` / `to` accept any
+// string DuckDB can cast to TIMESTAMP ('2026-06-01', '2026-06-01 12:00:00').
+static void OrchRestatePragma(ClientContext &context,
+                                const FunctionParameters &parameters) {
+	if (parameters.values.size() < 3 || parameters.values[0].IsNull() ||
+	    parameters.values[1].IsNull() || parameters.values[2].IsNull()) {
+		throw InvalidInputException(
+		    "orch_restate requires ('asset_name', 'from_ts', 'to_ts')");
+	}
+	string asset = parameters.values[0].ToString();
+	string from = parameters.values[1].ToString();
+	string to = parameters.values[2].ToString();
+	Connection con(*context.db);
+	EnsureOrchSchema(con);
+	std::ostringstream del;
+	del << "DELETE FROM __orch__.asset_intervals "
+	    << "WHERE asset_name = " << SqlEscape(asset)
+	    << "  AND start_ts < epoch(" << SqlEscape(to) << "::TIMESTAMP)"
+	    << "  AND end_ts > epoch(" << SqlEscape(from) << "::TIMESTAMP);";
+	auto r = con.Query(del.str());
+	if (r->HasError()) {
+		throw InvalidInputException("orch_restate: " + r->GetError());
+	}
 }
 
 // ========================================================================
@@ -3629,6 +4022,913 @@ static void OrchPreOptimize(OptimizerExtensionInput &input,
 }
 
 // ========================================================================
+// Phase 19: JSON ingestion
+//
+// Pragmas:
+//   orch_ingest_preview(path, target)     plan only, writes nothing
+//   orch_ingest_run(path, target, ...)    normalize a file source and load it
+//   orch_ingest_http(url, target, ...)    fetch a paginated API, then load it
+//   orch_ingest_state()                   resume cursors per source/resource
+//   orch_ingest_reset(source, resource)   forget a cursor
+//
+// Named parameters shared by run and http:
+//   disposition  'append' (default) | 'replace' | 'merge'
+//   primary_key  required by merge; comma-separated for a composite key
+//   max_nesting  depth at which arrays stop becoming child tables (default 3)
+//
+// Type inference is DuckDB's: the source is wrapped in a temp view over
+// read_json and DESCRIBEd, and only the resulting type strings cross into
+// Rust. Nothing here parses JSON records itself.
+// ========================================================================
+
+// Frees a yyjson doc on any exit path, including the throws below.
+struct YyDocGuard {
+	yyjson_ns::yyjson_doc *doc;
+	~YyDocGuard() {
+		if (doc) {
+			yyjson_ns::yyjson_doc_free(doc);
+		}
+	}
+};
+
+static const char *kIngestSrcView = "__orch_ingest_src";
+static const int64_t kIngestMaxNesting = 3;
+
+struct IngestColumn {
+	string name;
+	string type;
+};
+
+// One dataset's ledger rows, buffered until the data transaction commits.
+struct LedgerWrite {
+	string dataset;
+	string parent_dataset;
+	string hash;
+	string columns_json;
+	int64_t version = 1;
+	bool new_version = false;
+	// kind, column, from, to, ddl
+	std::vector<std::array<string, 5>> changes;
+};
+
+// What one load did. Returned by IngestLoadPath so both the file and the HTTP
+// entry points report the same thing.
+struct IngestResult {
+	int64_t tables_written = 0;
+	int64_t rows_inserted = 0;
+	int64_t rows_deleted = 0;
+	int64_t schema_changes = 0;
+	string root_dataset;
+	std::vector<string> datasets;
+	std::vector<string> parents; // parallel to datasets; empty for the root
+};
+
+// DESCRIBE a relation. `exists` comes back false when the relation is absent,
+// which is how a first-ever load is told apart from a repeat load.
+static std::vector<IngestColumn> DescribeRelation(Connection &con, const string &relation,
+                                                   bool &exists) {
+	std::vector<IngestColumn> cols;
+	auto r = con.Query("DESCRIBE " + relation);
+	if (!r || r->HasError()) {
+		exists = false;
+		return cols;
+	}
+	exists = true;
+	for (idx_t i = 0; i < r->RowCount(); i++) {
+		IngestColumn c;
+		c.name = r->GetValue(0, i).ToString();
+		c.type = r->GetValue(1, i).ToString();
+		cols.push_back(c);
+	}
+	return cols;
+}
+
+static string IngestColumnsToJson(const std::vector<IngestColumn> &cols) {
+	std::ostringstream oss;
+	oss << "[";
+	for (size_t i = 0; i < cols.size(); i++) {
+		if (i) oss << ",";
+		oss << "{\"name\":" << JsonEscape(cols[i].name) << ",\"type\":"
+		    << JsonEscape(cols[i].type) << "}";
+	}
+	oss << "]";
+	return oss.str();
+}
+
+static string IngestStringsToJson(const std::vector<string> &items) {
+	std::ostringstream oss;
+	oss << "[";
+	for (size_t i = 0; i < items.size(); i++) {
+		if (i) oss << ",";
+		oss << JsonEscape(items[i]);
+	}
+	oss << "]";
+	return oss.str();
+}
+
+// Stable fingerprint of a table's shape, used to decide whether the ledger
+// needs a new version row.
+static string IngestSchemaHash(const std::vector<IngestColumn> &cols) {
+	std::ostringstream canon;
+	for (auto &c : cols) {
+		canon << c.name << ' ' << c.type << '\n';
+	}
+	return ComputeCodeVersion(canon.str());
+}
+
+static string IngestTrim(const string &s) {
+	size_t b = s.find_first_not_of(" \t\n\r");
+	if (b == string::npos) {
+		return string();
+	}
+	size_t e = s.find_last_not_of(" \t\n\r");
+	return s.substr(b, e - b + 1);
+}
+
+static string IngestQuoteIdent(const string &s) {
+	string out = "\"";
+	for (char c : s) {
+		out += (c == '"') ? "\"\"" : string(1, c);
+	}
+	out += "\"";
+	return out;
+}
+
+// The row number is what makes `_orch_id` derivable without hashing row
+// content — a content hash would change every id whenever a column appeared.
+static void CreateIngestSourceView(Connection &con, const string &path) {
+	std::ostringstream sql;
+	sql << "CREATE OR REPLACE TEMP VIEW " << kIngestSrcView
+	    << " AS SELECT *, row_number() OVER () AS \"__orch_rn\" FROM read_json("
+	    << SqlEscape(path) << ", union_by_name = true, sample_size = -1)";
+	auto r = con.Query(sql.str());
+	if (r->HasError()) {
+		throw InvalidInputException("orch_ingest: cannot read " + path + ": " + r->GetError());
+	}
+}
+
+static void DropIngestSourceView(Connection &con) {
+	con.Query(string("DROP VIEW IF EXISTS ") + kIngestSrcView);
+}
+
+static string BuildIngestPlanJson(Connection &con, const string &target, const string &load_id,
+                                   int64_t max_nesting) {
+	bool exists = false;
+	auto cols = DescribeRelation(con, kIngestSrcView, exists);
+	if (!exists) {
+		throw InvalidInputException("orch_ingest: source view could not be described");
+	}
+	std::ostringstream spec;
+	spec << "{\"target\":" << JsonEscape(target) << ",\"source_relation\":\""
+	     << kIngestSrcView << "\",\"load_id\":" << JsonEscape(load_id)
+	     << ",\"row_key\":\"__orch_rn\",\"max_nesting\":" << max_nesting
+	     << ",\"columns\":" << IngestColumnsToJson(cols) << "}";
+	string spec_json = spec.str();
+
+	bool ok = false;
+	auto plan = CallRustString(
+	    [&](uint8_t **op, size_t *ol) {
+		    return orch_ingest_plan(reinterpret_cast<const uint8_t *>(spec_json.c_str()),
+		                             spec_json.size(), op, ol);
+	        },
+	    ok);
+	if (!ok) {
+		throw InvalidInputException("orch_ingest: plan failed: " + plan);
+	}
+	return plan;
+}
+
+static string IngestJsonStr(yyjson_ns::yyjson_val *obj, const char *key) {
+	auto v = yyjson_ns::yyjson_obj_get(obj, key);
+	if (!v || !yyjson_ns::yyjson_is_str(v)) {
+		return string();
+	}
+	return string(yyjson_ns::yyjson_get_str(v));
+}
+
+static int64_t IngestJsonInt(yyjson_ns::yyjson_val *obj, const char *key) {
+	auto v = yyjson_ns::yyjson_obj_get(obj, key);
+	if (!v) return 0;
+	if (yyjson_ns::yyjson_is_int(v)) return yyjson_ns::yyjson_get_int(v);
+	if (yyjson_ns::yyjson_is_uint(v)) return (int64_t)yyjson_ns::yyjson_get_uint(v);
+	return 0;
+}
+
+static bool IngestJsonBool(yyjson_ns::yyjson_val *obj, const char *key) {
+	auto v = yyjson_ns::yyjson_obj_get(obj, key);
+	return v && yyjson_ns::yyjson_is_true(v);
+}
+
+// Collect a JSON array of strings into a message, for error reporting.
+static string IngestJoinErrors(yyjson_ns::yyjson_val *arr) {
+	std::ostringstream em;
+	if (!arr || !yyjson_ns::yyjson_is_arr(arr)) {
+		return string();
+	}
+	size_t i, max;
+	yyjson_ns::yyjson_val *e;
+	yyjson_arr_foreach(arr, i, max, e) {
+		const char *s = yyjson_ns::yyjson_get_str(e);
+		if (s) em << (i ? "; " : "") << s;
+	}
+	return em.str();
+}
+
+static void IngestExec(Connection &con, const string &sql, const string &what) {
+	auto r = con.Query(sql);
+	if (r->HasError()) {
+		throw InvalidInputException("orch_ingest: " + what + " failed: " + r->GetError() +
+		                            "\n  SQL: " + sql);
+	}
+}
+
+// Run a statement and return the row count DuckDB reports for it.
+static int64_t IngestExecCount(Connection &con, const string &sql, const string &what) {
+	auto r = con.Query(sql);
+	if (r->HasError()) {
+		throw InvalidInputException("orch_ingest: " + what + " failed: " + r->GetError() +
+		                            "\n  SQL: " + sql);
+	}
+	if (r->RowCount() > 0) {
+		return r->GetValue(0, 0).GetValue<int64_t>();
+	}
+	return 0;
+}
+
+static string IngestNamedStr(const FunctionParameters &parameters, const char *key,
+                              const string &fallback) {
+	auto it = parameters.named_parameters.find(key);
+	if (it == parameters.named_parameters.end() || it->second.IsNull()) {
+		return fallback;
+	}
+	return it->second.ToString();
+}
+
+static int64_t IngestNamedInt(const FunctionParameters &parameters, const char *key,
+                               int64_t fallback) {
+	auto it = parameters.named_parameters.find(key);
+	if (it == parameters.named_parameters.end() || it->second.IsNull()) {
+		return fallback;
+	}
+	return it->second.GetValue<int64_t>();
+}
+
+// ------------------------------------------------------------------------
+// The load itself: normalize `path` into `target` and enforce `disposition`.
+// Everything happens inside one transaction, so a schema change that cannot
+// be absorbed leaves the tables untouched.
+// ------------------------------------------------------------------------
+static IngestResult IngestLoadPath(Connection &con, const string &path, const string &target,
+                                    const string &disposition, const string &primary_key,
+                                    int64_t max_nesting, const string &load_id) {
+	IngestResult result;
+
+	CreateIngestSourceView(con, path);
+	string plan_json = BuildIngestPlanJson(con, target, load_id, max_nesting);
+
+	auto doc = yyjson_ns::yyjson_read(plan_json.c_str(), plan_json.size(), 0);
+	if (!doc) {
+		throw InvalidInputException("orch_ingest: invalid plan JSON");
+	}
+	YyDocGuard doc_guard{doc};
+	auto root = yyjson_ns::yyjson_doc_get_root(doc);
+
+	string catalog_name = IngestJsonStr(root, "catalog");
+	string schema_name = IngestJsonStr(root, "schema");
+	if (!schema_name.empty()) {
+		string qualified_schema = catalog_name.empty()
+		                              ? IngestQuoteIdent(schema_name)
+		                              : IngestQuoteIdent(catalog_name) + "." +
+		                                    IngestQuoteIdent(schema_name);
+		IngestExec(con, "CREATE SCHEMA IF NOT EXISTS " + qualified_schema, "schema creation");
+	}
+
+	// Dataset keys carry catalog and schema so two destinations can hold
+	// same-named tables without colliding in the ledger.
+	string prefix;
+	if (!catalog_name.empty()) prefix += catalog_name + ".";
+	if (!schema_name.empty()) prefix += schema_name + ".";
+
+	IngestExec(con, "BEGIN TRANSACTION", "transaction start");
+
+	string root_qualified;
+	std::vector<std::array<string, 2>> prune_tables; // qualified, depth
+	std::vector<LedgerWrite> ledger;
+
+	auto tables = yyjson_ns::yyjson_obj_get(root, "tables");
+	if (tables && yyjson_ns::yyjson_is_arr(tables)) {
+		size_t ti, tmax;
+		yyjson_ns::yyjson_val *t;
+		yyjson_arr_foreach(tables, ti, tmax, t) {
+			string tname = IngestJsonStr(t, "name");
+			string qualified = IngestJsonStr(t, "qualified");
+			string parent = IngestJsonStr(t, "parent");
+			int64_t depth = IngestJsonInt(t, "depth");
+			string dataset = prefix + tname;
+			string parent_dataset = parent.empty() ? string() : prefix + parent;
+			string create_sql = IngestJsonStr(t, "create_sql");
+			string insert_sql = IngestJsonStr(t, "insert_sql");
+
+			if (depth == 0) {
+				root_qualified = qualified;
+				result.root_dataset = dataset;
+			}
+			{
+				std::array<string, 2> pt;
+				pt[0] = qualified;
+				pt[1] = std::to_string(depth);
+				prune_tables.push_back(pt);
+			}
+			result.datasets.push_back(dataset);
+			result.parents.push_back(parent_dataset);
+
+			auto cols_val = yyjson_ns::yyjson_obj_get(t, "columns");
+			size_t cl = 0;
+			char *cols_raw = cols_val ? yyjson_ns::yyjson_val_write(cols_val, 0, &cl) : nullptr;
+			string new_cols_json = cols_raw ? string(cols_raw, cl) : string("[]");
+			if (cols_raw) free(cols_raw);
+
+			bool exists = false;
+			auto old_cols = DescribeRelation(con, qualified, exists);
+
+			// kind, column, from, to, ddl
+			std::vector<std::array<string, 5>> changes;
+
+			if (!exists) {
+				IngestExec(con, create_sql, "create " + tname);
+				changes.push_back({"table_created", "", "", "", create_sql});
+			} else {
+				std::ostringstream dspec;
+				dspec << "{\"table\":" << JsonEscape(qualified) << ",\"old\":"
+				      << IngestColumnsToJson(old_cols) << ",\"new\":" << new_cols_json << "}";
+				string dspec_json = dspec.str();
+				bool dok = false;
+				auto diff_json = CallRustString(
+				    [&](uint8_t **op, size_t *ol) {
+					    return orch_ingest_schema_diff(
+					        reinterpret_cast<const uint8_t *>(dspec_json.c_str()),
+					        dspec_json.size(), op, ol);
+				        },
+				    dok);
+				if (!dok) {
+					throw InvalidInputException("orch_ingest: schema diff failed: " + diff_json);
+				}
+				auto ddoc = yyjson_ns::yyjson_read(diff_json.c_str(), diff_json.size(), 0);
+				if (!ddoc) {
+					throw InvalidInputException("orch_ingest: invalid diff JSON");
+				}
+				YyDocGuard ddoc_guard{ddoc};
+				auto droot = yyjson_ns::yyjson_doc_get_root(ddoc);
+
+				string errs = IngestJoinErrors(yyjson_ns::yyjson_obj_get(droot, "errors"));
+				if (!errs.empty()) {
+					throw InvalidInputException(
+					    "orch_ingest: schema change cannot be absorbed: " + errs);
+				}
+
+				auto chs = yyjson_ns::yyjson_obj_get(droot, "changes");
+				if (chs && yyjson_ns::yyjson_is_arr(chs)) {
+					size_t chi, chmax;
+					yyjson_ns::yyjson_val *ch;
+					yyjson_arr_foreach(chs, chi, chmax, ch) {
+						string ddl = IngestJsonStr(ch, "ddl");
+						if (!ddl.empty()) {
+							IngestExec(con, ddl, "schema evolution on " + tname);
+						}
+						changes.push_back({IngestJsonStr(ch, "kind"), IngestJsonStr(ch, "column"),
+						                   IngestJsonStr(ch, "from"), IngestJsonStr(ch, "to"), ddl});
+					}
+				}
+			}
+
+			result.rows_inserted += IngestExecCount(con, insert_sql, "insert into " + tname);
+			result.tables_written++;
+
+			// Ledger: a new version only when the shape actually moved.
+			// Reads are fine inside the transaction; the writes are deferred
+			// until after COMMIT because DuckDB refuses to let one transaction
+			// write to two catalogs, and the target may live in an attached
+			// lakehouse while `__orch__` lives in the local file.
+			bool post_ok = false;
+			auto post_cols = DescribeRelation(con, qualified, post_ok);
+			LedgerWrite lw;
+			lw.dataset = dataset;
+			lw.parent_dataset = parent_dataset;
+			lw.hash = IngestSchemaHash(post_cols);
+			lw.columns_json = IngestColumnsToJson(post_cols);
+			lw.version = 1;
+			lw.changes = changes;
+			string prev_hash;
+			{
+				std::ostringstream s;
+				s << "SELECT version, schema_hash FROM __orch__.ingest_schemas WHERE dataset = "
+				  << SqlEscape(dataset) << " ORDER BY version DESC LIMIT 1";
+				auto r = con.Query(s.str());
+				if (!r->HasError() && r->RowCount() > 0) {
+					lw.version = r->GetValue(0, 0).GetValue<int64_t>();
+					prev_hash = r->GetValue(1, 0).ToString();
+				}
+			}
+			lw.new_version = prev_hash.empty() || prev_hash != lw.hash;
+			if (lw.new_version && !prev_hash.empty()) {
+				lw.version += 1;
+			}
+			ledger.push_back(lw);
+			result.schema_changes += (int64_t)changes.size();
+		}
+	}
+
+	// ---- write disposition ------------------------------------------------
+	if (!root_qualified.empty()) {
+		bool root_ok = false;
+		auto root_cols = DescribeRelation(con, root_qualified, root_ok);
+		std::vector<string> root_names;
+		for (auto &c : root_cols) {
+			root_names.push_back(c.name);
+		}
+		std::vector<string> key_cols;
+		{
+			string cur;
+			for (char c : primary_key) {
+				if (c == ',') {
+					if (!cur.empty()) key_cols.push_back(IngestTrim(cur));
+					cur.clear();
+				} else {
+					cur += c;
+				}
+			}
+			if (!cur.empty()) key_cols.push_back(IngestTrim(cur));
+		}
+
+		std::ostringstream ps;
+		ps << "{\"disposition\":" << JsonEscape(disposition) << ",\"load_id\":"
+		   << JsonEscape(load_id) << ",\"root\":" << JsonEscape(root_qualified) << ",\"tables\":[";
+		for (size_t i = 0; i < prune_tables.size(); i++) {
+			if (i) ps << ",";
+			ps << "{\"qualified\":" << JsonEscape(prune_tables[i][0]) << ",\"depth\":"
+			   << prune_tables[i][1] << "}";
+		}
+		ps << "],\"primary_key\":" << IngestStringsToJson(key_cols)
+		   << ",\"root_columns\":" << IngestStringsToJson(root_names) << "}";
+		string ps_json = ps.str();
+
+		bool pok = false;
+		auto prune_json = CallRustString(
+		    [&](uint8_t **op, size_t *ol) {
+			    return orch_ingest_prune(reinterpret_cast<const uint8_t *>(ps_json.c_str()),
+			                              ps_json.size(), op, ol);
+		        },
+		    pok);
+		if (!pok) {
+			throw InvalidInputException("orch_ingest: prune planning failed: " + prune_json);
+		}
+		auto pdoc = yyjson_ns::yyjson_read(prune_json.c_str(), prune_json.size(), 0);
+		if (!pdoc) {
+			throw InvalidInputException("orch_ingest: invalid prune JSON");
+		}
+		YyDocGuard pdoc_guard{pdoc};
+		auto proot = yyjson_ns::yyjson_doc_get_root(pdoc);
+		string perrs = IngestJoinErrors(yyjson_ns::yyjson_obj_get(proot, "errors"));
+		if (!perrs.empty()) {
+			throw InvalidInputException("orch_ingest: " + perrs);
+		}
+		auto stmts = yyjson_ns::yyjson_obj_get(proot, "statements");
+		if (stmts && yyjson_ns::yyjson_is_arr(stmts)) {
+			size_t si, smax;
+			yyjson_ns::yyjson_val *st;
+			yyjson_arr_foreach(stmts, si, smax, st) {
+				const char *sql = yyjson_ns::yyjson_get_str(st);
+				if (!sql) continue;
+				string statement(sql);
+				if (statement.rfind("DELETE", 0) == 0) {
+					result.rows_deleted += IngestExecCount(con, statement, "prune");
+				} else {
+					IngestExec(con, statement, "prune");
+				}
+			}
+		}
+	}
+
+	IngestExec(con, "COMMIT", "transaction commit");
+
+	// Ledger writes land only once the data they describe is durable, so a
+	// version can never claim a shape that was rolled back.
+	for (auto &lw : ledger) {
+		if (lw.new_version) {
+			std::ostringstream s;
+			s << "INSERT INTO __orch__.ingest_schemas (dataset, version, schema_hash, "
+			  << "parent_dataset, columns_json) VALUES (" << SqlEscape(lw.dataset) << ", "
+			  << lw.version << ", " << SqlEscape(lw.hash) << ", "
+			  << (lw.parent_dataset.empty() ? string("NULL") : SqlEscape(lw.parent_dataset))
+			  << ", " << SqlEscape(lw.columns_json) << ")";
+			IngestExec(con, s.str(), "ledger version for " + lw.dataset);
+		}
+		for (auto &c : lw.changes) {
+			std::ostringstream s;
+			s << "INSERT INTO __orch__.ingest_schema_changes (dataset, version, change_kind, "
+			  << "column_name, from_type, to_type, ddl) VALUES (" << SqlEscape(lw.dataset) << ", "
+			  << lw.version << ", " << SqlEscape(c[0]) << ", " << SqlEscape(c[1]) << ", "
+			  << SqlEscape(c[2]) << ", " << SqlEscape(c[3]) << ", " << SqlEscape(c[4]) << ")";
+			IngestExec(con, s.str(), "ledger change for " + lw.dataset);
+		}
+	}
+
+	DropIngestSourceView(con);
+	return result;
+}
+
+// ------------------------------------------------------------------------
+// Lineage: the loaded tables become Assets, so the sensor, freshness and
+// visualization machinery sees them like any other Asset. The source URI is
+// recorded as the upstream dataset.
+// ------------------------------------------------------------------------
+static void RecordIngestLineage(Connection &con, const string &source_uri,
+                                 const IngestResult &result, const string &load_id,
+                                 const string &source_kind) {
+	for (size_t i = 0; i < result.datasets.size(); i++) {
+		const string &ds = result.datasets[i];
+		std::ostringstream a;
+		a << "INSERT OR REPLACE INTO __orch__.assets (name, kind, location, group_name, "
+		  << "description, defined_by_task) VALUES (" << SqlEscape(ds) << ", 'table', "
+		  << SqlEscape(ds) << ", 'ingest', "
+		  << SqlEscape("ingested from " + source_uri) << ", " << SqlEscape("ingest:" + ds) << ")";
+		IngestExec(con, a.str(), "asset registration");
+
+		std::ostringstream m;
+		m << "INSERT OR REPLACE INTO __orch__.asset_materializations (asset_name, partition_key, "
+		  << "materialized_at, run_id, rows, status) VALUES (" << SqlEscape(ds)
+		  << ", '__default__', CURRENT_TIMESTAMP, CAST(" << SqlEscape(load_id) << " AS UUID), "
+		  << (i == 0 ? result.rows_inserted : 0) << ", 'success')";
+		IngestExec(con, m.str(), "materialization record");
+
+		if (!result.parents[i].empty()) {
+			std::ostringstream e;
+			e << "INSERT OR REPLACE INTO __orch__.asset_edges (upstream_asset, downstream_asset, "
+			  << "via_task, edge_type) VALUES (" << SqlEscape(result.parents[i]) << ", "
+			  << SqlEscape(ds) << ", " << SqlEscape("ingest:" + result.root_dataset)
+			  << ", 'ingest')";
+			IngestExec(con, e.str(), "asset edge");
+		}
+	}
+
+	if (!result.root_dataset.empty()) {
+		std::ostringstream l;
+		l << "INSERT OR REPLACE INTO __orch__.lineage_edges (src_dataset, dst_dataset, via_task, "
+		  << "transform_type, source) VALUES (" << SqlEscape(source_kind + "://" + source_uri)
+		  << ", " << SqlEscape(result.root_dataset) << ", "
+		  << SqlEscape("ingest:" + result.root_dataset) << ", 'ingest', 'ingest')";
+		IngestExec(con, l.str(), "lineage edge");
+	}
+}
+
+// PRAGMA orch_ingest_preview('path', 'target') — plan only, writes nothing.
+static string OrchIngestPreviewPragma(ClientContext &context,
+                                       const FunctionParameters &parameters) {
+	if (parameters.values.size() < 2) {
+		throw InvalidInputException("orch_ingest_preview requires (path, target)");
+	}
+	string path = parameters.values[0].GetValue<string>();
+	string target = parameters.values[1].GetValue<string>();
+	int64_t max_nesting = IngestNamedInt(parameters, "max_nesting", kIngestMaxNesting);
+
+	Connection con(*context.db);
+	EnsureOrchSchema(con);
+	CreateIngestSourceView(con, path);
+	string plan_json;
+	try {
+		plan_json = BuildIngestPlanJson(con, target, "preview", max_nesting);
+	} catch (...) {
+		DropIngestSourceView(con);
+		throw;
+	}
+	DropIngestSourceView(con);
+
+	auto doc = yyjson_ns::yyjson_read(plan_json.c_str(), plan_json.size(), 0);
+	if (!doc) {
+		throw InvalidInputException("orch_ingest_preview: invalid plan JSON");
+	}
+	YyDocGuard doc_guard{doc};
+	auto root = yyjson_ns::yyjson_doc_get_root(doc);
+
+	std::ostringstream q;
+	q << "SELECT * FROM (VALUES ";
+	bool first = true;
+
+	auto tables = yyjson_ns::yyjson_obj_get(root, "tables");
+	if (tables && yyjson_ns::yyjson_is_arr(tables)) {
+		size_t ti, tmax;
+		yyjson_ns::yyjson_val *t;
+		yyjson_arr_foreach(tables, ti, tmax, t) {
+			string tname = IngestJsonStr(t, "name");
+			int64_t depth = IngestJsonInt(t, "depth");
+			auto cols = yyjson_ns::yyjson_obj_get(t, "columns");
+			if (!cols || !yyjson_ns::yyjson_is_arr(cols)) continue;
+			size_t ci, cmax;
+			yyjson_ns::yyjson_val *c;
+			yyjson_arr_foreach(cols, ci, cmax, c) {
+				if (!first) q << ", ";
+				first = false;
+				q << "(" << SqlEscape(tname) << ", " << depth << "::BIGINT, "
+				  << SqlEscape(IngestJsonStr(c, "name")) << ", "
+				  << SqlEscape(IngestJsonStr(c, "type")) << ")";
+			}
+		}
+	}
+
+	auto warnings = yyjson_ns::yyjson_obj_get(root, "warnings");
+	if (warnings && yyjson_ns::yyjson_is_arr(warnings)) {
+		size_t wi, wmax;
+		yyjson_ns::yyjson_val *w;
+		yyjson_arr_foreach(warnings, wi, wmax, w) {
+			const char *msg = yyjson_ns::yyjson_get_str(w);
+			if (!msg) continue;
+			if (!first) q << ", ";
+			first = false;
+			q << "('(warning)', -1::BIGINT, '', " << SqlEscape(string(msg)) << ")";
+		}
+	}
+
+	if (first) {
+		return "SELECT NULL::VARCHAR AS table_name, NULL::BIGINT AS depth, "
+		       "NULL::VARCHAR AS column_name, NULL::VARCHAR AS column_type WHERE false";
+	}
+	q << ") AS t(table_name, depth, column_name, column_type)";
+	return q.str();
+}
+
+// Shared bookkeeping around a load: the row in `ingest_loads` is written
+// before the work starts, so a failure still leaves a trace.
+static string IngestBegin(Connection &con, const string &source, const string &target,
+                           const string &disposition, const string &source_kind) {
+	string load_id;
+	auto r = con.Query("SELECT uuid()::VARCHAR");
+	if (r->HasError() || r->RowCount() == 0) {
+		throw InvalidInputException("orch_ingest: cannot generate load id");
+	}
+	load_id = r->GetValue(0, 0).ToString();
+
+	std::ostringstream s;
+	s << "INSERT INTO __orch__.ingest_loads (load_id, source, dataset, write_disposition, "
+	  << "source_kind, tables_written, rows_inserted, rows_deleted, started_at, status) VALUES ("
+	  << SqlEscape(load_id) << ", " << SqlEscape(source) << ", " << SqlEscape(target) << ", "
+	  << SqlEscape(disposition.empty() ? string("append") : disposition) << ", "
+	  << SqlEscape(source_kind) << ", 0, 0, 0, CURRENT_TIMESTAMP, 'running')";
+	IngestExec(con, s.str(), "load bookkeeping");
+	return load_id;
+}
+
+static void IngestMarkFailed(Connection &con, const string &load_id, const string &msg) {
+	con.Query("ROLLBACK");
+	std::ostringstream s;
+	s << "UPDATE __orch__.ingest_loads SET status = 'failed', finished_at = CURRENT_TIMESTAMP, "
+	  << "error_message = " << SqlEscape(msg) << " WHERE load_id = " << SqlEscape(load_id);
+	con.Query(s.str());
+	DropIngestSourceView(con);
+}
+
+static void IngestMarkDone(Connection &con, const string &load_id, const IngestResult &result,
+                            bool truncated) {
+	std::ostringstream s;
+	s << "UPDATE __orch__.ingest_loads SET status = 'success', finished_at = CURRENT_TIMESTAMP, "
+	  << "tables_written = " << result.tables_written
+	  << ", rows_inserted = " << result.rows_inserted
+	  << ", rows_deleted = " << result.rows_deleted
+	  << ", truncated = " << (truncated ? "true" : "false")
+	  << " WHERE load_id = " << SqlEscape(load_id);
+	IngestExec(con, s.str(), "load bookkeeping");
+}
+
+static string IngestSummarySelect(const string &load_id, const string &target,
+                                   const IngestResult &result, bool truncated) {
+	std::ostringstream out;
+	out << "SELECT " << SqlEscape(load_id) << " AS load_id, " << SqlEscape(target)
+	    << " AS dataset, " << result.tables_written << "::BIGINT AS tables_written, "
+	    << result.rows_inserted << "::BIGINT AS rows_inserted, " << result.rows_deleted
+	    << "::BIGINT AS rows_deleted, " << result.schema_changes << "::BIGINT AS schema_changes, "
+	    << (truncated ? "true" : "false") << " AS truncated";
+	return out.str();
+}
+
+// PRAGMA orch_ingest_run('path', 'target', disposition=..., primary_key=...)
+static string OrchIngestRunPragma(ClientContext &context, const FunctionParameters &parameters) {
+	if (parameters.values.size() < 2) {
+		throw InvalidInputException("orch_ingest_run requires (path, target)");
+	}
+	string path = parameters.values[0].GetValue<string>();
+	string target = parameters.values[1].GetValue<string>();
+	string disposition = IngestNamedStr(parameters, "disposition", "append");
+	string primary_key = IngestNamedStr(parameters, "primary_key", "");
+	int64_t max_nesting = IngestNamedInt(parameters, "max_nesting", kIngestMaxNesting);
+
+	Connection con(*context.db);
+	EnsureOrchSchema(con);
+	string load_id = IngestBegin(con, path, target, disposition, "file");
+
+	IngestResult result;
+	try {
+		result = IngestLoadPath(con, path, target, disposition, primary_key, max_nesting, load_id);
+		RecordIngestLineage(con, path, result, load_id, "file");
+	} catch (std::exception &e) {
+		IngestMarkFailed(con, load_id, e.what());
+		throw;
+	}
+	IngestMarkDone(con, load_id, result, false);
+	return IngestSummarySelect(load_id, target, result, false);
+}
+
+// ------------------------------------------------------------------------
+// HTTP source
+// ------------------------------------------------------------------------
+
+// Resolve a bearer token from a DuckDB secret. The value never enters the
+// task text or the ledger — only the secret's name does.
+static string IngestSecretToken(ClientContext &context, const string &secret_name) {
+	if (secret_name.empty()) {
+		return string();
+	}
+	auto &manager = SecretManager::Get(context);
+	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
+	auto entry = manager.GetSecretByName(transaction, secret_name);
+	if (!entry || !entry->secret) {
+		throw InvalidInputException("orch_ingest_http: no secret named '" + secret_name + "'");
+	}
+	const auto *kv = dynamic_cast<const KeyValueSecret *>(entry->secret.get());
+	if (!kv) {
+		throw InvalidInputException("orch_ingest_http: secret '" + secret_name +
+		                            "' is not a key-value secret");
+	}
+	static const char *keys[] = {"token", "bearer_token", "key", "api_key", "password"};
+	for (auto key : keys) {
+		Value v;
+		if (kv->TryGetValue(key, v) && !v.IsNull()) {
+			string s = v.ToString();
+			if (!s.empty()) {
+				return s;
+			}
+		}
+	}
+	throw InvalidInputException("orch_ingest_http: secret '" + secret_name +
+	                            "' has no token/bearer_token/key/api_key/password value");
+}
+
+static string IngestTempDir(const string &load_id) {
+	const char *base = std::getenv("TMPDIR");
+	if (!base || !*base) {
+		base = std::getenv("TEMP");
+	}
+	if (!base || !*base) {
+		base = "/tmp";
+	}
+	string dir(base);
+	if (!dir.empty() && dir[dir.size() - 1] != '/' && dir[dir.size() - 1] != '\\') {
+		dir += "/";
+	}
+	return dir + "duckorch_ingest_" + load_id;
+}
+
+// PRAGMA orch_ingest_http('url', 'target', secret=..., paginate=..., ...)
+static string OrchIngestHttpPragma(ClientContext &context, const FunctionParameters &parameters) {
+	if (parameters.values.size() < 2) {
+		throw InvalidInputException("orch_ingest_http requires (url, target)");
+	}
+	string url = parameters.values[0].GetValue<string>();
+	string target = parameters.values[1].GetValue<string>();
+	string disposition = IngestNamedStr(parameters, "disposition", "append");
+	string primary_key = IngestNamedStr(parameters, "primary_key", "");
+	int64_t max_nesting = IngestNamedInt(parameters, "max_nesting", kIngestMaxNesting);
+	string paginate = IngestNamedStr(parameters, "paginate", "none");
+	string records_path = IngestNamedStr(parameters, "records_path", "");
+	string cursor_path = IngestNamedStr(parameters, "cursor_path", "");
+	string cursor_param = IngestNamedStr(parameters, "cursor_param", "");
+	string page_param = IngestNamedStr(parameters, "page_param", "");
+	string resource = IngestNamedStr(parameters, "resource", "default");
+	string secret_name = IngestNamedStr(parameters, "secret", "");
+	string token = IngestNamedStr(parameters, "token", "");
+	int64_t max_pages = IngestNamedInt(parameters, "max_pages", 100);
+
+	Connection con(*context.db);
+	EnsureOrchSchema(con);
+	if (token.empty() && !secret_name.empty()) {
+		token = IngestSecretToken(context, secret_name);
+	}
+
+	string load_id = IngestBegin(con, url, target, disposition, "http");
+
+	// Resume from wherever the previous run of this resource stopped.
+	string cursor_in;
+	{
+		std::ostringstream s;
+		s << "SELECT cursor_value FROM __orch__.ingest_state WHERE source = " << SqlEscape(url)
+		  << " AND resource = " << SqlEscape(resource);
+		auto r = con.Query(s.str());
+		if (!r->HasError() && r->RowCount() > 0 && !r->GetValue(0, 0).IsNull()) {
+			cursor_in = r->GetValue(0, 0).ToString();
+		}
+	}
+
+	string out_dir = IngestTempDir(load_id);
+	IngestResult result;
+	bool truncated = false;
+	try {
+		std::ostringstream fs;
+		fs << "{\"url\":" << JsonEscape(url) << ",\"out_dir\":" << JsonEscape(out_dir)
+		   << ",\"paginate\":" << JsonEscape(paginate) << ",\"records_path\":"
+		   << JsonEscape(records_path) << ",\"cursor_path\":" << JsonEscape(cursor_path)
+		   << ",\"cursor_param\":" << JsonEscape(cursor_param) << ",\"page_param\":"
+		   << JsonEscape(page_param) << ",\"cursor_in\":" << JsonEscape(cursor_in)
+		   << ",\"max_pages\":" << max_pages << ",\"headers\":[";
+		if (!token.empty()) {
+			fs << "[\"Authorization\"," << JsonEscape("Bearer " + token) << "]";
+		}
+		fs << "]}";
+		string fs_json = fs.str();
+
+		bool fok = false;
+		auto fetch_json = CallRustString(
+		    [&](uint8_t **op, size_t *ol) {
+			    return orch_ingest_fetch(reinterpret_cast<const uint8_t *>(fs_json.c_str()),
+			                              fs_json.size(), op, ol);
+		        },
+		    fok);
+		if (!fok) {
+			throw InvalidInputException("orch_ingest_http: fetch failed: " + fetch_json);
+		}
+		auto fdoc = yyjson_ns::yyjson_read(fetch_json.c_str(), fetch_json.size(), 0);
+		if (!fdoc) {
+			throw InvalidInputException("orch_ingest_http: invalid fetch JSON");
+		}
+		YyDocGuard fdoc_guard{fdoc};
+		auto froot = yyjson_ns::yyjson_doc_get_root(fdoc);
+		int64_t records = IngestJsonInt(froot, "records");
+		string cursor_out = IngestJsonStr(froot, "cursor_out");
+		truncated = IngestJsonBool(froot, "truncated");
+
+		auto pages = yyjson_ns::yyjson_obj_get(froot, "pages");
+		if (pages && yyjson_ns::yyjson_is_arr(pages)) {
+			size_t pi, pmax;
+			yyjson_ns::yyjson_val *pg;
+			yyjson_arr_foreach(pages, pi, pmax, pg) {
+				std::ostringstream s;
+				s << "INSERT INTO __orch__.ingest_fetches (load_id, page, url, http_status, "
+				  << "bytes, records, file_path) VALUES (" << SqlEscape(load_id) << ", "
+				  << IngestJsonInt(pg, "page") << ", " << SqlEscape(IngestJsonStr(pg, "url"))
+				  << ", " << IngestJsonInt(pg, "status") << ", " << IngestJsonInt(pg, "bytes")
+				  << ", " << IngestJsonInt(pg, "records") << ", "
+				  << SqlEscape(IngestJsonStr(pg, "file")) << ")";
+				IngestExec(con, s.str(), "fetch bookkeeping");
+			}
+		}
+
+		// An empty fetch is a successful no-op, not a load of nothing: there
+		// is no shape to infer, so the tables are left exactly as they are.
+		if (records > 0) {
+			result = IngestLoadPath(con, out_dir + "/part-*.jsonl", target, disposition,
+			                        primary_key, max_nesting, load_id);
+			RecordIngestLineage(con, url, result, load_id, "http");
+		}
+
+		std::ostringstream st;
+		st << "INSERT OR REPLACE INTO __orch__.ingest_state (source, resource, cursor_value, "
+		   << "cursor_kind, last_load_id, updated_at) VALUES (" << SqlEscape(url) << ", "
+		   << SqlEscape(resource) << ", " << SqlEscape(cursor_out) << ", "
+		   << SqlEscape(paginate) << ", " << SqlEscape(load_id) << ", CURRENT_TIMESTAMP)";
+		IngestExec(con, st.str(), "cursor state");
+	} catch (std::exception &e) {
+		IngestMarkFailed(con, load_id, e.what());
+		throw;
+	}
+
+	IngestMarkDone(con, load_id, result, truncated);
+	return IngestSummarySelect(load_id, target, result, truncated);
+}
+
+// PRAGMA orch_ingest_state — resume cursors, newest first.
+static string OrchIngestStatePragma(ClientContext &context,
+                                     const FunctionParameters &parameters) {
+	Connection con(*context.db);
+	EnsureOrchSchema(con);
+	return "SELECT source, resource, cursor_value, cursor_kind, last_load_id, updated_at "
+	       "FROM __orch__.ingest_state ORDER BY updated_at DESC";
+}
+
+// PRAGMA orch_ingest_reset('source', 'resource') — forget a cursor so the
+// next run starts from the beginning.
+static void OrchIngestResetPragma(ClientContext &context,
+                                   const FunctionParameters &parameters) {
+	if (parameters.values.size() < 2) {
+		throw InvalidInputException("orch_ingest_reset requires (source, resource)");
+	}
+	string source = parameters.values[0].GetValue<string>();
+	string resource = parameters.values[1].GetValue<string>();
+	Connection con(*context.db);
+	EnsureOrchSchema(con);
+	std::ostringstream s;
+	s << "DELETE FROM __orch__.ingest_state WHERE source = " << SqlEscape(source)
+	  << " AND resource = " << SqlEscape(resource);
+	IngestExec(con, s.str(), "cursor reset");
+}
+
+// ========================================================================
 // Extension entry
 // ========================================================================
 
@@ -3746,6 +5046,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "orch_sensor_set_interval",
 	    static_cast<pragma_function_t>(OrchSensorSetIntervalPragma),
 	    {LogicalType::BIGINT}));
+	loader.RegisterFunction(PragmaFunction::PragmaCall(
+	    "orch_restate", static_cast<pragma_function_t>(OrchRestatePragma),
+	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}));
 
 	// Phase 17: Dynamic Asset surface (Snowflake compat).
 	loader.RegisterFunction(PragmaFunction::PragmaCall(
@@ -3757,6 +5060,45 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "orch_dynamic_refresh",
 	    static_cast<pragma_function_t>(OrchDynamicRefreshPragma),
 	    {LogicalType::VARCHAR}));
+
+	// Phase 19: JSON ingestion. preview/run/http/state are `pragma_query_t`
+	// (they return rows); reset is a side-effect pragma.
+	{
+		auto preview = PragmaFunction::PragmaCall(
+		    "orch_ingest_preview", OrchIngestPreviewPragma,
+		    {LogicalType::VARCHAR, LogicalType::VARCHAR});
+		preview.named_parameters["max_nesting"] = LogicalType::BIGINT;
+		loader.RegisterFunction(std::move(preview));
+
+		auto run = PragmaFunction::PragmaCall("orch_ingest_run", OrchIngestRunPragma,
+		                                       {LogicalType::VARCHAR, LogicalType::VARCHAR});
+		run.named_parameters["disposition"] = LogicalType::VARCHAR;
+		run.named_parameters["primary_key"] = LogicalType::VARCHAR;
+		run.named_parameters["max_nesting"] = LogicalType::BIGINT;
+		loader.RegisterFunction(std::move(run));
+
+		auto http = PragmaFunction::PragmaCall("orch_ingest_http", OrchIngestHttpPragma,
+		                                        {LogicalType::VARCHAR, LogicalType::VARCHAR});
+		http.named_parameters["disposition"] = LogicalType::VARCHAR;
+		http.named_parameters["primary_key"] = LogicalType::VARCHAR;
+		http.named_parameters["max_nesting"] = LogicalType::BIGINT;
+		http.named_parameters["paginate"] = LogicalType::VARCHAR;
+		http.named_parameters["records_path"] = LogicalType::VARCHAR;
+		http.named_parameters["cursor_path"] = LogicalType::VARCHAR;
+		http.named_parameters["cursor_param"] = LogicalType::VARCHAR;
+		http.named_parameters["page_param"] = LogicalType::VARCHAR;
+		http.named_parameters["resource"] = LogicalType::VARCHAR;
+		http.named_parameters["secret"] = LogicalType::VARCHAR;
+		http.named_parameters["token"] = LogicalType::VARCHAR;
+		http.named_parameters["max_pages"] = LogicalType::BIGINT;
+		loader.RegisterFunction(std::move(http));
+
+		loader.RegisterFunction(PragmaFunction::PragmaStatement(
+		    "orch_ingest_state", OrchIngestStatePragma));
+		loader.RegisterFunction(PragmaFunction::PragmaCall(
+		    "orch_ingest_reset", static_cast<pragma_function_t>(OrchIngestResetPragma),
+		    {LogicalType::VARCHAR, LogicalType::VARCHAR}));
+	}
 }
 
 void DuckorchExtension::Load(ExtensionLoader &loader) {
