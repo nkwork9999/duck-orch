@@ -1031,3 +1031,122 @@ pub extern "C" fn orch_target_lag_parse(
     }))
     .unwrap_or(-1)
 }
+
+// ---------------------------------------------------------------------------
+// Ingestion (orch_ingest) — Phase 19 P0
+// ---------------------------------------------------------------------------
+
+/// Build a normalization plan. Input is a `PlanSpec` JSON carrying the target
+/// table, the source relation and the column types DuckDB inferred; output is
+/// a `Plan` JSON with one entry per table, each holding ready-to-run DDL and
+/// INSERT text.
+#[unsafe(no_mangle)]
+pub extern "C" fn orch_ingest_plan(
+    spec_ptr: *const u8,
+    spec_len: usize,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        let json = unsafe { read_str(spec_ptr, spec_len) };
+        let spec: orch_ingest::PlanSpec = match serde_json::from_str(json) {
+            Ok(s) => s,
+            Err(e) => {
+                return err_to_buf(&format!("invalid ingest plan spec: {}", e), out_ptr, out_len)
+            }
+        };
+        let plan = orch_ingest::build_plan(&spec);
+        write_out(
+            serde_json::to_string(&plan).unwrap_or_default(),
+            out_ptr,
+            out_len,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+/// Compare a table's current columns against the shape the incoming data
+/// wants. Returns the changes plus the DDL that absorbs them, and an error
+/// list for changes P0 refuses to apply.
+#[unsafe(no_mangle)]
+pub extern "C" fn orch_ingest_schema_diff(
+    spec_ptr: *const u8,
+    spec_len: usize,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        let json = unsafe { read_str(spec_ptr, spec_len) };
+        let spec: orch_ingest::DiffSpec = match serde_json::from_str(json) {
+            Ok(s) => s,
+            Err(e) => {
+                return err_to_buf(&format!("invalid ingest diff spec: {}", e), out_ptr, out_len)
+            }
+        };
+        let out = orch_ingest::diff(&spec);
+        write_out(
+            serde_json::to_string(&out).unwrap_or_default(),
+            out_ptr,
+            out_len,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+/// Statements that enforce a write disposition after the rows have been
+/// appended. Input is a `PruneSpec` JSON; output `{statements, disposition,
+/// errors}`.
+#[unsafe(no_mangle)]
+pub extern "C" fn orch_ingest_prune(
+    spec_ptr: *const u8,
+    spec_len: usize,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        let json = unsafe { read_str(spec_ptr, spec_len) };
+        let spec: orch_ingest::PruneSpec = match serde_json::from_str(json) {
+            Ok(s) => s,
+            Err(e) => {
+                return err_to_buf(&format!("invalid ingest prune spec: {}", e), out_ptr, out_len)
+            }
+        };
+        let out = orch_ingest::prune(&spec);
+        write_out(
+            serde_json::to_string(&out).unwrap_or_default(),
+            out_ptr,
+            out_len,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+/// Fetch a paginated HTTP source into JSONL part files. Input is a
+/// `FetchSpec` JSON with the request already carrying resolved headers;
+/// output `{files, pages, records, cursor_out, truncated}`.
+#[unsafe(no_mangle)]
+pub extern "C" fn orch_ingest_fetch(
+    spec_ptr: *const u8,
+    spec_len: usize,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        let json = unsafe { read_str(spec_ptr, spec_len) };
+        let spec: orch_ingest::FetchSpec = match serde_json::from_str(json) {
+            Ok(s) => s,
+            Err(e) => {
+                return err_to_buf(&format!("invalid ingest fetch spec: {}", e), out_ptr, out_len)
+            }
+        };
+        match orch_ingest::fetch(&spec) {
+            Ok(out) => write_out(
+                serde_json::to_string(&out).unwrap_or_default(),
+                out_ptr,
+                out_len,
+            ),
+            Err(e) => err_to_buf(&e, out_ptr, out_len),
+        }
+    }))
+    .unwrap_or(-1)
+}

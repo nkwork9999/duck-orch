@@ -1,0 +1,327 @@
+# name: test/sql/duckorch_ingest.test
+# description: Phase 19 — normalization, schema ledger, dispositions, catalog, lineage
+# group: [sql]
+
+require duckorch
+
+statement ok
+CREATE SCHEMA raw;
+
+# ---------------------------------------------------------------------------
+# preview plans without touching the database
+# ---------------------------------------------------------------------------
+
+query TITT
+PRAGMA orch_ingest_preview('test/fixtures/ingest/simple.jsonl', 'raw.preview_orders');
+----
+preview_orders	0	_orch_id	VARCHAR
+preview_orders	0	_orch_load_id	VARCHAR
+preview_orders	0	id	BIGINT
+preview_orders__tags	1	_orch_id	VARCHAR
+preview_orders__tags	1	_orch_parent_id	VARCHAR
+preview_orders__tags	1	_orch_index	BIGINT
+preview_orders__tags	1	_orch_load_id	VARCHAR
+preview_orders__tags	1	value	VARCHAR
+
+query I
+SELECT COUNT(*)::INTEGER FROM duckdb_tables() WHERE table_name LIKE 'preview_orders%';
+----
+0
+
+# ---------------------------------------------------------------------------
+# first load: nested objects flatten, arrays become child tables
+# ---------------------------------------------------------------------------
+
+statement ok
+PRAGMA orch_ingest_run('test/fixtures/ingest/orders_day1.jsonl', 'raw.orders');
+
+query I
+SELECT COUNT(*)::INTEGER FROM raw.orders;
+----
+2
+
+query I
+SELECT COUNT(*)::INTEGER FROM raw.orders__items;
+----
+3
+
+query I
+SELECT COUNT(*)::INTEGER FROM raw.orders__items__tags;
+----
+3
+
+query TT
+SELECT customer__name, customer__city FROM raw.orders ORDER BY id;
+----
+tanaka	tokyo
+sato	osaka
+
+# every child row resolves to exactly one parent
+query I
+SELECT COUNT(*)::INTEGER
+FROM raw.orders__items i
+JOIN raw.orders o ON o._orch_id = i._orch_parent_id;
+----
+3
+
+query I
+SELECT COUNT(*)::INTEGER
+FROM raw.orders__items__tags t
+JOIN raw.orders__items i ON i._orch_id = t._orch_parent_id;
+----
+3
+
+# array position is preserved
+query TI
+SELECT i.sku, i._orch_index::INTEGER
+FROM raw.orders__items i
+JOIN raw.orders o ON o._orch_id = i._orch_parent_id
+WHERE o.id = 1
+ORDER BY i._orch_index;
+----
+A-1	0
+B-7	1
+
+# ledger: one version per table, root has no parent
+query TIT
+SELECT dataset, version::INTEGER, COALESCE(parent_dataset, '-')
+FROM __orch__.ingest_schemas
+ORDER BY dataset;
+----
+raw.orders	1	-
+raw.orders__items	1	raw.orders
+raw.orders__items__tags	1	raw.orders__items
+
+query I
+SELECT COUNT(*)::INTEGER
+FROM __orch__.ingest_schema_changes
+WHERE change_kind = 'table_created';
+----
+3
+
+query TII
+SELECT status, tables_written::INTEGER, rows_inserted::INTEGER
+FROM __orch__.ingest_loads;
+----
+success	3	8
+
+# ---------------------------------------------------------------------------
+# second load: appends, absorbs a new column and a widened type
+# ---------------------------------------------------------------------------
+
+statement ok
+PRAGMA orch_ingest_run('test/fixtures/ingest/orders_day2.jsonl', 'raw.orders');
+
+query I
+SELECT COUNT(*)::INTEGER FROM raw.orders;
+----
+3
+
+query I
+SELECT COUNT(*)::INTEGER FROM raw.orders__items;
+----
+4
+
+# the new key landed as a column; earlier rows take NULL
+query TT
+SELECT COALESCE(customer__tier, '-'), code::VARCHAR FROM raw.orders ORDER BY id;
+----
+-	5
+-	6
+gold	x7
+
+query TTT
+SELECT change_kind, column_name, to_type
+FROM __orch__.ingest_schema_changes
+WHERE dataset = 'raw.orders' AND change_kind <> 'table_created'
+ORDER BY column_name;
+----
+type_widened	code	VARCHAR
+column_added	customer__tier	VARCHAR
+
+# the shape moved, so the ledger carries a second version
+query I
+SELECT MAX(version)::INTEGER FROM __orch__.ingest_schemas WHERE dataset = 'raw.orders';
+----
+2
+
+# unchanged tables keep their version
+query I
+SELECT MAX(version)::INTEGER FROM __orch__.ingest_schemas WHERE dataset = 'raw.orders__items';
+----
+1
+
+# both loads are recorded, and ids carry their load prefix
+query I
+SELECT COUNT(*)::INTEGER FROM __orch__.ingest_loads WHERE status = 'success';
+----
+2
+
+query I
+SELECT COUNT(DISTINCT split_part(_orch_id, '#', 1))::INTEGER FROM raw.orders;
+----
+2
+
+# ---------------------------------------------------------------------------
+# a type change that cannot be absorbed stops the load
+# ---------------------------------------------------------------------------
+
+statement error
+PRAGMA orch_ingest_run('test/fixtures/ingest/orders_bad.jsonl', 'raw.orders');
+----
+incompatible type change
+
+# nothing was written, and the failure is on record
+query I
+SELECT COUNT(*)::INTEGER FROM raw.orders;
+----
+3
+
+query TT
+SELECT status, error_message IS NOT NULL
+FROM __orch__.ingest_loads
+WHERE status = 'failed';
+----
+failed	true
+
+# ---------------------------------------------------------------------------
+# merge replaces the rows whose key came back, children included
+# ---------------------------------------------------------------------------
+
+statement ok
+PRAGMA orch_ingest_run('test/fixtures/ingest/merge_a.jsonl', 'raw.m_orders');
+
+query I
+SELECT COUNT(*)::INTEGER FROM raw.m_orders;
+----
+2
+
+statement ok
+PRAGMA orch_ingest_run('test/fixtures/ingest/merge_b.jsonl', 'raw.m_orders', disposition = 'merge', primary_key = 'id');
+
+query IT
+SELECT id::INTEGER, v FROM raw.m_orders ORDER BY id;
+----
+1	A2
+2	b
+3	c
+
+# the old row's children went with it; only the new ones remain
+query T
+SELECT string_agg(value, ',' ORDER BY value) FROM raw.m_orders__tags;
+----
+y,z
+
+query I
+SELECT rows_deleted::INTEGER FROM __orch__.ingest_loads
+WHERE write_disposition = 'merge';
+----
+2
+
+# merge without a key is refused before anything is written
+statement error
+PRAGMA orch_ingest_run('test/fixtures/ingest/merge_b.jsonl', 'raw.m_orders', disposition = 'merge');
+----
+primary_key
+
+query I
+SELECT COUNT(*)::INTEGER FROM raw.m_orders;
+----
+3
+
+# ---------------------------------------------------------------------------
+# replace keeps only the newest load
+# ---------------------------------------------------------------------------
+
+statement ok
+PRAGMA orch_ingest_run('test/fixtures/ingest/merge_a.jsonl', 'raw.r_orders');
+
+statement ok
+PRAGMA orch_ingest_run('test/fixtures/ingest/merge_b.jsonl', 'raw.r_orders', disposition = 'replace');
+
+query IT
+SELECT id::INTEGER, v FROM raw.r_orders ORDER BY id;
+----
+1	A2
+3	c
+
+query T
+SELECT string_agg(value, ',' ORDER BY value) FROM raw.r_orders__tags;
+----
+y,z
+
+# ---------------------------------------------------------------------------
+# a three-part target lands in an attached catalog
+# ---------------------------------------------------------------------------
+
+statement ok
+ATTACH ':memory:' AS lake;
+
+statement ok
+PRAGMA orch_ingest_run('test/fixtures/ingest/merge_a.jsonl', 'lake.staging.orders');
+
+query I
+SELECT COUNT(*)::INTEGER FROM lake.staging.orders;
+----
+2
+
+query TI
+SELECT dataset, version::INTEGER FROM __orch__.ingest_schemas
+WHERE dataset LIKE 'lake.%' ORDER BY dataset;
+----
+lake.staging.orders	1
+lake.staging.orders__tags	1
+
+# ---------------------------------------------------------------------------
+# loaded tables become assets, with the source as upstream
+# ---------------------------------------------------------------------------
+
+query TT
+SELECT name, group_name FROM __orch__.assets
+WHERE name = 'raw.m_orders';
+----
+raw.m_orders	ingest
+
+query I
+SELECT COUNT(*)::INTEGER FROM __orch__.asset_edges
+WHERE upstream_asset = 'raw.m_orders' AND downstream_asset = 'raw.m_orders__tags';
+----
+1
+
+# one upstream edge per distinct source file this table was fed from
+query I
+SELECT COUNT(*)::INTEGER FROM __orch__.lineage_edges
+WHERE dst_dataset = 'raw.m_orders' AND src_dataset LIKE 'file://%';
+----
+2
+
+# one materialization per successful load — this asset had two
+query I
+SELECT COUNT(*)::INTEGER FROM __orch__.asset_materializations
+WHERE asset_name = 'raw.m_orders';
+----
+2
+
+# ---------------------------------------------------------------------------
+# resume cursors can be listed and forgotten
+# ---------------------------------------------------------------------------
+
+statement ok
+INSERT INTO __orch__.ingest_state (source, resource, cursor_value, cursor_kind, last_load_id)
+VALUES ('https://api.example.com/orders', 'default', 'c42', 'cursor', 'L1');
+
+statement ok
+PRAGMA orch_ingest_state;
+
+query TTTT
+SELECT source, resource, cursor_value, cursor_kind FROM __orch__.ingest_state;
+----
+https://api.example.com/orders	default	c42	cursor
+
+statement ok
+PRAGMA orch_ingest_reset('https://api.example.com/orders', 'default');
+
+query I
+SELECT COUNT(*)::INTEGER FROM __orch__.ingest_state;
+----
+0
