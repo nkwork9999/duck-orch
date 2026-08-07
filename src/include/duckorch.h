@@ -129,4 +129,34 @@ int32_t orch_missing_intervals_for(const uint8_t *cond_dsl_ptr, size_t cond_dsl_
                                     const uint8_t *ctx_json_ptr, size_t ctx_json_len,
                                     uint8_t **out_ptr, size_t *out_len);
 
+// Phase 19 (ingestion, P0)
+
+// `orch_ingest_plan` turns the column types DuckDB inferred for a JSON source
+// into a normalization plan: one entry per parent/child table with its
+// CREATE TABLE and INSERT text. Input is a PlanSpec JSON
+// (`{target, source_relation, load_id, row_key, max_nesting, columns}`);
+// output is `{schema, tables: [...], warnings: [...]}`.
+int32_t orch_ingest_plan(const uint8_t *spec_ptr, size_t spec_len,
+                          uint8_t **out_ptr, size_t *out_len);
+
+// `orch_ingest_schema_diff` compares a table's current columns with the shape
+// the incoming data wants. Input `{table, old: [...], new: [...]}`; output
+// `{changes: [{kind, column, from, to, ddl}], errors: [...]}`. Errors are the
+// changes P0 refuses to absorb.
+int32_t orch_ingest_schema_diff(const uint8_t *spec_ptr, size_t spec_len,
+                                 uint8_t **out_ptr, size_t *out_len);
+
+// `orch_ingest_prune` returns the statements that enforce a write disposition
+// once the rows are already appended. Input `{disposition, load_id, root,
+// tables, primary_key, root_columns}`; output `{statements, disposition,
+// errors}`. `append` yields no statements.
+int32_t orch_ingest_prune(const uint8_t *spec_ptr, size_t spec_len,
+                           uint8_t **out_ptr, size_t *out_len);
+
+// `orch_ingest_fetch` pulls a paginated HTTP source into JSONL part files.
+// Input is a FetchSpec JSON whose `headers` already carry resolved
+// credentials; output `{files, pages, records, cursor_out, truncated}`.
+int32_t orch_ingest_fetch(const uint8_t *spec_ptr, size_t spec_len,
+                           uint8_t **out_ptr, size_t *out_len);
+
 }

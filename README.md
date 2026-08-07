@@ -244,6 +244,16 @@ duck-orch [--db <path>] [--ext <path>] <subcommand> [--json]
   dynamic create <name> --target-lag <dur> --sql <inline>
   dynamic create-from-sql <file>       Parse Snowflake-style file, register each block
   dynamic migrate-from-snowflake <file>      Alias of create-from-sql
+
+# JSON ingestion (Phase 19)
+  ingest preview <path> <target>       Tables the source would produce; writes nothing
+  ingest run <path> <target> [--disposition append|replace|merge]
+                                       [--primary-key <cols>] [--max-nesting N]
+  ingest http <url> <target> [--secret <name> | --token <t>] [--paginate ...]
+  ingest schema [<dataset>]            Schema ledger versions
+  ingest changes [<dataset>]           What each version changed
+  ingest loads [--limit N]             Load history, failures included
+  ingest state / ingest reset <source> <resource>
 ```
 
 Pass `--json` to any subcommand for Claude / agent-parseable output.
@@ -344,7 +354,47 @@ SELECT * FROM __orch__.asset_partitions;             -- Phase 14
 SELECT * FROM __orch__.automation_evaluations;       -- Phase 15
 SELECT * FROM __orch__.asset_checks;                 -- Phase 16
 SELECT * FROM __orch__.asset_check_results;          -- Phase 16
+SELECT * FROM __orch__.ingest_schemas;               -- Phase 19
+SELECT * FROM __orch__.ingest_schema_changes;        -- Phase 19
+SELECT * FROM __orch__.ingest_loads;                 -- Phase 19
+SELECT * FROM __orch__.ingest_state;                 -- Phase 19
+SELECT * FROM __orch__.ingest_fetches;               -- Phase 19
 ```
+
+### JSON ingestion (Phase 19)
+
+Nested JSON becomes flat parent/child tables, and a schema ledger absorbs
+columns that appear later. Type inference is DuckDB's own: the source is read
+through `read_json` and the resulting types drive the normalization.
+
+```sql
+-- see the shape first; nothing is written
+PRAGMA orch_ingest_preview('orders.jsonl', 'raw.orders');
+
+-- load a file source
+PRAGMA orch_ingest_run('orders/*.jsonl', 'raw.orders');
+PRAGMA orch_ingest_run('orders.jsonl', 'raw.orders',
+                       disposition = 'merge', primary_key = 'id');
+
+-- load an API, resuming from the cursor the previous run stored
+CREATE SECRET orders_api (TYPE http, BEARER_TOKEN '...');
+PRAGMA orch_ingest_http('https://api.example.com/orders', 'raw.orders',
+                        secret = 'orders_api', paginate = 'cursor',
+                        records_path = 'data', cursor_path = 'meta.next',
+                        cursor_param = 'cursor', resource = 'orders');
+
+PRAGMA orch_ingest_state;
+PRAGMA orch_ingest_reset('https://api.example.com/orders', 'orders');
+```
+
+| | |
+|---|---|
+| **Normalization** | Structs flatten into the parent (`customer__name`); arrays become child tables (`orders__items`). Control columns `_orch_id` / `_orch_parent_id` / `_orch_index` / `_orch_load_id` link and order the rows. `max_nesting` (default 3) caps how deep child tables go; anything deeper stays a JSON string column. |
+| **Schema ledger** | `ingest_schemas` gains a version only when the shape actually moves. Added columns and widening types (`INTEGER → BIGINT`, anything → `VARCHAR`) are absorbed with `ALTER`; an incompatible change fails the load with the column named. Columns that vanish stay and take NULLs. |
+| **Dispositions** | `append` (default), `replace` (keep only this load), `merge` (needs `primary_key`; replaces earlier rows whose key came back, children included). |
+| **HTTP** | `none` / `page` / `offset` / `cursor` / `link` pagination, bearer token from a DuckDB secret, resume cursor in `ingest_state`, per-page log in `ingest_fetches`. A `max_pages` ceiling is reported as `truncated`, never silently. |
+| **Destination** | A three-part target (`lake.raw.orders`) loads into an attached catalog, so a DuckLake lakehouse is just a different target. |
+| **Lineage** | Loaded tables register as Assets with a materialization per load, parent→child asset edges, and a `file://` / `http://` upstream in `lineage_edges`. |
 
 ---
 

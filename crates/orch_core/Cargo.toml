@@ -14,6 +14,7 @@ orch_dag = { path = "../orch_dag" }
 orch_lineage = { path = "../orch_lineage" }
 orch_runtime = { path = "../orch_runtime" }
 orch_ol = { path = "../orch_ol" }
+orch_ingest = { path = "../orch_ingest" }
 
 # External deps still used at this layer (FFI shims)
 serde = { version = "1", features = ["derive"] }

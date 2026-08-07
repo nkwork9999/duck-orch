@@ -1,0 +1,2 @@
+{"id":1,"code":5,"when":"2026-01-01","customer":{"name":"tanaka","city":"tokyo"},"items":[{"sku":"A-1","qty":2,"tags":["x","y"]},{"sku":"B-7","qty":1,"tags":[]}]}
+{"id":2,"code":6,"when":"2026-01-02","customer":{"name":"sato","city":"osaka"},"items":[{"sku":"C-3","qty":5,"tags":["z"]}]}
