@@ -396,9 +396,6 @@ PRAGMA orch_ingest_reset('https://api.example.com/orders', 'orders');
 | **Destination** | A three-part target (`lake.raw.orders`) loads into an attached catalog, so a DuckLake lakehouse is just a different target. |
 | **Lineage** | Loaded tables register as Assets with a materialization per load, parent→child asset edges, and a `file://` / `http://` upstream in `lineage_edges`. |
 
-Design record, with the reasoning behind each decision and the open gaps:
-[docs/ingest-design.md](docs/ingest-design.md).
-
 ---
 
 ## Architecture
