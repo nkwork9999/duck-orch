@@ -77,6 +77,21 @@ Outputs:
 - `build/release/extension/duckorch/duckorch.duckdb_extension` — extension binary
 - `target/release/duck-orch` — standalone CLI
 
+Verify the local runtime without creating a database file:
+
+```bash
+cargo run -p duckorch_cli -- doctor \\
+  --ext build/release/extension/duckorch/duckorch.duckdb_extension
+cargo run -p duckorch_cli -- doctor --json
+```
+
+`doctor` checks the DuckDB executable, database-parent existence and write
+permissions, extension path/suffix/size/readability, in-memory loading, and 20
+registered orchestration capabilities (core parsing/DAG APIs, init/register/run,
+visualization/tests, assets/partitions/backfill, automation/sensor, checks, and
+dynamic assets). JSON output includes a schema version plus total/pass/fail counts;
+the command exits non-zero if any readiness check fails.
+
 ### 2. Define tasks
 
 ```sql

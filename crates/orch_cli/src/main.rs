@@ -13,6 +13,7 @@ USAGE:
     duck-orch [--db <path>] [--ext <path>] <subcommand> [args] [--json]
 
 SUBCOMMANDS:
+    doctor                   Check DuckDB, extension path, and in-memory loading
     register <dir>           Load tasks from a directory of .sql files
     run                      Execute the DAG
     status                   Show recent task runs
@@ -180,6 +181,300 @@ fn run_sql(args: &Args, sql: &str, json_mode: bool) -> Result<(String, String, i
 
 fn sql_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DoctorCheck {
+    name: &'static str,
+    ok: bool,
+    detail: String,
+}
+
+fn doctor_report_json(checks: &[DoctorCheck]) -> serde_json::Value {
+    let passed = checks.iter().filter(|check| check.ok).count();
+    serde_json::json!({
+        "schemaVersion": 1,
+        "ok": checks.iter().all(|check| check.ok),
+        "summary": {
+            "total": checks.len(),
+            "passed": passed,
+            "failed": checks.len() - passed,
+        },
+        "checks": checks.iter().map(|check| serde_json::json!({
+            "name": check.name,
+            "ok": check.ok,
+            "detail": check.detail,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+const DOCTOR_CAPABILITIES: [&str; 20] = [
+    "orch_hello",
+    "orch_extract_io",
+    "orch_parse_task",
+    "orch_build_dag",
+    "orch_render_mermaid",
+    "orch_downstream_of",
+    "orch_init",
+    "orch_register",
+    "orch_run",
+    "orch_visualize",
+    "orch_test",
+    "orch_asset_list",
+    "orch_asset_health",
+    "orch_asset_partitions",
+    "orch_backfill",
+    "orch_automation_status",
+    "orch_sensor_status",
+    "orch_check_run",
+    "orch_dynamic_list",
+    "orch_dynamic_refresh",
+];
+
+fn doctor_capability_sql(extension_path: &str) -> String {
+    let names = DOCTOR_CAPABILITIES
+        .iter()
+        .map(|name| sql_escape(name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "LOAD {}; SELECT DISTINCT function_name FROM duckdb_functions() \
+         WHERE function_name IN ({}) ORDER BY function_name;",
+        sql_escape(extension_path),
+        names
+    )
+}
+
+fn run_doctor_sql(bin: &str, sql: &str) -> std::io::Result<std::process::Output> {
+    Command::new(bin)
+        .arg(":memory:")
+        .arg("-init")
+        .arg("/dev/null")
+        .arg("-unsigned")
+        .arg("-csv")
+        .arg("-noheader")
+        .arg("-c")
+        .arg(sql)
+        .output()
+}
+
+fn cmd_doctor(args: &Args) -> i32 {
+    let bin = duckdb_bin();
+    let mut checks = Vec::new();
+    let duckdb_ok = match Command::new(&bin).arg("--version").output() {
+        Ok(output) if output.status.success() => {
+            let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            checks.push(DoctorCheck {
+                name: "duckdb",
+                ok: true,
+                detail: if version.is_empty() {
+                    bin.clone()
+                } else {
+                    version
+                },
+            });
+            true
+        }
+        Ok(output) => {
+            checks.push(DoctorCheck {
+                name: "duckdb",
+                ok: false,
+                detail: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            });
+            false
+        }
+        Err(error) => {
+            checks.push(DoctorCheck {
+                name: "duckdb",
+                ok: false,
+                detail: format!("{}: {}", bin, error),
+            });
+            false
+        }
+    };
+
+    let database_parent = if args.db == ":memory:" {
+        std::path::Path::new(".")
+    } else {
+        std::path::Path::new(&args.db)
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."))
+    };
+    let database_parent_ok = database_parent.is_dir();
+    checks.push(DoctorCheck {
+        name: "database-parent",
+        ok: database_parent_ok,
+        detail: database_parent.display().to_string(),
+    });
+    let database_parent_writable = std::fs::metadata(database_parent)
+        .map(|metadata| !metadata.permissions().readonly())
+        .unwrap_or(false);
+    checks.push(DoctorCheck {
+        name: "database-parent-writable",
+        ok: database_parent_writable,
+        detail: if database_parent_writable {
+            "filesystem permissions allow writes".to_string()
+        } else {
+            "database parent is read-only or unavailable".to_string()
+        },
+    });
+
+    let extension = args.ext.clone().or_else(auto_detect_ext);
+    let extension_ok = extension
+        .as_deref()
+        .is_some_and(|path| std::path::Path::new(path).is_file());
+    checks.push(DoctorCheck {
+        name: "extension",
+        ok: extension_ok,
+        detail: extension
+            .clone()
+            .unwrap_or_else(|| "not found; pass --ext or set DUCKORCH_EXT".to_string()),
+    });
+
+    let extension_suffix_ok = extension
+        .as_deref()
+        .is_some_and(|path| path.ends_with(".duckdb_extension"));
+    checks.push(DoctorCheck {
+        name: "extension-suffix",
+        ok: extension_suffix_ok,
+        detail: if extension_suffix_ok {
+            ".duckdb_extension".to_string()
+        } else {
+            "expected a .duckdb_extension file".to_string()
+        },
+    });
+
+    let extension_size = extension
+        .as_deref()
+        .and_then(|path| std::fs::metadata(path).ok())
+        .map(|metadata| metadata.len());
+    checks.push(DoctorCheck {
+        name: "extension-nonempty",
+        ok: extension_size.is_some_and(|size| size > 0),
+        detail: extension_size
+            .map(|size| format!("{} bytes", size))
+            .unwrap_or_else(|| "metadata unavailable".to_string()),
+    });
+
+    let extension_readable = extension
+        .as_deref()
+        .is_some_and(|path| std::fs::File::open(path).is_ok());
+    checks.push(DoctorCheck {
+        name: "extension-readable",
+        ok: extension_readable,
+        detail: if extension_readable {
+            "extension can be opened for reading".to_string()
+        } else {
+            "extension cannot be opened for reading".to_string()
+        },
+    });
+
+    if duckdb_ok && extension_ok {
+        let path = extension.as_deref().unwrap_or_default();
+        let sql = format!(
+            "LOAD {}; SELECT 'duckorch-ready' AS status;",
+            sql_escape(path)
+        );
+        let load = run_doctor_sql(&bin, &sql);
+        match load {
+            Ok(output) if output.status.success() => checks.push(DoctorCheck {
+                name: "load",
+                ok: true,
+                detail: "extension loaded in an in-memory DuckDB".to_string(),
+            }),
+            Ok(output) => checks.push(DoctorCheck {
+                name: "load",
+                ok: false,
+                detail: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            }),
+            Err(error) => checks.push(DoctorCheck {
+                name: "load",
+                ok: false,
+                detail: error.to_string(),
+            }),
+        }
+    } else {
+        checks.push(DoctorCheck {
+            name: "load",
+            ok: false,
+            detail: "skipped until DuckDB and extension checks pass".to_string(),
+        });
+    }
+
+    if duckdb_ok && extension_ok {
+        let path = extension.as_deref().unwrap_or_default();
+        match run_doctor_sql(&bin, &doctor_capability_sql(path)) {
+            Ok(output) if output.status.success() => {
+                let available = String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .map(|line| line.trim().trim_matches('"').to_string())
+                    .collect::<std::collections::HashSet<_>>();
+                for capability in DOCTOR_CAPABILITIES {
+                    let ok = available.contains(capability);
+                    checks.push(DoctorCheck {
+                        name: capability,
+                        ok,
+                        detail: if ok {
+                            "registered".to_string()
+                        } else {
+                            "missing from duckdb_functions()".to_string()
+                        },
+                    });
+                }
+            }
+            Ok(output) => {
+                let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                for capability in DOCTOR_CAPABILITIES {
+                    checks.push(DoctorCheck {
+                        name: capability,
+                        ok: false,
+                        detail: if detail.is_empty() {
+                            "capability query failed".to_string()
+                        } else {
+                            detail.clone()
+                        },
+                    });
+                }
+            }
+            Err(error) => {
+                for capability in DOCTOR_CAPABILITIES {
+                    checks.push(DoctorCheck {
+                        name: capability,
+                        ok: false,
+                        detail: error.to_string(),
+                    });
+                }
+            }
+        }
+    } else {
+        for capability in DOCTOR_CAPABILITIES {
+            checks.push(DoctorCheck {
+                name: capability,
+                ok: false,
+                detail: "skipped until DuckDB and extension checks pass".to_string(),
+            });
+        }
+    }
+
+    let report = doctor_report_json(&checks);
+    if args.json {
+        println!("{}", report);
+    } else {
+        for check in &checks {
+            println!(
+                "{} {:<10} {}",
+                if check.ok { "✓" } else { "✗" },
+                check.name,
+                check.detail
+            );
+        }
+    }
+    if report["ok"].as_bool().unwrap_or(false) {
+        0
+    } else {
+        1
+    }
 }
 
 fn cmd_register(args: &Args) -> i32 {
@@ -1225,6 +1520,7 @@ fn main() {
         Err(e) => { eprintln!("{}", e); std::process::exit(2); }
     };
     let code = match args.subcommand.as_str() {
+        "doctor" => cmd_doctor(&args),
         "register" => cmd_register(&args),
         "run" => cmd_run(&args),
         "status" => cmd_status(&args),
@@ -1289,6 +1585,40 @@ mod tests {
     fn sql_escape_quotes() {
         assert_eq!(sql_escape("o'brien"), "'o''brien'");
         assert_eq!(sql_escape("plain"), "'plain'");
+    }
+
+    #[test]
+    fn doctor_report_is_machine_readable_and_fails_closed() {
+        let report = doctor_report_json(&[
+            DoctorCheck {
+                name: "duckdb",
+                ok: true,
+                detail: "v1.5".into(),
+            },
+            DoctorCheck {
+                name: "extension",
+                ok: false,
+                detail: "missing".into(),
+            },
+        ]);
+        assert_eq!(report["ok"], false);
+        assert_eq!(report["schemaVersion"], 1);
+        assert_eq!(report["summary"]["total"], 2);
+        assert_eq!(report["summary"]["passed"], 1);
+        assert_eq!(report["summary"]["failed"], 1);
+        assert_eq!(report["checks"][0]["name"], "duckdb");
+        assert_eq!(report["checks"][1]["detail"], "missing");
+    }
+
+    #[test]
+    fn doctor_checks_twenty_extension_capabilities() {
+        assert_eq!(DOCTOR_CAPABILITIES.len(), 20);
+        assert!(DOCTOR_CAPABILITIES.contains(&"orch_register"));
+        assert!(DOCTOR_CAPABILITIES.contains(&"orch_dynamic_refresh"));
+        let sql = doctor_capability_sql("/tmp/duck'or.ch.duckdb_extension");
+        assert!(sql.contains("LOAD '/tmp/duck''or.ch.duckdb_extension'"));
+        assert!(sql.contains("duckdb_functions()"));
+        assert!(sql.contains("'orch_asset_partitions'"));
     }
 
     // Phase 17: regression test for the snowflake re-export through the CLI.
