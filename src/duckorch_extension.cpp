@@ -8,6 +8,7 @@
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/pragma_function.hpp"
 #include "duckdb/parser/parsed_data/create_pragma_function_info.hpp"
+#include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/common/vector_operations/unary_executor.hpp"
 #include "duckdb/common/vector_operations/binary_executor.hpp"
 #include "duckdb/common/vector_operations/ternary_executor.hpp"
@@ -106,24 +107,23 @@ static std::string CallRustString(CallFn &&fn, bool &ok) {
 // ========================================================================
 
 static void OrchHelloFunc(DataChunk &args, ExpressionState &state, Vector &result) {
-	UnaryExecutor::ExecuteWithNulls<string_t, string_t>(
+	UnaryExecutor::Execute<string_t, string_t>(
 	    args.data[0], result, args.size(),
-	    [&](string_t input, ValidityMask &mask, idx_t idx) -> string_t {
+	    [&](string_t input) -> optional<string_t> {
 		    uint8_t buf[256];
 		    int32_t n = orch_hello(reinterpret_cast<const uint8_t *>(input.GetData()),
 		                            input.GetSize(), buf, sizeof(buf));
 		    if (n < 0) {
-			    mask.SetInvalid(idx);
-			    return string_t();
+			    return {};
 		    }
 		    return StringVector::AddString(result, reinterpret_cast<const char *>(buf), n);
 	    });
 }
 
 static void OrchExtractIoFunc(DataChunk &args, ExpressionState &state, Vector &result) {
-	UnaryExecutor::ExecuteWithNulls<string_t, string_t>(
+	UnaryExecutor::Execute<string_t, string_t>(
 	    args.data[0], result, args.size(),
-	    [&](string_t sql, ValidityMask &mask, idx_t idx) -> string_t {
+	    [&](string_t sql) -> optional<string_t> {
 		    bool ok = false;
 		    auto json = CallRustString(
 		        [&](uint8_t **op, size_t *ol) {
@@ -132,8 +132,7 @@ static void OrchExtractIoFunc(DataChunk &args, ExpressionState &state, Vector &r
 		            },
 		        ok);
 		    if (!ok) {
-			    mask.SetInvalid(idx);
-			    return string_t();
+			    return {};
 		    }
 		    return StringVector::AddString(result, json);
 	    });
@@ -531,6 +530,9 @@ static void OrchInitPragma(ClientContext &context, const FunctionParameters &par
 // ========================================================================
 
 namespace yyjson_ns = duckdb_yyjson;
+using duckdb_yyjson::unsafe_yyjson_get_next;
+using duckdb_yyjson::yyjson_arr_get_first;
+using duckdb_yyjson::yyjson_arr_size;
 
 static string SqlEscape(const string &s) {
 	string out;
@@ -1095,14 +1097,14 @@ static string TasksToJson(Connection &con) {
 	for (idx_t i = 0; i < result->RowCount(); i++) {
 		if (!first) oss << ",";
 		first = false;
-		auto retries_v = result->GetValue(5, i);
-		auto incr_v = result->GetValue(6, i);
+		auto retries_v = result->Collection().GetValue(5, i);
+		auto incr_v = result->Collection().GetValue(6, i);
 		oss << "{"
-		    << "\"name\":" << JsonEscape(result->GetValue(0, i).ToString())
-		    << ",\"sql\":" << JsonEscape(result->GetValue(1, i).ToString())
-		    << ",\"inputs\":" << ListValueToJson(result->GetValue(2, i))
-		    << ",\"outputs\":" << ListValueToJson(result->GetValue(3, i))
-		    << ",\"depends_on\":" << ListValueToJson(result->GetValue(4, i))
+		    << "\"name\":" << JsonEscape(result->Collection().GetValue(0, i).ToString())
+		    << ",\"sql\":" << JsonEscape(result->Collection().GetValue(1, i).ToString())
+		    << ",\"inputs\":" << ListValueToJson(result->Collection().GetValue(2, i))
+		    << ",\"outputs\":" << ListValueToJson(result->Collection().GetValue(3, i))
+		    << ",\"depends_on\":" << ListValueToJson(result->Collection().GetValue(4, i))
 		    << ",\"retries\":" << (retries_v.IsNull() ? 0 : retries_v.GetValue<int32_t>())
 		    << ",\"incremental_by\":"
 		    << (incr_v.IsNull() ? "null" : JsonEscape(incr_v.ToString()))
@@ -1134,15 +1136,15 @@ static std::vector<TaskRow> LoadTaskRows(Connection &con) {
 	std::vector<TaskRow> out;
 	for (idx_t i = 0; i < result->RowCount(); i++) {
 		TaskRow r;
-		r.name = result->GetValue(0, i).ToString();
-		r.sql = result->GetValue(1, i).ToString();
-		auto rv = result->GetValue(2, i);
+		r.name = result->Collection().GetValue(0, i).ToString();
+		r.sql = result->Collection().GetValue(1, i).ToString();
+		auto rv = result->Collection().GetValue(2, i);
 		r.retries = rv.IsNull() ? 0 : rv.GetValue<int32_t>();
-		auto iv = result->GetValue(3, i);
+		auto iv = result->Collection().GetValue(3, i);
 		r.incremental_by = iv.IsNull() ? string() : iv.ToString();
-		auto pv = result->GetValue(4, i);
+		auto pv = result->Collection().GetValue(4, i);
 		r.partitions_json = pv.IsNull() ? string() : pv.ToString();
-		auto pmv = result->GetValue(5, i);
+		auto pmv = result->Collection().GetValue(5, i);
 		r.params_json = pmv.IsNull() ? string() : pmv.ToString();
 		out.push_back(std::move(r));
 	}
@@ -1157,7 +1159,7 @@ static string LookupLastProcessedAt(Connection &con, const string &task_name) {
 	  << " AND status = 'success'";
 	auto r = con.Query(q.str());
 	if (r->HasError() || r->RowCount() == 0) return "1970-01-01 00:00:00";
-	auto v = r->GetValue(0, 0);
+	auto v = r->Collection().GetValue(0, 0);
 	return v.IsNull() ? "1970-01-01 00:00:00" : v.ToString();
 }
 
@@ -1274,7 +1276,7 @@ static bool RunSingleTask(Connection &con, const TaskRow &task, const string &pi
                           const string &tasks_json,
                           const string &partition_key = "__default__",
                           int64_t interval_start = -1, int64_t interval_end = -1) {
-	auto run_uuid = con.Query("SELECT uuid()::VARCHAR")->GetValue(0, 0).ToString();
+	auto run_uuid = con.Query("SELECT uuid()::VARCHAR")->Collection().GetValue(0, 0).ToString();
 	string started = IsoNow();
 
 	// Phase 9 + DuckLake: lookup task inputs/outputs and resolve per-dataset namespace
@@ -1284,8 +1286,8 @@ static bool RunSingleTask(Connection &con, const TaskRow &task, const string &pi
 		auto tr = con.Query("SELECT inputs, outputs FROM __orch__.tasks WHERE name = " +
 		                    SqlEscape(task.name));
 		if (!tr->HasError() && tr->RowCount() > 0) {
-			auto iv = tr->GetValue(0, 0);
-			auto ov = tr->GetValue(1, 0);
+			auto iv = tr->Collection().GetValue(0, 0);
+			auto ov = tr->Collection().GetValue(1, 0);
 			if (!iv.IsNull()) {
 				for (auto &c : ListValue::GetChildren(iv)) {
 					string nm = c.ToString();
@@ -1308,7 +1310,7 @@ static bool RunSingleTask(Connection &con, const TaskRow &task, const string &pi
 	string now_ts;
 	{
 		auto nr = con.Query("SELECT current_timestamp::VARCHAR");
-		now_ts = nr->GetValue(0, 0).ToString();
+		now_ts = nr->Collection().GetValue(0, 0).ToString();
 	}
 	std::ostringstream vars;
 	vars << "{\"last_processed_at\":" << JsonEscape(last_at) << ",\"now\":" << JsonEscape(now_ts)
@@ -1409,18 +1411,19 @@ static bool RunSingleTask(Connection &con, const TaskRow &task, const string &pi
 			auto values = BuildParamValues(task.params_json, bound);
 			ran_ok = !stmts.empty();
 			for (auto &stmt : stmts) {
-				string one = stmt->query.substr(stmt->stmt_location, stmt->stmt_length);
+				string one = stmt->query.substr(stmt->stmt_location.Start(), stmt->stmt_location.length);
 				auto prepared = con.Prepare(one);
 				if (prepared->HasError()) {
 					this_err = prepared->GetError();
 					ran_ok = false;
 					break;
 				}
-				case_insensitive_map_t<BoundParameterData> bind_map;
+				identifier_map_t<BoundParameterData> bind_map;
 				for (auto &kv : values) {
-					if (prepared->named_param_map.find(kv.first) !=
-					    prepared->named_param_map.end()) {
-						bind_map.emplace(kv.first, BoundParameterData(kv.second));
+					Identifier key(kv.first);
+					if (prepared->GetNamedParameterMap().find(key) !=
+					    prepared->GetNamedParameterMap().end()) {
+						bind_map.emplace(std::move(key), BoundParameterData(kv.second));
 					}
 				}
 				auto qres = prepared->Execute(bind_map);
@@ -1454,12 +1457,12 @@ static bool RunSingleTask(Connection &con, const TaskRow &task, const string &pi
 		if (!task.incremental_by.empty()) {
 			auto out_r = con.Query("SELECT outputs[1] FROM __orch__.tasks WHERE name = " +
 			                        SqlEscape(task.name));
-			if (!out_r->HasError() && out_r->RowCount() > 0 && !out_r->GetValue(0, 0).IsNull()) {
-				string out_table = out_r->GetValue(0, 0).ToString();
+			if (!out_r->HasError() && out_r->RowCount() > 0 && !out_r->Collection().GetValue(0, 0).IsNull()) {
+				string out_table = out_r->Collection().GetValue(0, 0).ToString();
 				auto wm = con.Query("SELECT max(" + task.incremental_by + ")::VARCHAR FROM " +
 				                     out_table);
-				if (!wm->HasError() && wm->RowCount() > 0 && !wm->GetValue(0, 0).IsNull()) {
-					new_watermark = wm->GetValue(0, 0).ToString();
+				if (!wm->HasError() && wm->RowCount() > 0 && !wm->Collection().GetValue(0, 0).IsNull()) {
+					new_watermark = wm->Collection().GetValue(0, 0).ToString();
 				}
 			}
 		}
@@ -1502,7 +1505,7 @@ static bool RunSingleTask(Connection &con, const TaskRow &task, const string &pi
 			std::vector<string> asset_names;
 			if (!out_r->HasError()) {
 				for (idx_t i = 0; i < out_r->RowCount(); i++) {
-					asset_names.push_back(out_r->GetValue(0, i).ToString());
+					asset_names.push_back(out_r->Collection().GetValue(0, i).ToString());
 				}
 			}
 			bool any_error_failure = false;
@@ -1670,7 +1673,7 @@ static void OrchRunPragma(ClientContext &context, const FunctionParameters &para
 	for (auto &r : rows) by_name[r.name] = r;
 
 	auto uuid_result = con.Query("SELECT uuid()::VARCHAR");
-	string pipeline_run_id = uuid_result->GetValue(0, 0).ToString();
+	string pipeline_run_id = uuid_result->Collection().GetValue(0, 0).ToString();
 
 	std::mutex sk_mu;
 	std::set<string> failed_tasks;
@@ -1694,7 +1697,7 @@ static void OrchRunPragma(ClientContext &context, const FunctionParameters &para
 
 		// Mark skipped tasks
 		for (auto &name : to_skip) {
-			auto run_uuid = con.Query("SELECT uuid()::VARCHAR")->GetValue(0, 0).ToString();
+			auto run_uuid = con.Query("SELECT uuid()::VARCHAR")->Collection().GetValue(0, 0).ToString();
 			std::ostringstream ins;
 			ins << "INSERT INTO __orch__.runs (run_id, pipeline_run_id, task_name, started_at, "
 			    << "finished_at, status, rows_count, retry_count) VALUES ("
@@ -1875,7 +1878,7 @@ static bool EvalAssertion(Connection &con, const string &query, const string &as
 		error_out = "expected single value, got 0 rows";
 		return false;
 	}
-	auto v = r->GetValue(0, 0);
+	auto v = r->Collection().GetValue(0, 0);
 	int64_t actual = v.IsNull() ? 0 : v.GetValue<int64_t>();
 	if (verb == "expect") {
 		if (actual == bound) return true;
@@ -1905,9 +1908,9 @@ static void OrchTestPragma(ClientContext &context, const FunctionParameters &par
 	if (tests->HasError()) return;
 	int passed = 0, failed = 0;
 	for (idx_t i = 0; i < tests->RowCount(); i++) {
-		string task = tests->GetValue(0, i).ToString();
-		string q = tests->GetValue(2, i).ToString();
-		string a = tests->GetValue(3, i).ToString();
+		string task = tests->Collection().GetValue(0, i).ToString();
+		string q = tests->Collection().GetValue(2, i).ToString();
+		string a = tests->Collection().GetValue(3, i).ToString();
 		string err;
 		bool ok = EvalAssertion(con, q, a, err);
 		if (ok) {
@@ -1959,7 +1962,7 @@ static string OrchVisualizePragma(ClientContext &context, const FunctionParamete
 	string statuses_json = "[]";
 	auto stat_result = con.Query(stats_sql.str());
 	if (!stat_result->HasError() && stat_result->RowCount() > 0) {
-		auto v = stat_result->GetValue(0, 0).ToString();
+		auto v = stat_result->Collection().GetValue(0, 0).ToString();
 		if (!v.empty() && v != "NULL") {
 			// Convert from {task_name: x, status: y} to [x, y]
 			auto d = yyjson_ns::yyjson_read(v.c_str(), v.size(), 0);
@@ -2106,8 +2109,8 @@ static string OrchAssetLineagePragma(ClientContext &context,
 	   << " OR downstream_asset = " << SqlEscape(focal) << ";";
 	string edges_json = "[]";
 	auto er = con.Query(eq.str());
-	if (!er->HasError() && er->RowCount() > 0 && !er->GetValue(0, 0).IsNull()) {
-		auto v = er->GetValue(0, 0).ToString();
+	if (!er->HasError() && er->RowCount() > 0 && !er->Collection().GetValue(0, 0).IsNull()) {
+		auto v = er->Collection().GetValue(0, 0).ToString();
 		if (!v.empty() && v != "NULL") {
 			edges_json = v;
 		}
@@ -2212,12 +2215,12 @@ static std::vector<CheckRow> LoadChecksForAsset(Connection &con, const string &a
 	if (r->HasError()) return out;
 	for (idx_t i = 0; i < r->RowCount(); i++) {
 		CheckRow cr;
-		cr.check_name = r->GetValue(0, i).ToString();
-		cr.sql = r->GetValue(1, i).ToString();
-		cr.expect_type = r->GetValue(2, i).ToString();
-		auto ev = r->GetValue(3, i);
+		cr.check_name = r->Collection().GetValue(0, i).ToString();
+		cr.sql = r->Collection().GetValue(1, i).ToString();
+		cr.expect_type = r->Collection().GetValue(2, i).ToString();
+		auto ev = r->Collection().GetValue(3, i);
 		cr.expect_value = ev.IsNull() ? string() : ev.ToString();
-		auto sv = r->GetValue(4, i);
+		auto sv = r->Collection().GetValue(4, i);
 		cr.severity = sv.IsNull() ? string("error") : sv.ToString();
 		out.push_back(std::move(cr));
 	}
@@ -2350,7 +2353,7 @@ RunChecksForAsset(Connection &con, const string &asset_name, const string &run_i
 			cr.actual_value = "ERROR";
 			cr.reason = qres->HasError() ? qres->GetError() : "check SQL returned no rows";
 		} else {
-			Value v = qres->GetValue(0, 0);
+			Value v = qres->Collection().GetValue(0, 0);
 			string actual_str, reason;
 			bool pass = EvalCheckScalar(v, c.expect_type, c.expect_value, actual_str, reason);
 			cr.status = pass ? "pass" : "fail";
@@ -2389,7 +2392,7 @@ static string OrchCheckRunPragma(ClientContext &context,
 	}
 	string asset_name = parameters.values[0].GetValue<string>();
 	Connection con(*context.db);
-	auto run_id = con.Query("SELECT uuid()::VARCHAR")->GetValue(0, 0).ToString();
+	auto run_id = con.Query("SELECT uuid()::VARCHAR")->Collection().GetValue(0, 0).ToString();
 	auto results = RunChecksForAsset(con, asset_name, run_id);
 	if (results.empty()) {
 		// No checks registered — return an empty result set with the
@@ -2502,8 +2505,8 @@ static string OrchAssetPartitionsCalendarPragma(ClientContext &context,
 		  << "WHERE a.name = " << SqlEscape(name)
 		  << " AND t.partitions_json IS NOT NULL LIMIT 1;";
 		auto r = con.Query(q.str());
-		if (!r->HasError() && r->RowCount() > 0 && !r->GetValue(0, 0).IsNull()) {
-			def_json = r->GetValue(0, 0).ToString();
+		if (!r->HasError() && r->RowCount() > 0 && !r->Collection().GetValue(0, 0).IsNull()) {
+			def_json = r->Collection().GetValue(0, 0).ToString();
 		}
 	}
 	if (def_json.empty()) {
@@ -2528,8 +2531,8 @@ static string OrchAssetPartitionsCalendarPragma(ClientContext &context,
 		  << "LEFT JOIN latest l USING (partition_key) "
 		  << "WHERE p.asset_name = " << SqlEscape(name) << ";";
 		auto r = con.Query(q.str());
-		if (!r->HasError() && r->RowCount() > 0 && !r->GetValue(0, 0).IsNull()) {
-			rows_json = r->GetValue(0, 0).ToString();
+		if (!r->HasError() && r->RowCount() > 0 && !r->Collection().GetValue(0, 0).IsNull()) {
+			rows_json = r->Collection().GetValue(0, 0).ToString();
 		}
 	}
 
@@ -2558,10 +2561,10 @@ static string LookupDefiningTask(Connection &con, const string &asset_name) {
 	q << "SELECT defined_by_task FROM __orch__.assets WHERE name = "
 	  << SqlEscape(asset_name) << " LIMIT 1;";
 	auto r = con.Query(q.str());
-	if (r->HasError() || r->RowCount() == 0 || r->GetValue(0, 0).IsNull()) {
+	if (r->HasError() || r->RowCount() == 0 || r->Collection().GetValue(0, 0).IsNull()) {
 		return string();
 	}
-	return r->GetValue(0, 0).ToString();
+	return r->Collection().GetValue(0, 0).ToString();
 }
 
 // Shared backfill driver: re-run `task` for every partition in `keys`.
@@ -2569,7 +2572,7 @@ static string LookupDefiningTask(Connection &con, const string &asset_name) {
 // of the backfill completes (CLI surfaces the per-partition status).
 static void RunBackfillKeys(Connection &con, const TaskRow &task,
                              const std::vector<string> &keys) {
-	auto pipeline_uuid = con.Query("SELECT uuid()::VARCHAR")->GetValue(0, 0).ToString();
+	auto pipeline_uuid = con.Query("SELECT uuid()::VARCHAR")->Collection().GetValue(0, 0).ToString();
 	for (auto &k : keys) {
 		RunSingleTask(con, task, pipeline_uuid, string(), k);
 	}
@@ -2594,7 +2597,7 @@ static std::vector<string> KeysFromRegistry(Connection &con, const string &asset
 	auto r = con.Query(q.str());
 	if (r->HasError()) return out;
 	for (idx_t i = 0; i < r->RowCount(); i++) {
-		out.push_back(r->GetValue(0, i).ToString());
+		out.push_back(r->Collection().GetValue(0, i).ToString());
 	}
 	return out;
 }
@@ -2611,7 +2614,7 @@ static std::vector<string> FilterMissing(Connection &con, const string &asset_na
 	auto r = con.Query(q.str());
 	if (!r->HasError()) {
 		for (idx_t i = 0; i < r->RowCount(); i++) {
-			done.insert(r->GetValue(0, i).ToString());
+			done.insert(r->Collection().GetValue(0, i).ToString());
 		}
 	}
 	std::vector<string> out;
@@ -2695,7 +2698,7 @@ static void OrchRunPartitionPragma(ClientContext &context,
 		    "orch_run_partition: no task defines asset `" + asset + "`");
 	}
 	auto task = LoadTaskRowByName(con, task_name);
-	auto pipeline_uuid = con.Query("SELECT uuid()::VARCHAR")->GetValue(0, 0).ToString();
+	auto pipeline_uuid = con.Query("SELECT uuid()::VARCHAR")->Collection().GetValue(0, 0).ToString();
 	RunSingleTask(con, task, pipeline_uuid, string(), key);
 }
 
@@ -2736,32 +2739,32 @@ static std::vector<AutomationRow> LoadAutomationAssets(Connection &con) {
 	if (r->HasError()) return out;
 	for (idx_t i = 0; i < r->RowCount(); i++) {
 		AutomationRow row;
-		row.asset_name = r->GetValue(0, i).ToString();
-		row.condition_dsl = r->GetValue(1, i).ToString();
-		auto tlv = r->GetValue(2, i);
+		row.asset_name = r->Collection().GetValue(0, i).ToString();
+		row.condition_dsl = r->Collection().GetValue(1, i).ToString();
+		auto tlv = r->Collection().GetValue(2, i);
 		if (!tlv.IsNull()) {
 			row.target_lag_seconds = tlv.GetValue<int64_t>();
 			row.target_lag_set = true;
 		}
-		auto flv = r->GetValue(3, i);
+		auto flv = r->Collection().GetValue(3, i);
 		if (!flv.IsNull()) {
 			row.freshness_lag_seconds = flv.GetValue<int64_t>();
 			row.freshness_lag_set = true;
 		}
-		auto iuv = r->GetValue(4, i);
+		auto iuv = r->Collection().GetValue(4, i);
 		if (!iuv.IsNull()) {
 			row.interval_unit = iuv.ToString();
 		}
-		auto isv = r->GetValue(5, i);
+		auto isv = r->Collection().GetValue(5, i);
 		if (!isv.IsNull()) {
 			row.interval_start_ts = isv.GetValue<int64_t>();
 			row.interval_start_set = true;
 		}
-		auto lbv = r->GetValue(6, i);
+		auto lbv = r->Collection().GetValue(6, i);
 		if (!lbv.IsNull()) {
 			row.lookback = lbv.GetValue<int64_t>();
 		}
-		auto apv = r->GetValue(7, i);
+		auto apv = r->Collection().GetValue(7, i);
 		if (!apv.IsNull()) {
 			row.allow_partials = apv.GetValue<bool>();
 		}
@@ -2789,24 +2792,24 @@ static string BuildEvalContextJson(Connection &con, const AutomationRow &row,
 
 	auto query_string = [&](const string &q) -> string {
 		auto r = con.Query(q);
-		if (r->HasError() || r->RowCount() == 0 || r->GetValue(0, 0).IsNull()) {
+		if (r->HasError() || r->RowCount() == 0 || r->Collection().GetValue(0, 0).IsNull()) {
 			return string();
 		}
-		return r->GetValue(0, 0).ToString();
+		return r->Collection().GetValue(0, 0).ToString();
 	};
 	auto query_int = [&](const string &q) -> int64_t {
 		auto r = con.Query(q);
-		if (r->HasError() || r->RowCount() == 0 || r->GetValue(0, 0).IsNull()) {
+		if (r->HasError() || r->RowCount() == 0 || r->Collection().GetValue(0, 0).IsNull()) {
 			return 0;
 		}
-		return r->GetValue(0, 0).GetValue<int64_t>();
+		return r->Collection().GetValue(0, 0).GetValue<int64_t>();
 	};
 	auto query_bool = [&](const string &q) -> bool {
 		auto r = con.Query(q);
-		if (r->HasError() || r->RowCount() == 0 || r->GetValue(0, 0).IsNull()) {
+		if (r->HasError() || r->RowCount() == 0 || r->Collection().GetValue(0, 0).IsNull()) {
 			return false;
 		}
-		return r->GetValue(0, 0).GetValue<bool>();
+		return r->Collection().GetValue(0, 0).GetValue<bool>();
 	};
 
 	std::ostringstream q_up;
@@ -2850,8 +2853,8 @@ static string BuildEvalContextJson(Connection &con, const AutomationRow &row,
 		     << "WHERE asset_name = " << SqlEscape(row.asset_name)
 		     << "  AND status = 'success';";
 		auto iv_r = con.Query(q_iv.str());
-		if (!iv_r->HasError() && iv_r->RowCount() > 0 && !iv_r->GetValue(0, 0).IsNull()) {
-			stored_intervals_json = iv_r->GetValue(0, 0).ToString();
+		if (!iv_r->HasError() && iv_r->RowCount() > 0 && !iv_r->Collection().GetValue(0, 0).IsNull()) {
+			stored_intervals_json = iv_r->Collection().GetValue(0, 0).ToString();
 		}
 	}
 
@@ -3051,7 +3054,7 @@ static void SensorTickOnce(Connection &con) {
 			    ok_iv);
 			if (!ok_iv || iv_json.empty() || iv_json == "[]") {
 				// Fallback: run once without interval binding.
-				auto uuid = con.Query("SELECT uuid()::VARCHAR")->GetValue(0, 0).ToString();
+				auto uuid = con.Query("SELECT uuid()::VARCHAR")->Collection().GetValue(0, 0).ToString();
 				RunSingleTask(con, task, uuid, string());
 				triggered++;
 				continue;
@@ -3119,7 +3122,7 @@ static void SensorTickOnce(Connection &con) {
 				}
 				int64_t batch_start = intervals[bi].first;
 				int64_t batch_end = intervals[bj - 1].second;
-				auto uuid = con.Query("SELECT uuid()::VARCHAR")->GetValue(0, 0).ToString();
+				auto uuid = con.Query("SELECT uuid()::VARCHAR")->Collection().GetValue(0, 0).ToString();
 				// Interval bounds surface in the task SQL as
 				// ${interval_start} / ${interval_end} (ISO UTC) and
 				// ${interval_start_ts} / ${interval_end_ts} (epoch).
@@ -3146,7 +3149,7 @@ static void SensorTickOnce(Connection &con) {
 		} else {
 			// Non-interval condition: run once.
 			auto pipeline_uuid =
-			    con.Query("SELECT uuid()::VARCHAR")->GetValue(0, 0).ToString();
+			    con.Query("SELECT uuid()::VARCHAR")->Collection().GetValue(0, 0).ToString();
 			RunSingleTask(con, task, pipeline_uuid, string());
 			triggered++;
 		}
@@ -3567,7 +3570,7 @@ static void OrchDynamicRefreshPragma(ClientContext &context,
 	}
 	auto task = LoadTaskRowByName(con, task_name);
 	auto pipeline_uuid =
-	    con.Query("SELECT uuid()::VARCHAR")->GetValue(0, 0).ToString();
+	    con.Query("SELECT uuid()::VARCHAR")->Collection().GetValue(0, 0).ToString();
 	RunSingleTask(con, task, pipeline_uuid, string());
 }
 
@@ -3663,7 +3666,7 @@ static string BuildSchemaJson(Connection &con, const std::vector<OlDataset> &tab
 		for (idx_t i = 0; i < r->RowCount(); i++) {
 			if (!first_col) o << ",";
 			first_col = false;
-			o << JsonEscape(r->GetValue(0, i).ToString());
+			o << JsonEscape(r->Collection().GetValue(0, i).ToString());
 		}
 		o << "]";
 	}
@@ -3785,7 +3788,9 @@ static std::vector<string> PrepareOutputColumns(Connection &con, const string &t
 	try {
 		auto stmt = con.Prepare(sql_to_prepare);
 		if (stmt && !stmt->HasError()) {
-			names = stmt->GetNames();
+			for (const auto &name : stmt->GetNames()) {
+				names.push_back(name.GetIdentifierName());
+			}
 		}
 	} catch (...) {
 	}
@@ -3888,7 +3893,7 @@ static string RecordColumnLineage(Connection &con, const string &task_sql,
 		    SqlEscape(task_name));
 		if (!existing->HasError()) {
 			for (idx_t i2 = 0; i2 < existing->RowCount(); i2++) {
-				already_covered.insert(existing->GetValue(0, i2).ToString());
+				already_covered.insert(existing->Collection().GetValue(0, i2).ToString());
 			}
 		}
 		string dst_dataset_for_unresolved;
@@ -3947,7 +3952,7 @@ static string ResolveDatasetNamespace(ClientContext &context, const string &tabl
 	}
 	string maybe_catalog = table_name.substr(0, first_dot);
 	try {
-		auto &catalog = Catalog::GetCatalog(context, maybe_catalog);
+		auto &catalog = Catalog::GetCatalog(context, Identifier(maybe_catalog));
 		if (catalog.IsSystemCatalog() || catalog.IsTemporaryCatalog()) {
 			return g_orch_namespace;
 		}
@@ -4096,8 +4101,8 @@ static std::vector<IngestColumn> DescribeRelation(Connection &con, const string 
 	exists = true;
 	for (idx_t i = 0; i < r->RowCount(); i++) {
 		IngestColumn c;
-		c.name = r->GetValue(0, i).ToString();
-		c.type = r->GetValue(1, i).ToString();
+		c.name = r->Collection().GetValue(0, i).ToString();
+		c.type = r->Collection().GetValue(1, i).ToString();
 		cols.push_back(c);
 	}
 	return cols;
@@ -4250,7 +4255,7 @@ static int64_t IngestExecCount(Connection &con, const string &sql, const string 
 		                            "\n  SQL: " + sql);
 	}
 	if (r->RowCount() > 0) {
-		return r->GetValue(0, 0).GetValue<int64_t>();
+		return r->Collection().GetValue(0, 0).GetValue<int64_t>();
 	}
 	return 0;
 }
@@ -4308,6 +4313,18 @@ static IngestResult IngestLoadPath(Connection &con, const string &path, const st
 	string prefix;
 	if (!catalog_name.empty()) prefix += catalog_name + ".";
 	if (!schema_name.empty()) prefix += schema_name + ".";
+	auto tables = yyjson_ns::yyjson_obj_get(root, "tables");
+	std::map<string, std::pair<bool, std::vector<IngestColumn>>> existing_tables;
+	if (tables && yyjson_ns::yyjson_is_arr(tables)) {
+		size_t ti, tmax;
+		yyjson_ns::yyjson_val *t;
+		yyjson_arr_foreach(tables, ti, tmax, t) {
+			string qualified = IngestJsonStr(t, "qualified");
+			bool exists = false;
+			auto columns = DescribeRelation(con, qualified, exists);
+			existing_tables.emplace(std::move(qualified), std::make_pair(exists, std::move(columns)));
+		}
+	}
 
 	IngestExec(con, "BEGIN TRANSACTION", "transaction start");
 
@@ -4315,7 +4332,6 @@ static IngestResult IngestLoadPath(Connection &con, const string &path, const st
 	std::vector<std::array<string, 2>> prune_tables; // qualified, depth
 	std::vector<LedgerWrite> ledger;
 
-	auto tables = yyjson_ns::yyjson_obj_get(root, "tables");
 	if (tables && yyjson_ns::yyjson_is_arr(tables)) {
 		size_t ti, tmax;
 		yyjson_ns::yyjson_val *t;
@@ -4348,8 +4364,9 @@ static IngestResult IngestLoadPath(Connection &con, const string &path, const st
 			string new_cols_json = cols_raw ? string(cols_raw, cl) : string("[]");
 			if (cols_raw) free(cols_raw);
 
-			bool exists = false;
-			auto old_cols = DescribeRelation(con, qualified, exists);
+			auto &old_table = existing_tables.at(qualified);
+			bool exists = old_table.first;
+			auto &old_cols = old_table.second;
 
 			// kind, column, from, to, ddl
 			std::vector<std::array<string, 5>> changes;
@@ -4425,8 +4442,8 @@ static IngestResult IngestLoadPath(Connection &con, const string &path, const st
 				  << SqlEscape(dataset) << " ORDER BY version DESC LIMIT 1";
 				auto r = con.Query(s.str());
 				if (!r->HasError() && r->RowCount() > 0) {
-					lw.version = r->GetValue(0, 0).GetValue<int64_t>();
-					prev_hash = r->GetValue(1, 0).ToString();
+					lw.version = r->Collection().GetValue(0, 0).GetValue<int64_t>();
+					prev_hash = r->Collection().GetValue(1, 0).ToString();
 				}
 			}
 			lw.new_version = prev_hash.empty() || prev_hash != lw.hash;
@@ -4665,7 +4682,7 @@ static string IngestBegin(Connection &con, const string &source, const string &t
 	if (r->HasError() || r->RowCount() == 0) {
 		throw InvalidInputException("orch_ingest: cannot generate load id");
 	}
-	load_id = r->GetValue(0, 0).ToString();
+	load_id = r->Collection().GetValue(0, 0).ToString();
 
 	std::ostringstream s;
 	s << "INSERT INTO __orch__.ingest_loads (load_id, source, dataset, write_disposition, "
@@ -4821,8 +4838,8 @@ static string OrchIngestHttpPragma(ClientContext &context, const FunctionParamet
 		s << "SELECT cursor_value FROM __orch__.ingest_state WHERE source = " << SqlEscape(url)
 		  << " AND resource = " << SqlEscape(resource);
 		auto r = con.Query(s.str());
-		if (!r->HasError() && r->RowCount() > 0 && !r->GetValue(0, 0).IsNull()) {
-			cursor_in = r->GetValue(0, 0).ToString();
+		if (!r->HasError() && r->RowCount() > 0 && !r->Collection().GetValue(0, 0).IsNull()) {
+			cursor_in = r->Collection().GetValue(0, 0).ToString();
 		}
 	}
 
@@ -4932,6 +4949,39 @@ static void OrchIngestResetPragma(ClientContext &context,
 // Extension entry
 // ========================================================================
 
+static void RegisterDescribedScalarFunction(ExtensionLoader &loader, ScalarFunction function,
+                                            vector<string> parameter_names, string description, string example,
+                                            string category) {
+	auto &signature = function.GetSignature();
+	D_ASSERT(signature.GetParameterCount() == parameter_names.size());
+	for (idx_t i = 0; i < parameter_names.size(); i++) {
+		signature.GetParameter(i).SetName(Identifier(parameter_names[i]));
+	}
+	CreateScalarFunctionInfo info(std::move(function));
+	info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	FunctionDescription function_description;
+	for (const auto &parameter : info.functions.functions[0]->GetSignature().GetParameters()) {
+		function_description.parameter_types.push_back(parameter.GetType());
+	}
+	function_description.parameter_names = std::move(parameter_names);
+	function_description.description = std::move(description);
+	function_description.examples.push_back(std::move(example));
+	function_description.categories.push_back(std::move(category));
+	info.descriptions.push_back(std::move(function_description));
+	loader.RegisterFunction(std::move(info));
+}
+
+static PragmaFunction IngestPragma(const char *name, pragma_query_t query, vector<LogicalType> arguments,
+                                  std::initializer_list<pair<const char *, LogicalType>> options) {
+	FunctionSignature signature(std::move(arguments), LogicalType::INVALID);
+	TypedKwargs kwargs;
+	for (const auto &option : options) {
+		kwargs.Add(option.first, option.second);
+	}
+	signature.AddTypedKwargs("options", std::move(kwargs));
+	return PragmaFunction::PragmaCall(name, query, std::move(signature));
+}
+
 static void LoadInternal(ExtensionLoader &loader) {
 	auto &config = loader.GetDatabaseInstance().config;
 	config.AddExtensionOption("orch_openlineage_url",
@@ -4957,27 +5007,47 @@ static void LoadInternal(ExtensionLoader &loader) {
 	oext.pre_optimize_function = OrchPreOptimize;
 	OptimizerExtension::Register(config, std::move(oext));
 
-	loader.RegisterFunction(
-	    ScalarFunction("orch_hello", {LogicalType::VARCHAR}, LogicalType::VARCHAR, OrchHelloFunc));
-	loader.RegisterFunction(ScalarFunction("orch_extract_io", {LogicalType::VARCHAR},
-	                                        LogicalType::VARCHAR, OrchExtractIoFunc));
-	loader.RegisterFunction(ScalarFunction("orch_parse_task",
-	                                        {LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                                        LogicalType::VARCHAR, OrchParseTaskFunc));
-	loader.RegisterFunction(ScalarFunction("orch_load_directory_json", {LogicalType::VARCHAR},
-	                                        LogicalType::VARCHAR, OrchLoadDirectoryFunc));
-	loader.RegisterFunction(ScalarFunction("orch_build_dag", {LogicalType::VARCHAR},
-	                                        LogicalType::VARCHAR, OrchBuildDagFunc));
-	loader.RegisterFunction(ScalarFunction(
-	    "orch_render_mermaid",
-	    {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR},
-	    LogicalType::VARCHAR, OrchRenderMermaidFunc));
-	loader.RegisterFunction(ScalarFunction("orch_downstream_of",
-	                                        {LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                                        LogicalType::VARCHAR, OrchDownstreamOfFunc));
+	RegisterDescribedScalarFunction(
+	    loader, ScalarFunction("orch_hello", {LogicalType::VARCHAR}, LogicalType::VARCHAR, OrchHelloFunc), {"name"},
+	    "Returns a greeting from the duckorch core library for the supplied name.", "orch_hello('world')", "greeting");
+	RegisterDescribedScalarFunction(
+	    loader, ScalarFunction("orch_extract_io", {LogicalType::VARCHAR}, LogicalType::VARCHAR, OrchExtractIoFunc),
+	    {"sql"}, "Extracts input and output datasets from a SQL statement as JSON.",
+	    "orch_extract_io('INSERT INTO dst SELECT * FROM src')", "lineage");
+	RegisterDescribedScalarFunction(loader,
+	                                ScalarFunction("orch_parse_task", {LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                                               LogicalType::VARCHAR, OrchParseTaskFunc),
+	                                {"sql", "file_path"},
+	                                "Parses a task SQL document and returns its task metadata as JSON.",
+	                                "orch_parse_task('-- @task name=demo' || chr(10) || 'SELECT 1', 'demo.sql')", "tasks");
+	RegisterDescribedScalarFunction(
+	    loader,
+	    ScalarFunction("orch_load_directory_json", {LogicalType::VARCHAR}, LogicalType::VARCHAR, OrchLoadDirectoryFunc),
+	    {"path"}, "Walks a directory's SQL files and returns parsed tasks and errors as JSON.",
+	    "orch_load_directory_json('.')", "tasks");
+	RegisterDescribedScalarFunction(
+	    loader, ScalarFunction("orch_build_dag", {LogicalType::VARCHAR}, LogicalType::VARCHAR, OrchBuildDagFunc),
+	    {"tasks_json"}, "Builds a dependency DAG from task definitions encoded as JSON.", "orch_build_dag('[]')",
+	    "dag");
+	RegisterDescribedScalarFunction(
+	    loader,
+	    ScalarFunction("orch_render_mermaid", {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR},
+		               LogicalType::VARCHAR, OrchRenderMermaidFunc),
+	    {"dag_json", "mode", "statuses_json"},
+	    "Renders a task DAG and lineage as Mermaid text using execution statuses.",
+	    "orch_render_mermaid('{\"order\":[],\"task_edges\":[],\"lineage_edges\":[]}', 0, '[]')", "visualization");
+	RegisterDescribedScalarFunction(
+	    loader,
+	    ScalarFunction("orch_downstream_of", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR,
+		               OrchDownstreamOfFunc),
+	    {"tasks_json", "failed_task"},
+	    "Returns the task names downstream of a failed task from task definitions encoded as JSON.",
+	    "orch_downstream_of('[]', 'failed_task')", "dag");
 
 	// PRAGMAs: side-effect ones use pragma_function_t (void return).
 	// orch_visualize stays pragma_query_t since it returns a SELECT statement.
+	// DuckDB 1.5.x exposes no ExtensionLoader::RegisterFunction(CreatePragmaFunctionInfo)
+	// overload, so pragma descriptions cannot be attached through the extension API.
 	loader.RegisterFunction(PragmaFunction::PragmaStatement(
 	    "orch_init", static_cast<pragma_function_t>(OrchInitPragma)));
 	loader.RegisterFunction(PragmaFunction::PragmaCall(
@@ -5064,34 +5134,28 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Phase 19: JSON ingestion. preview/run/http/state are `pragma_query_t`
 	// (they return rows); reset is a side-effect pragma.
 	{
-		auto preview = PragmaFunction::PragmaCall(
-		    "orch_ingest_preview", OrchIngestPreviewPragma,
-		    {LogicalType::VARCHAR, LogicalType::VARCHAR});
-		preview.named_parameters["max_nesting"] = LogicalType::BIGINT;
-		loader.RegisterFunction(std::move(preview));
-
-		auto run = PragmaFunction::PragmaCall("orch_ingest_run", OrchIngestRunPragma,
-		                                       {LogicalType::VARCHAR, LogicalType::VARCHAR});
-		run.named_parameters["disposition"] = LogicalType::VARCHAR;
-		run.named_parameters["primary_key"] = LogicalType::VARCHAR;
-		run.named_parameters["max_nesting"] = LogicalType::BIGINT;
-		loader.RegisterFunction(std::move(run));
-
-		auto http = PragmaFunction::PragmaCall("orch_ingest_http", OrchIngestHttpPragma,
-		                                        {LogicalType::VARCHAR, LogicalType::VARCHAR});
-		http.named_parameters["disposition"] = LogicalType::VARCHAR;
-		http.named_parameters["primary_key"] = LogicalType::VARCHAR;
-		http.named_parameters["max_nesting"] = LogicalType::BIGINT;
-		http.named_parameters["paginate"] = LogicalType::VARCHAR;
-		http.named_parameters["records_path"] = LogicalType::VARCHAR;
-		http.named_parameters["cursor_path"] = LogicalType::VARCHAR;
-		http.named_parameters["cursor_param"] = LogicalType::VARCHAR;
-		http.named_parameters["page_param"] = LogicalType::VARCHAR;
-		http.named_parameters["resource"] = LogicalType::VARCHAR;
-		http.named_parameters["secret"] = LogicalType::VARCHAR;
-		http.named_parameters["token"] = LogicalType::VARCHAR;
-		http.named_parameters["max_pages"] = LogicalType::BIGINT;
-		loader.RegisterFunction(std::move(http));
+		loader.RegisterFunction(IngestPragma("orch_ingest_preview", OrchIngestPreviewPragma,
+		                                    {LogicalType::VARCHAR, LogicalType::VARCHAR},
+		                                    {{"max_nesting", LogicalType::BIGINT}}));
+		loader.RegisterFunction(IngestPragma("orch_ingest_run", OrchIngestRunPragma,
+		                                    {LogicalType::VARCHAR, LogicalType::VARCHAR},
+		                                    {{"disposition", LogicalType::VARCHAR},
+		                                     {"primary_key", LogicalType::VARCHAR},
+		                                     {"max_nesting", LogicalType::BIGINT}}));
+		loader.RegisterFunction(IngestPragma("orch_ingest_http", OrchIngestHttpPragma,
+		                                    {LogicalType::VARCHAR, LogicalType::VARCHAR},
+		                                    {{"disposition", LogicalType::VARCHAR},
+		                                     {"primary_key", LogicalType::VARCHAR},
+		                                     {"max_nesting", LogicalType::BIGINT},
+		                                     {"paginate", LogicalType::VARCHAR},
+		                                     {"records_path", LogicalType::VARCHAR},
+		                                     {"cursor_path", LogicalType::VARCHAR},
+		                                     {"cursor_param", LogicalType::VARCHAR},
+		                                     {"page_param", LogicalType::VARCHAR},
+		                                     {"resource", LogicalType::VARCHAR},
+		                                     {"secret", LogicalType::VARCHAR},
+		                                     {"token", LogicalType::VARCHAR},
+		                                     {"max_pages", LogicalType::BIGINT}}));
 
 		loader.RegisterFunction(PragmaFunction::PragmaStatement(
 		    "orch_ingest_state", OrchIngestStatePragma));

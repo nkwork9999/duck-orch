@@ -1,0 +1,25 @@
+# name: test/sql/duckorch_function_descriptions.test
+# description: scalar function catalog descriptions use real metadata
+# group: [sql]
+
+require duckorch
+
+query I
+SELECT COUNT(*)::INTEGER
+FROM duckdb_functions()
+WHERE function_type = 'scalar'
+  AND function_name IN (
+      'orch_hello',
+      'orch_extract_io',
+      'orch_parse_task',
+      'orch_load_directory_json',
+      'orch_build_dag',
+      'orch_render_mermaid',
+      'orch_downstream_of'
+  )
+  AND description IS NOT NULL
+  AND len(examples) = 1
+  AND NOT list_contains(parameters, 'col0')
+  AND len(categories) = 1;
+----
+7
