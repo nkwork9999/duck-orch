@@ -4,7 +4,7 @@ if(MSVC)
         set(CMAKE_CXX_STANDARD_REQUIRED ON CACHE BOOL "Require the configured C++ standard" FORCE)
     endif()
     if(MSVC_VERSION GREATER_EQUAL 1950)
-        add_compile_options("/FI${CMAKE_CURRENT_LIST_DIR}/cmake/msvc_fmt_compat.hpp")
+        add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:/FI${CMAKE_CURRENT_LIST_DIR}/cmake/msvc_fmt_compat.hpp>")
     endif()
 endif()
 
