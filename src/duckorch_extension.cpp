@@ -5177,7 +5177,7 @@ std::string DuckorchExtension::Version() const {
 #ifdef EXT_VERSION_DUCKORCH
 	return EXT_VERSION_DUCKORCH;
 #else
-	return "0.1.0";
+	return "0.3.1";
 #endif
 }
 
