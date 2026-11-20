@@ -219,6 +219,8 @@ upstream changes.
 
 `python/duckorch_embedded.py` exposes `DailyPartitionPlanner(connection, models)`. Give it one tenant-scoped connection and a host-owned mapping from model IDs to registered **daily** asset names. `pending(model_id, start, end)` returns registered dates in the half-open interval whose latest attempt has not succeeded. Initialize the asset registry before planning.
 
+`pending_ranges(model_id, start, end)` merges adjacent pending days into half-open intervals. For downstream invalidation, construct `ChangeWindowPlanner(dependencies, horizon)` with a registered graph, a `DateWindow`, and a `PartitionGrain` for each edge. Its `affected(source_id, changed_window)` method returns downstream windows clipped to the retained horizon. Planning is read-only.
+
 Give each active caller its own connection with the matching extension loaded. With Python 3.10+,
 the `duckdb` package and the matching installed extension, run the integration tests from the repository root:
 
