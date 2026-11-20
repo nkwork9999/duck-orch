@@ -156,8 +156,9 @@ if(APPLE)
     target_link_libraries(${EXTENSION_NAME} "-framework Security" "-framework CoreFoundation")
     target_link_libraries(${LOADABLE_EXTENSION_NAME} "-framework Security" "-framework CoreFoundation")
 elseif(WIN32)
-    target_link_libraries(${EXTENSION_NAME} ws2_32 userenv bcrypt ntdll)
-    target_link_libraries(${LOADABLE_EXTENSION_NAME} ws2_32 userenv bcrypt ntdll)
+    # Rust's static standard library imports WaitOnAddress and WakeByAddress*.
+    target_link_libraries(${EXTENSION_NAME} ws2_32 userenv bcrypt ntdll synchronization)
+    target_link_libraries(${LOADABLE_EXTENSION_NAME} ws2_32 userenv bcrypt ntdll synchronization)
 endif()
 
 install(
