@@ -215,6 +215,19 @@ upstream changes.
 
 ---
 
+## Embedded daily-partition planner
+
+`python/duckorch_embedded.py` exposes `DailyPartitionPlanner(connection, models)`. Give it one tenant-scoped connection and a host-owned mapping from model IDs to registered **daily** asset names. `pending(model_id, start, end)` returns registered dates in the half-open interval whose latest attempt has not succeeded. Initialize the asset registry before planning.
+
+Give each active caller its own connection with the matching extension loaded. With Python 3.10+,
+the `duckdb` package and the matching installed extension, run the integration tests from the repository root:
+
+```sh
+python3 -m unittest discover -s python -v
+```
+
+Set `DUCKORCH_TEST_EXTENSION` to the absolute path of a trusted local build to test it instead of the installed package.
+
 ## CLI
 
 ```
