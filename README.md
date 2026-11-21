@@ -250,6 +250,9 @@ model references and their passed checks, prepare a plan, and call `validate` be
 `publish` checks the source and active epochs again before switching the entire manifest.
 `rollback` restores a previously published manifest and its input baseline. `fork` can create an
 isolated trial environment with the same immutable physical references.
+Read a bounded batch with `pending_notifications(limit=100)`, deliver its stable event IDs, then call
+`acknowledge_notifications` with the delivered IDs. Publication and rollback commit their notices with
+the pointer update. A missing acknowledgement leaves the same notice available for retry.
 `RelationContract.inspect` compares candidate column names, types and declared nullability using the DuckDB catalog.
 `JsonProjector(connection, fields)` projects registered paths and reports malformed documents, missing keys,
 JSON nulls and incompatible values per row. `VariantEventLog` stores events in typed columns and a VARIANT

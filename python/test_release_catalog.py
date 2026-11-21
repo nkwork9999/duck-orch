@@ -121,10 +121,37 @@ os._exit(42)
                                            str(Path(__file__).resolve().parent)], timeout=30)
                 self.assertEqual(finished.returncode, code)
                 with duckdb.connect(path) as db:
-                    release = GenerationCatalog(db, "production", {"orders", "report"}).active()
+                    catalog = GenerationCatalog(db, "production", {"orders", "report"})
+                    release = catalog.active()
+                    self.assertEqual([event.revision for event in catalog.pending_notifications(limit=10)],
+                                     ["v1"] if phase == "before" else ["v1", "v2"])
                     self.assertEqual(release.revision, version)
                     self.assertEqual([model.physical_version for _, model in release.models],
                                      [f"orders-{version}", f"report-{version}"])
+
+    def test_outbox_replays_stable_notifications_until_acknowledged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = str(Path(directory) / "tenant.duckdb")
+            with duckdb.connect(database) as db:
+                catalog = GenerationCatalog(db, "production", {"orders"})
+                for revision in ("v1", "v2"):
+                    catalog.stage(revision, {"orders": ReleaseModel(revision, "schema")},
+                                  inputs={}, checks={"quality": True})
+                    active = catalog.publish(catalog.prepare(revision))
+                catalog.rollback("v1", expected_epoch=active.epoch)
+                first, = catalog.pending_notifications(limit=1)
+                trial = catalog.fork("trial")
+                self.assertFalse(trial.pending_notifications(limit=10))
+                self.assertEqual(trial.acknowledge_notifications([first.event_id]), 0)
+            with duckdb.connect(database) as db:
+                catalog = GenerationCatalog(db, "production", {"orders"})
+                self.assertEqual(catalog.pending_notifications(limit=1), [first])
+                all_events = catalog.pending_notifications(limit=10)
+                self.assertEqual([(e.epoch, e.revision, e.kind) for e in all_events],
+                                 [(1, "v1", "publish"), (2, "v2", "publish"), (3, "v1", "rollback")])
+                self.assertEqual(catalog.acknowledge_notifications([first.event_id, first.event_id]), 1)
+                self.assertEqual(catalog.acknowledge_notifications([first.event_id]), 0)
+                self.assertEqual(catalog.pending_notifications(limit=10), all_events[1:])
 
     def test_trial_reuses_unchanged_versions_and_stays_pinned(self):
         with duckdb.connect() as db:

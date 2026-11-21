@@ -652,6 +652,15 @@ class PublishedGeneration:
     inputs: tuple[tuple[str, str], ...]
 
 
+@dataclass(frozen=True)
+class ReleaseNotification:
+    event_id: UUID
+    environment: str
+    epoch: int
+    revision: str
+    kind: str
+
+
 class StaleReleasePlan(ValueError):
     """The active generation or source inputs changed since preparation."""
 
@@ -683,6 +692,13 @@ class GenerationCatalog:
                     environment VARCHAR, revision VARCHAR, models JSON NOT NULL,
                     inputs JSON NOT NULL, checks JSON NOT NULL, published BOOLEAN NOT NULL,
                     PRIMARY KEY (environment, revision)
+                )
+            """)
+            tx.execute("""
+                CREATE TABLE IF NOT EXISTS __orch__.release_outbox (
+                    environment VARCHAR NOT NULL, epoch BIGINT NOT NULL, event_id UUID UNIQUE NOT NULL,
+                    revision VARCHAR NOT NULL, kind VARCHAR NOT NULL, delivered BOOLEAN NOT NULL,
+                    PRIMARY KEY (environment, epoch)
                 )
             """)
             tx.execute("""
@@ -767,6 +783,7 @@ class GenerationCatalog:
             tx.execute("""
                 UPDATE __orch__.release_manifests SET published = true WHERE environment = ? AND revision = ?
             """, [self._environment, plan.revision])
+            self._notify(tx, epoch[0], plan.revision, "publish")
             return self._snapshot(plan.revision, epoch[0], *manifest)
         return _write_transaction(self._db, switch)
 
@@ -782,8 +799,41 @@ class GenerationCatalog:
             """, [revision, self._environment, expected_epoch]).fetchone()
             if found is None:
                 raise StaleReleasePlan("active generation changed before rollback")
+            self._notify(tx, found[0], revision, "rollback")
             return self._snapshot(revision, found[0], models, inputs)
         return _write_transaction(self._db, switch)
+
+    def _notify(self, tx, epoch: int, revision: str, kind: str) -> None:
+        tx.execute("""
+            INSERT INTO __orch__.release_outbox VALUES (?, ?, uuid(), ?, ?, false)
+        """, [self._environment, epoch, revision, kind])
+
+    def pending_notifications(self, *, limit: int) -> list[ReleaseNotification]:
+        """Read a bounded batch. The caller may deliver the same event again until ACK."""
+        if type(limit) is not int or not 1 <= limit <= 10_000:
+            raise ValueError("limit must be an integer between 1 and 10000")
+        with self._db.cursor() as reader:
+            rows = reader.execute("""
+                SELECT event_id, environment, epoch, revision, kind
+                FROM __orch__.release_outbox
+                WHERE environment = ? AND NOT delivered ORDER BY epoch LIMIT ?
+            """, [self._environment, limit]).fetchall()
+        return [ReleaseNotification(*row) for row in rows]
+
+    def acknowledge_notifications(self, events: list[UUID]) -> int:
+        """Mark previously delivered IDs from this environment as acknowledged."""
+        if type(events) is not list or len(events) > 10_000 or any(type(event) is not UUID for event in events):
+            raise TypeError("expected a list of up to 10000 UUIDs")
+
+        def acknowledge(tx):
+            rows = tx.execute("""
+                UPDATE __orch__.release_outbox SET delivered = true
+                WHERE environment = ? AND NOT delivered AND event_id IN (SELECT unnest(?::UUID[]))
+                RETURNING event_id
+            """, [self._environment, events]).fetchall()
+            return len(rows)
+
+        return _write_transaction(self._db, acknowledge)
 
     def _manifest(self, tx, revision, *, published_only):
         if type(revision) is not str or not revision:
