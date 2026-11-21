@@ -1,5 +1,7 @@
 # duckOrch
 
+[Documentation / 全機能ガイド](https://nkwork9999.github.io/duck-orch/)
+
 **Asset-centric data orchestration with lineage, partitions, and a sensor
 loop**, packaged as a single DuckDB extension. Define tasks → automatic DAG +
 asset graph, partition-aware execution, Dagster-style declarative automation,
