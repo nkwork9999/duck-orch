@@ -221,6 +221,13 @@ upstream changes.
 
 `pending_ranges(model_id, start, end)` merges adjacent pending days into half-open intervals. For downstream invalidation, construct `ChangeWindowPlanner(dependencies, horizon)` with a registered graph, a `DateWindow`, and a `PartitionGrain` for each edge. Its `affected(source_id, changed_window)` method returns downstream windows clipped to the retained horizon. Planning is read-only.
 
+Use `GenerationCoverage(connection, models)` when workers need durable reservations.
+`enqueue(model_id, generation, DateWindow(start, end))` atomically returns claims for gaps in the requested interval.
+It considers both completed work and outstanding claims for the same asset and generation. Call
+`finish(claim, success=True)` after the work commits, or pass `success=False` to release it for retry.
+Store the claim with the worker's job so it can be settled after restarting. A persistent DuckDB file retains
+the reservations across restarts. An outstanding claim continues to own its interval until explicitly settled.
+
 Give each active caller its own connection with the matching extension loaded. With Python 3.10+,
 the `duckdb` package and the matching installed extension, run the integration tests from the repository root:
 
