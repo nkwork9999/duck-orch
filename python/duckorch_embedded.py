@@ -1,5 +1,5 @@
 """Read-side planning for a host-provisioned, tenant-scoped duckOrch connection."""
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
@@ -87,11 +87,41 @@ class RollingDependency:
 
 
 @dataclass(frozen=True)
+class PlanStep:
+    tenant_id: str
+    model_id: str
+    window: DateWindow
+    reason: str
+    parent_id: str | None
+    estimated_bytes: int | None
+
+
+@dataclass(frozen=True)
 class CoverageClaim:
     claim_id: UUID
     model_id: str
     generation: str
     window: DateWindow
+
+
+@dataclass(frozen=True)
+class CoverageBatch:
+    claims: tuple[CoverageClaim, ...]
+
+    def __post_init__(self):
+        if type(self.claims) is not tuple or not self.claims or any(type(c) is not CoverageClaim for c in self.claims):
+            raise ValueError("a batch must include coverage claims")
+        if any((a.model_id, a.generation, a.window.end) != (b.model_id, b.generation, b.window.start)
+               for a, b in zip(self.claims, self.claims[1:])):
+            raise ValueError("a batch must be contiguous and fixed to one model and generation")
+
+    @property
+    def generation(self):
+        return self.claims[0].generation
+
+    @property
+    def window(self):
+        return DateWindow(self.claims[0].window.start, self.claims[-1].window.end)
 
 
 def _write_transaction(connection, operation):
@@ -189,6 +219,57 @@ class GenerationCoverage:
         args = [claim.claim_id, asset, claim.generation, claim.window.start, claim.window.end]
         return _write_transaction(self._db, lambda tx: tx.execute(sql, args).fetchone() is not None)
 
+    @staticmethod
+    def batches(claims: list[CoverageClaim]) -> list[CoverageBatch]:
+        """Combine adjacent intervals from separate requests into one job."""
+        if type(claims) is not list or any(type(claim) is not CoverageClaim for claim in claims):
+            raise TypeError("claims must be a list of CoverageClaim values")
+        ordered = sorted(claims, key=lambda c: (c.model_id, c.generation, c.window.start, c.window.end))
+        grouped = []
+        for claim in ordered:
+            if grouped:
+                previous = grouped[-1][-1]
+                if (previous.model_id, previous.generation) == (claim.model_id, claim.generation):
+                    if claim.window.start < previous.window.end:
+                        raise ValueError("claims for a model version cannot overlap")
+                    if claim.window.start == previous.window.end:
+                        grouped[-1].append(claim)
+                        continue
+            grouped.append([claim])
+        return [CoverageBatch(tuple(group)) for group in grouped]
+
+    def settle(self, batch: CoverageBatch, succeeded: set[UUID]) -> tuple[bool, ...]:
+        """Commit successful portions and release failed portions in one transaction."""
+        if type(batch) is not CoverageBatch or type(succeeded) is not set:
+            raise TypeError("expected a CoverageBatch and a set of successful claim IDs")
+        keys = {c.claim_id for c in batch.claims}
+        if not succeeded <= keys:
+            raise ValueError("successful claims must belong to this batch")
+        asset = self._models[batch.claims[0].model_id]
+        selected = """
+            SELECT unnest(?::UUID[]) AS claim_key, unnest(?::DATE[]) AS first_day,
+                   unnest(?::DATE[]) AS last_day
+        """
+        condition = """
+            c.claim_id = r.claim_key AND c.asset = ? AND c.generation = ?
+            AND c.lo = r.first_day AND c.hi = r.last_day AND NOT c.completed
+        """
+        def update(tx):
+            applied = set()
+            for success, operation in (
+                (True, f"UPDATE __orch__.coverage_claims AS c SET completed = true FROM ({selected}) AS r"),
+                (False, f"DELETE FROM __orch__.coverage_claims AS c USING ({selected}) AS r"),
+            ):
+                claims = [c for c in batch.claims if (c.claim_id in succeeded) == success]
+                if not claims:
+                    continue
+                args = [[c.claim_id for c in claims], [c.window.start for c in claims],
+                        [c.window.end for c in claims], asset, batch.generation]
+                rows = tx.execute(f"{operation} WHERE {condition} RETURNING claim_id", args).fetchall()
+                applied.update(row[0] for row in rows)
+            return tuple(c.claim_id in applied for c in batch.claims)
+        return _write_transaction(self._db, update)
+
 
 class ChangeWindowPlanner:
     """Read-side change plan for a host-registered calendar DAG.
@@ -249,8 +330,7 @@ class ChangeWindowPlanner:
                 result.append(window)
         return tuple(result)
 
-    def affected_many(self, changes: Mapping[str, Iterable[DateWindow]]) -> dict[str, tuple[DateWindow, ...]]:
-        """Propagate disjoint source changes and merge touching output intervals."""
+    def _walk(self, changes: Mapping[str, Iterable[DateWindow]]):
         direct = {}
         for model, changes_for_model in changes.items():
             if model not in self._dependencies:
@@ -266,17 +346,41 @@ class ChangeWindowPlanner:
             direct[model] = self._merge(clipped)
 
         propagated = {}
-        outputs = {}
         for model in self._order:
-            incoming = self._merge(
-                self._expand(window, grain)
+            incoming = [
+                (parent, grain, self._expand(window, grain))
                 for parent, grain in self._dependencies[model].items()
                 for window in propagated.get(parent, ())
-            )
+            ]
+            sources = direct.get(model, ())
+            propagated[model] = self._merge((*sources, *(window for _, _, window in incoming)))
+            yield model, sources, incoming
+
+    def affected_many(self, changes: Mapping[str, Iterable[DateWindow]]) -> dict[str, tuple[DateWindow, ...]]:
+        """Propagate disjoint source changes and merge touching output intervals."""
+        outputs = {}
+        for model, _, incoming in self._walk(changes):
             if incoming:
-                outputs[model] = incoming
-            propagated[model] = self._merge((*incoming, *direct.get(model, ())))
+                outputs[model] = self._merge(window for _, _, window in incoming)
         return outputs
+
+    def explain(self, changes: Mapping[str, Iterable[DateWindow]], *, tenant_id: str,
+                bytes_per_day: Mapping[str, int] | None = None) -> Iterator[PlanStep]:
+        """Stream source and parent-edge evidence in dependency order."""
+        if type(tenant_id) is not str or not tenant_id:
+            raise ValueError("tenant_id must be a nonempty ID from the host")
+        estimates = dict(bytes_per_day or {})
+        if any(type(size) is not int or size < 0 for size in estimates.values()):
+            raise ValueError("per-day estimates must be nonnegative bytes")
+        for model, direct, edges in self._walk(changes):
+            cost = estimates.get(model)
+            def estimate(interval):
+                return None if cost is None else cost * (interval.end - interval.start).days
+            for interval in direct:
+                yield PlanStep(tenant_id, model, interval, "source_change", None, estimate(interval))
+            for parent, grain, interval in edges:
+                reason = grain.value if type(grain) is PartitionGrain else "rolling_window"
+                yield PlanStep(tenant_id, model, interval, reason, parent, estimate(interval))
 
 
 class ChangeLedger:
@@ -322,8 +426,7 @@ class ChangeLedger:
             """, [revision, asset, changed.start, changed.end]).fetchone() is not None
         return _write_transaction(self._db, insert)
 
-    def plan(self, revision: str, planner: ChangeWindowPlanner) -> dict[str, tuple[DateWindow, ...]]:
-        """Map the recorded source ranges to their downstream windows."""
+    def _changes(self, revision, planner):
         self._require_revision(revision)
         if type(planner) is not ChangeWindowPlanner:
             raise TypeError("expected a ChangeWindowPlanner")
@@ -336,7 +439,17 @@ class ChangeLedger:
             window = DateWindow(start, end)
             for model in self._by_asset[asset]:
                 changes.setdefault(model, []).append(window)
+        return changes
+
+    def plan(self, revision: str, planner: ChangeWindowPlanner) -> dict[str, tuple[DateWindow, ...]]:
+        """Map the recorded source ranges to their downstream windows."""
+        changes = self._changes(revision, planner)
         return planner.affected_many(changes)
+
+    def explain(self, revision: str, planner: ChangeWindowPlanner, *, tenant_id: str,
+                bytes_per_day: Mapping[str, int] | None = None) -> Iterator[PlanStep]:
+        changes = self._changes(revision, planner)
+        return planner.explain(changes, tenant_id=tenant_id, bytes_per_day=bytes_per_day)
 
 
 class QualityCheckSelector:
@@ -1056,3 +1169,95 @@ class CriticalPathScheduler:
                 ready.append(name)
                 counts[tenant] += 1
         return tuple(ready)
+
+
+@dataclass(frozen=True)
+class MembershipChange:
+    key: int
+    previous_group: str | None
+    current_group: str | None
+
+    def __post_init__(self):
+        if type(self.key) is not int or not -(1 << 63) <= self.key < (1 << 63):
+            raise ValueError("the row key must be a signed 64-bit integer")
+        if self.previous_group is None and self.current_group is None:
+            raise ValueError("a change must affect at least one group")
+        if any(value is not None and type(value) is not str for value in (self.previous_group, self.current_group)):
+            raise TypeError("group keys must be strings or absent")
+
+
+class GroupDelta:
+    """Refresh region sums and row counts from the committed current relation."""
+
+    def __init__(self, connection: DuckDBPyConnection, source: str, target: str):
+        for name in (source, target):
+            if type(name) is not str or not name or "\0" in name:
+                raise ValueError("source and target must be nonempty identifiers without NUL")
+        if source.casefold() == target.casefold():
+            raise ValueError("source and target must be distinct relations")
+        contract = RelationContract({"region": ColumnContract(ColumnType.TEXT, nullable=False),
+                                     "amount": ColumnContract(ColumnType.DOUBLE)})
+        if contract.inspect(connection, source):
+            raise ValueError("source must have a non-null VARCHAR region and DOUBLE amount")
+        self._db = connection
+        self._model = (source, target)
+        self._source = '"' + source.replace('"', '""') + '"'
+        self._target = '"' + target.replace('"', '""') + '"'
+        def initialize(tx):
+            tx.execute("CREATE SCHEMA IF NOT EXISTS __orch__")
+            tx.execute("""
+                CREATE TABLE IF NOT EXISTS __orch__.group_changes (
+                   model_source VARCHAR NOT NULL, model_target VARCHAR NOT NULL, revision VARCHAR NOT NULL,
+                   row_key BIGINT NOT NULL, previous_group VARCHAR, current_group VARCHAR
+                )
+            """)
+            tx.execute("""
+                CREATE TABLE IF NOT EXISTS __orch__.group_refresh_state (
+                    target VARCHAR PRIMARY KEY, sequence BIGINT NOT NULL
+                )
+            """)
+        _write_transaction(connection, initialize)
+
+    def refresh(self, revision: str, changes: list[MembershipChange]) -> int:
+        """Rebuild the union of current and former groups for a revision."""
+        if type(revision) is not str or not revision:
+            raise ValueError("revision must be a nonempty string")
+        if type(changes) is not list or any(type(item) is not MembershipChange for item in changes):
+            raise TypeError("expected a list of MembershipChange values")
+        params = [*self._model, revision]
+        rows = [{"id": c.key, "prior": c.previous_group, "next_group": c.current_group} for c in changes]
+
+        def refresh(tx):
+            tx.execute("""
+                INSERT INTO __orch__.group_refresh_state VALUES (?, 1)
+                ON CONFLICT (target) DO UPDATE SET sequence = sequence + 1
+            """, [self._model[1].lower()])
+            tx.execute("""
+                INSERT INTO __orch__.group_changes
+                WITH input AS (
+                    SELECT DISTINCT c.id AS row_key, c.prior AS previous_group, c.next_group AS current_group
+                    FROM unnest(?::STRUCT(id BIGINT, prior VARCHAR, next_group VARCHAR)[]) AS t(c)
+                )
+                SELECT ?, ?, ?, todo.row_key, todo.previous_group, todo.current_group FROM input AS todo
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM __orch__.group_changes log
+                    WHERE (log.model_source, log.model_target, log.revision) = (?, ?, ?)
+                      AND log.row_key = todo.row_key
+                      AND log.previous_group IS NOT DISTINCT FROM todo.previous_group
+                      AND log.current_group IS NOT DISTINCT FROM todo.current_group
+                )
+            """, [rows, *params, *params])
+            tx.execute("""
+                CREATE TEMP TABLE affected_groups AS
+                SELECT DISTINCT unnest([previous_group, current_group]) AS region
+                FROM __orch__.group_changes WHERE (model_source, model_target, revision) = (?, ?, ?)
+            """, params)
+            count, = tx.execute("SELECT count(region) FROM affected_groups").fetchone()
+            tx.execute(f"DELETE FROM main.{self._target} WHERE region IN (SELECT region FROM affected_groups)")
+            tx.execute(f"""
+                INSERT INTO main.{self._target}(region, value, n)
+                SELECT region, sum(amount), count(*) FROM main.{self._source}
+                SEMI JOIN affected_groups USING (region) GROUP BY region
+            """)
+            return count
+        return _write_transaction(self._db, refresh)

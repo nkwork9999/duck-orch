@@ -18,6 +18,22 @@ def window(start, end):
 
 
 class GenerationCoverageTests(unittest.TestCase):
+    def test_adjacent_claims_share_one_job_and_keep_their_own_outcomes(self):
+        with duckdb.connect() as db:
+            queue = GenerationCoverage(db, {"daily": "sales"})
+            first, = queue.enqueue("daily", "v1", window(0, 2))
+            second, = queue.enqueue("daily", "v1", window(2, 5))
+            different, = queue.enqueue("daily", "v2", window(5, 6))
+            batches = queue.batches([second, different, first])
+            self.assertEqual([(b.generation, b.window) for b in batches],
+                             [("v1", window(0, 5)), ("v2", window(5, 6))])
+            self.assertEqual(batches[0].claims, (first, second))
+            self.assertEqual(queue.settle(batches[0], {first.claim_id}), (True, True))
+            retry, = queue.enqueue("daily", "v1", window(0, 5))
+            self.assertEqual(retry.window, second.window)
+            self.assertNotEqual(retry.claim_id, second.claim_id)
+            self.assertEqual(queue.settle(batches[0], {first.claim_id}), (False, False))
+
     def test_overlapping_requests_retries_and_reopen(self):
         with tempfile.TemporaryDirectory() as directory:
             path = str(Path(directory) / "tenant.duckdb")

@@ -34,3 +34,14 @@ class ChangeLedgerTests(unittest.TestCase):
                     "full": (horizon,),
                 })
                 self.assertEqual(local.plan("correction-b", planner)["daily"], (jan,))
+                plan = list(local.explain("correction-a", planner, tenant_id="tenant-a", bytes_per_day={"daily": 100}))
+                output = {step.model_id: step for step in plan}
+                self.assertEqual(set(output), {"orders", "daily", "monthly", "full"})
+                self.assertEqual(output["monthly"].parent_id, "daily")
+                self.assertEqual(output["daily"].parent_id, "orders")
+                self.assertEqual(output["orders"].window, feb)
+                self.assertEqual(output["orders"].reason, "source_change")
+                self.assertEqual(output["full"].window, horizon)
+                self.assertIsNone(output["monthly"].estimated_bytes)
+                self.assertEqual(output["daily"].estimated_bytes, 100)
+                self.assertTrue(all(step.tenant_id == "tenant-a" for step in plan))

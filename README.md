@@ -229,6 +229,8 @@ It considers both completed work and outstanding claims for the same asset and g
 `finish(claim, success=True)` after the work commits, or pass `success=False` to release it for retry.
 Store the claim with the worker's job so it can be settled after restarting. A persistent DuckDB file retains
 the reservations across restarts. An outstanding claim continues to own its interval until explicitly settled.
+Use `batches(claims)` to group adjacent reservations for a single worker job. Call
+`settle(batch, succeeded)` with the successful claim IDs to commit their outcomes together and release failures.
 
 For daily rolling models, set an edge to `RollingDependency(lookback=6)` for a seven-day trailing window.
 `affected_many({model_id: [window, ...]})` maps several source changes to downstream output ranges and merges
@@ -236,7 +238,11 @@ overlapping or adjacent ranges. Keep the inputs needed for the rolling window wh
 `QualityCheckSelector(checks).select(changes)` picks checks by model and column dependencies.
 Register both inputs of a referential check and use `ForeignKeyCheck` to count child keys missing from the parent.
 Use `ChangeLedger(connection, models)` to record durable source intervals by revision and pass a revision
-and its `ChangeWindowPlanner` to `plan`. Open a separate database file for each tenant.
+and its `ChangeWindowPlanner` to `plan`. Use `explain` to iterate through source and parent-edge reasons
+with optional per-model byte estimates. Open a separate database file for each tenant.
+`GroupDelta(connection, source, target).refresh(revision, changes)` recomputes sums and counts for affected
+regions, including both sides of a move. The registered source has `region` and `amount` columns. The target
+has `region`, `value` and `n` columns. Pass `MembershipChange` values from the same committed source revision.
 `ModelFingerprint.capture` records definition, upstream versions, macros, settings and engine version.
 `FingerprintStore` keeps named revisions, and `FingerprintPlanner` returns reasons for invalidation.
 `GenerationCatalog` keeps checked manifests and a versioned active pointer in DuckDB. Stage all required
