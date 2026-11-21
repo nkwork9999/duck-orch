@@ -237,6 +237,9 @@ For daily rolling models, set an edge to `RollingDependency(lookback=6)` for a s
 overlapping or adjacent ranges. Keep the inputs needed for the rolling window when refreshing those outputs.
 `QualityCheckSelector(checks).select(changes)` picks checks by model and column dependencies.
 Register both inputs of a referential check and use `ForeignKeyCheck` to count child keys missing from the parent.
+`SharedQualityScan` evaluates `RowCountRule`, `NullRule` and `NumericRangeRule` together over a
+host-registered table and date interval. Numeric rules count nonfinite values as out of range
+and let the separate NULL rule determine whether missing values fail.
 Use `ChangeLedger(connection, models)` to record durable source intervals by revision and pass a revision
 and its `ChangeWindowPlanner` to `plan`. Use `explain` to iterate through source and parent-edge reasons
 with optional per-model byte estimates. Open a separate database file for each tenant.

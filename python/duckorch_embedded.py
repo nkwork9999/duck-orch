@@ -6,6 +6,7 @@ from enum import Enum
 from graphlib import CycleError, TopologicalSorter
 from hashlib import sha256
 from json import dumps, loads
+from math import isfinite
 from time import sleep
 from uuid import UUID
 
@@ -571,6 +572,105 @@ class ForeignKeyCheck:
             WHERE c.{child_key} IS NOT NULL
         """).fetchone()
         return missing
+
+
+@dataclass(frozen=True)
+class RowCountRule:
+    minimum: int = 0
+    maximum: int | None = None
+
+    def __post_init__(self):
+        if type(self.minimum) is not int or self.minimum < 0:
+            raise ValueError("minimum must be a nonnegative integer")
+        if self.maximum is not None and (type(self.maximum) is not int or self.maximum < self.minimum):
+            raise ValueError("maximum must equal or exceed minimum")
+
+
+@dataclass(frozen=True)
+class NullRule:
+    column_id: str
+    maximum: int = 0
+
+    def __post_init__(self):
+        if type(self.maximum) is not int or self.maximum < 0:
+            raise ValueError("maximum must be a nonnegative integer")
+
+
+@dataclass(frozen=True)
+class NumericRangeRule:
+    column_id: str
+    minimum: float
+    maximum: float
+    allowed: int = 0
+
+    def __post_init__(self):
+        for value in (self.minimum, self.maximum):
+            valid_integer = type(value) is int and -(1 << 63) <= value < (1 << 63)
+            valid_double = type(value) is float and isfinite(value)
+            if not (valid_integer or valid_double):
+                raise ValueError("numeric bounds must be signed 64-bit integers or finite doubles")
+        if self.minimum > self.maximum:
+            raise ValueError("maximum must equal or exceed minimum")
+        if type(self.allowed) is not int or self.allowed < 0:
+            raise ValueError("allowed must be a nonnegative integer")
+
+
+@dataclass(frozen=True)
+class QualityObservation:
+    check_id: str
+    observed: int
+    passed: bool
+
+
+class SharedQualityScan:
+    """Validate an interval against host-registered columns with one scan."""
+
+    def __init__(self, connection: DuckDBPyConnection, relation: str, *,
+                 date_column: str, columns: Mapping[str, str]):
+        self._db = connection
+        self._relation = self._identifier(relation)
+        self._date = self._identifier(date_column)
+        self._columns = {name: self._identifier(column) for name, column in columns.items()}
+
+    @staticmethod
+    def _identifier(name):
+        if type(name) is not str or not name or "\0" in name:
+            raise ValueError("provide a registered column or relation identifier")
+        return '"' + name.replace('"', '""') + '"'
+
+    def evaluate(self, window: DateWindow,
+                 checks: Mapping[str, RowCountRule | NullRule | NumericRangeRule]) -> list[QualityObservation]:
+        if type(window) is not DateWindow:
+            raise TypeError("expected a DateWindow")
+        if len(checks) > 256:
+            raise ValueError("evaluate at most 256 checks together")
+        if not checks:
+            return []
+        aggregates, parameters, ranges = [], [], []
+        for check in checks.values():
+            if type(check) is RowCountRule:
+                aggregates.append("count(*)")
+                ranges.append((check.minimum, check.maximum))
+            elif type(check) is NullRule:
+                column = self._columns[check.column_id]
+                aggregates.append(f"count(*) FILTER (WHERE {column} IS NULL)")
+                ranges.append((0, check.maximum))
+            elif type(check) is NumericRangeRule:
+                column = self._columns[check.column_id]
+                aggregates.append(f"""
+                    count(*) FILTER (WHERE {column} IS NOT NULL
+                                     AND (NOT isfinite({column}) OR {column} < ? OR {column} > ?))
+                """)
+                parameters.extend([check.minimum, check.maximum])
+                ranges.append((0, check.allowed))
+            else:
+                raise TypeError("expected a typed quality check")
+        observed = self._db.execute(f"""
+            SELECT {", ".join(aggregates)} FROM main.{self._relation}
+            WHERE {self._date} >= ?::DATE AND {self._date} < ?::DATE
+        """, [*parameters, window.start, window.end]).fetchone()
+        return [QualityObservation(name, count, count >= lower and (upper is None or count <= upper))
+                for name, count, (lower, upper) in zip(checks, observed, ranges)]
 
 
 def _fingerprint(value):
