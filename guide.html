@@ -1,0 +1,668 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="DuckDB上で依存関係を解決し、パーティションやデータ品質を管理するオーケストレーション拡張。">
+<title>利用ガイド · duckOrch</title><link rel="stylesheet" href="style.css">
+<script src="search.js" defer></script>
+</head>
+<body data-project="duck-orch">
+<a class="skip" href="#main">本文へ移動</a>
+<header class="masthead"><a href="index.html" class="product">duckOrch</a>
+<a href="https://github.com/nkwork9999/duck-orch">GitHub ↗</a></header>
+<div class="layout"><nav aria-label="ドキュメント"><a href="index.html">概要</a><a href="functions.html">SQL リファレンス</a><a href="python.html">Python 組み込み API</a><a href="guide.html" aria-current="page">利用ガイド</a><a href="architecture.html">設計・実行モデル</a><a href="mcp.html">MCP サーバー</a></nav>
+<main id="main"><details class="toc" open><summary>このページの目次</summary><ul><li class="h2"><a href="#what-it-does">What it does</a></li><li class="h3"><a href="#core-phase-09">Core (Phase 0–9)</a></li><li class="h3"><a href="#asset--partition--sensor-phase-1117">Asset + Partition + Sensor (Phase 11–17)</a></li><li class="h2"><a href="#quick-start">Quick start</a></li><li class="h3"><a href="#1-build">1. Build</a></li><li class="h3"><a href="#2-define-tasks">2. Define tasks</a></li><li class="h3"><a href="#3-run">3. Run</a></li><li class="h2"><a href="#task-file-format">Task file format</a></li><li class="h3"><a href="#variable-substitution">Variable substitution</a></li><li class="h3"><a href="#snowflake-style-declaration">Snowflake-style declaration</a></li><li class="h2"><a href="#embedded-daily-partition-planner">Embedded daily-partition planner</a></li><li class="h2"><a href="#cli">CLI</a></li><li class="h3"><a href="#mcp-server-phase-11">MCP server (Phase 11)</a></li><li class="h2"><a href="#sql-api">SQL API</a></li><li class="h3"><a href="#json-ingestion-phase-19">JSON ingestion (Phase 19)</a></li><li class="h2"><a href="#architecture">Architecture</a></li><li class="h2"><a href="#status">Status</a></li><li class="h2"><a href="#development">Development</a></li><li class="h2"><a href="#license">License</a></li><li class="h2"><a href="#credits">Credits</a></li></ul></details><h1 id="duckorch">duckOrch</h1>
+<p><strong>Asset-centric data orchestration with lineage, partitions, and a sensor
+loop</strong>, packaged as a single DuckDB extension. Define tasks → automatic DAG +
+asset graph, partition-aware execution, Dagster-style declarative automation,
+Snowflake-compatible <code>CREATE DYNAMIC ASSET</code> syntax, MCP server for Claude Code,
+Mermaid visualization, and OpenLineage emission — all in one <code>LOAD</code>.</p>
+<pre><code class="language-sql">LOAD duckorch;
+PRAGMA orch_register('./tasks/');                            -- load *.sql files
+PRAGMA orch_backfill('analytics.daily', '2026-01-01', '2026-12-31');
+PRAGMA orch_sensor_start;                                    -- auto-run when upstream updates
+PRAGMA orch_create_dynamic_asset(
+  'analytics.region_total', '5 minutes',
+  'SELECT region, SUM(total) FROM analytics.daily GROUP BY region');
+</code></pre>
+<pre><code class="language-bash">duck-orch register ./tasks/
+duck-orch asset partitions analytics.daily      # ✅⚪ calendar view
+duck-orch backfill analytics.daily --from 2026-01-01 --to 2026-12-31
+duck-orch automation simulate analytics.region_total
+duck-orch dynamic migrate-from-snowflake snowflake_dump.sql
+</code></pre>
+<hr />
+<h2 id="what-it-does">What it does</h2>
+<h3 id="core-phase-09">Core (Phase 0–9)</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Task definition</strong></td>
+<td>One SQL file = one task. Metadata in <code>-- @key value</code> comment headers (SQLMesh-style).</td>
+</tr>
+<tr>
+<td><strong>Dependency resolution</strong></td>
+<td>DAG built from <code>inputs</code>/<code>outputs</code>. <code>sqlparser-rs</code> infers them from the SQL if you don't.</td>
+</tr>
+<tr>
+<td><strong>Execution</strong></td>
+<td>Topological order, parallel within a layer (<code>SET orch_max_parallel = 4</code>).</td>
+</tr>
+<tr>
+<td><strong>Failure handling</strong></td>
+<td>Exponential backoff retry, then skip downstream tasks.</td>
+</tr>
+<tr>
+<td><strong>Incremental</strong></td>
+<td><code>@incremental_by ts</code> + <code>{{ last_processed_at }}</code> for delta processing.</td>
+</tr>
+<tr>
+<td><strong>Tests / lineage / visualization / OpenLineage / scheduling</strong></td>
+<td>See <code>DESIGN.md</code> for the originally-shipped Phase 0–9 surface.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="asset--partition--sensor-phase-1117">Asset + Partition + Sensor (Phase 11–17)</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>MCP server</strong></td>
+<td><code>duck-orch-mcp</code> stdio server (<code>rmcp 0.3</code>) exposes 9 tools (<code>list_pipelines</code>, <code>list_assets</code>, <code>run_pipeline</code> with <code>dry_run</code> default, etc.) for direct Claude Code integration.</td>
+</tr>
+<tr>
+<td><strong>Asset as first-class</strong></td>
+<td><code>@asset name=...</code> (or auto-derived from <code>@outputs</code>) promotes a task's output to <code>__orch__.assets</code>. Per-Asset materialization history, code_version hash, declared edges, owner, group, description, tags.</td>
+</tr>
+<tr>
+<td><strong>Partitions</strong></td>
+<td><code>@partitions_by daily(start=2026-01-01)</code> / <code>static(jp,us,eu)</code> / <code>multi(date=..., region=...)</code>. <code>$partition_key</code> is bound via DuckDB <code>PREPARE</code> (multi-statement aware) so the task SQL runs once per partition.</td>
+</tr>
+<tr>
+<td><strong>Backfill</strong></td>
+<td><code>duck-orch backfill &lt;asset&gt; --from D --to D | --partition K | --missing</code> with calendar-style ✅🟡❌⚪ ASCII output.</td>
+</tr>
+<tr>
+<td><strong>DSL Automation</strong></td>
+<td><code>@automation eager | on_cron(...) | on_interval(...) | on_missing | freshness_violated | in_progress</code> plus <code>&amp;</code> / <code>|</code> / <code>!</code> operators. Stateless evaluator with <code>target_lag_seconds</code> throttle wrapper.</td>
+</tr>
+<tr>
+<td><strong>Interval tracking</strong></td>
+<td>SQLMesh-style: <code>@automation on_interval(&quot;daily&quot;)</code> + <code>@interval_start 2026-01-01</code> tracks <em>which</em> time intervals have been processed (<code>__orch__.asset_intervals</code>) instead of comparing wall-clock timestamps. Gaps are computed set-difference style, contiguous gaps run as one batch, and <code>${interval_start}</code> / <code>${interval_end}</code> (ISO UTC) + <code>${interval_start_ts}</code> / <code>${interval_end_ts}</code> (epoch) are substituted into the task SQL. <code>@lookback N</code> re-processes trailing intervals for late data; <code>@allow_partials</code> includes the in-progress interval. <code>PRAGMA orch_restate('asset', '2026-06-01', '2026-06-03')</code> deletes stored intervals so the next tick recomputes them.</td>
+</tr>
+<tr>
+<td><strong>Sensor loop</strong></td>
+<td>Background <code>std::thread</code> polls every N seconds (<code>PRAGMA orch_sensor_set_interval</code>), evaluates eligible Assets via the Rust evaluator, logs to <code>__orch__.automation_evaluations</code>, and fires <code>RunSingleTask</code> when <code>condition_met</code>.</td>
+</tr>
+<tr>
+<td><strong>Freshness + Asset Check</strong></td>
+<td><code>@freshness max_lag=60min</code> ties into <code>FreshnessViolated</code>. <code>@check name=N &quot;&lt;SQL&gt;&quot; expect &lt;op&gt; &lt;value&gt;</code> runs at end of every successful task; <code>severity=error</code> failures block downstream. <code>${asset}</code> substituted at execution.</td>
+</tr>
+<tr>
+<td><strong>Snowflake <code>CREATE DYNAMIC ASSET</code></strong></td>
+<td><code>PRAGMA orch_create_dynamic_asset(name, target_lag, sql)</code> synthesizes a task + Asset + <code>automation_condition='eager()'</code> so the sensor picks it up. <code>duck-orch dynamic migrate-from-snowflake &lt;dump&gt;</code> parses a Snowflake dump and registers every block (skipping <code>WAREHOUSE</code>/<code>REFRESH_MODE</code>/etc.).</td>
+</tr>
+<tr>
+<td><strong>3-route surface</strong></td>
+<td>Every feature is reachable from CLI (<code>duck-orch ...</code>), SQL (<code>PRAGMA orch_*</code>), and MCP (Claude Code tools).</td>
+</tr>
+</tbody>
+</table>
+<p>The primary positioning: <strong>&quot;DuckDB-native, offline, single-file Asset
+orchestrator with Dagster's Declarative Automation + Snowflake's
+<code>TARGET_LAG</code> semantics.&quot;</strong> Designed to run on a laptop (or in a plane)
+without a cloud control plane.</p>
+<hr />
+<h2 id="quick-start">Quick start</h2>
+<h3 id="1-build">1. Build</h3>
+<pre><code class="language-bash">git clone --recurse-submodules https://github.com/nkwork9999/duck-orch.git
+cd duck-orch
+make                                    # full DuckDB-bundled build (~10–30 min)
+cargo build -p duckorch_cli --release  # CLI binary
+</code></pre>
+<p>Outputs:</p>
+<ul>
+<li><code>build/release/duckdb</code> — DuckDB CLI with duckorch pre-loaded</li>
+<li><code>build/release/extension/duckorch/duckorch.duckdb_extension</code> — extension binary</li>
+<li><code>target/release/duck-orch</code> — standalone CLI</li>
+</ul>
+<p>Verify the local runtime without creating a database file:</p>
+<pre><code class="language-bash">cargo run -p duckorch_cli -- doctor \\
+  --ext build/release/extension/duckorch/duckorch.duckdb_extension
+cargo run -p duckorch_cli -- doctor --json
+</code></pre>
+<p><code>doctor</code> checks the DuckDB executable, database-parent existence and write
+permissions, extension path/suffix/size/readability, in-memory loading, and 20
+registered orchestration capabilities (core parsing/DAG APIs, init/register/run,
+visualization/tests, assets/partitions/backfill, automation/sensor, checks, and
+dynamic assets). JSON output includes a schema version plus total/pass/fail counts;
+the command exits non-zero if any readiness check fails.</p>
+<h3 id="2-define-tasks">2. Define tasks</h3>
+<pre><code class="language-sql">-- tasks/clean_users.sql
+-- @task name=clean_users
+-- @outputs analytics.clean_users
+-- @retries 2
+
+CREATE OR REPLACE TABLE analytics.clean_users AS
+SELECT id, name, country FROM raw.users WHERE deleted_at IS NULL;
+</code></pre>
+<pre><code class="language-sql">-- tasks/user_stats.sql
+-- @task name=user_stats
+-- @outputs analytics.user_stats
+-- @test &quot;SELECT COUNT(*) FROM analytics.user_stats WHERE users &lt; 0&quot; expect 0
+
+CREATE OR REPLACE TABLE analytics.user_stats AS
+SELECT country, COUNT(*) AS users
+FROM analytics.clean_users
+GROUP BY country;
+</code></pre>
+<p><code>inputs</code> is auto-extracted from the SQL, so you don't have to write it.</p>
+<h3 id="3-run">3. Run</h3>
+<pre><code class="language-bash">duck-orch register ./tasks/
+duck-orch run
+duck-orch graph
+</code></pre>
+<p>Or from inside DuckDB:</p>
+<pre><code class="language-sql">LOAD duckorch;
+PRAGMA orch_register('./tasks/');
+PRAGMA orch_run;
+SELECT task_name, status FROM __orch__.runs ORDER BY started_at;
+</code></pre>
+<hr />
+<h2 id="task-file-format">Task file format</h2>
+<pre><code class="language-sql">-- Core (Phase 0–9)
+-- @task name=user_stats               required (or `-- @name user_stats`)
+-- @description Active users per country
+-- @owner data-team@example.com
+-- @inputs analytics.clean_users        optional (auto-extracted)
+-- @outputs analytics.user_stats         required (or auto-extracted)
+-- @depends_on clean_users               optional (inferred from inputs)
+-- @schedule &quot;0 6 * * *&quot;                 5-field cron
+-- @retries 3
+-- @timeout 300                          seconds
+-- @incremental_by updated_at            incremental column
+-- @tags daily, analytics
+-- @test &quot;SELECT COUNT(*) FROM x WHERE y &lt; 0&quot; expect 0
+
+-- Asset / Partition (Phase 13–14)
+-- @asset name=analytics.user_stats     promotes to first-class Asset
+-- @asset_kind table                    | view | external | file | model
+-- @asset_group sales
+-- @asset_owner data-team@example.com
+-- @asset_description &quot;Active users per country&quot;
+-- @asset_tags daily, sales
+-- @partitions_by daily(start=2026-01-01)
+-- @param partition_key:DATE             declares $partition_key for PREPARE
+
+-- Automation / Freshness / Check (Phase 15–16)
+-- @automation eager AND NOT in_progress()
+-- @target_lag 5min                      Snowflake-style declarative freshness
+-- @freshness max_lag=60min              wires into freshness_violated()
+-- @check name=positive &quot;SELECT MIN(rev) FROM ${asset}&quot; expect gt 0
+-- @check_severity error                 | warn
+
+-- Interval tracking (Phase 18, SQLMesh-style)
+-- @automation on_interval(&quot;daily&quot;)      | &quot;hourly&quot; | &quot;5min&quot; | &quot;2h&quot; | &quot;3d&quot;
+-- @interval_start 2026-01-01            track gaps from this UTC date
+-- @lookback 2                           re-process last N intervals (late data)
+-- @allow_partials                       include the in-progress interval
+
+&lt;SQL body referencing $partition_key etc.&gt;
+</code></pre>
+<h3 id="variable-substitution">Variable substitution</h3>
+<table>
+<thead>
+<tr>
+<th>Style</th>
+<th>Use</th>
+<th>Mechanism</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>$name</code></td>
+<td>new code (Phase 12+): partition keys, typed params</td>
+<td>DuckDB native <code>PREPARE</code> + named bind, multi-statement aware</td>
+</tr>
+<tr>
+<td><code>${asset}</code></td>
+<td>identifier interpolation in <code>@check</code> SQL</td>
+<td>plain string substitution</td>
+</tr>
+<tr>
+<td><code>${interval_start}</code> / <code>${interval_end}</code></td>
+<td>Phase 18 <code>on_interval()</code> runs: quoted ISO UTC timestamp literal (<code>WHERE ts &gt;= ${interval_start}</code> works as-is); <code>${interval_start_ts}</code> / <code>${interval_end_ts}</code> give bare epoch seconds</td>
+<td>plain string substitution</td>
+</tr>
+<tr>
+<td><code>{{ var }}</code></td>
+<td>legacy <code>@incremental_by</code> (Phase 7)</td>
+<td>self-contained 33-line substitution (no Jinja crate); kept for back-compat, <strong>not used in new features</strong></td>
+</tr>
+</tbody>
+</table>
+<p>Supported <code>{{}}</code> variables: <code>{{ last_processed_at }}</code>, <code>{{ now }}</code>, <code>{{ run_id }}</code>.</p>
+<h3 id="snowflake-style-declaration">Snowflake-style declaration</h3>
+<p>If you'd rather skip the headers entirely:</p>
+<pre><code class="language-sql">-- snowflake_dump.sql
+CREATE DYNAMIC TABLE analytics.region_total
+  TARGET_LAG = '5 minutes'
+  AS
+  SELECT region, SUM(total) AS rt
+  FROM analytics.daily_orders
+  GROUP BY region;
+</code></pre>
+<pre><code class="language-bash">duck-orch dynamic migrate-from-snowflake snowflake_dump.sql
+</code></pre>
+<p>…registers each block as an Asset with <code>automation_condition='eager()'</code> and
+<code>target_lag_seconds=300</code>. The sensor materializes it within <code>target_lag</code> of
+upstream changes.</p>
+<hr />
+<h2 id="embedded-daily-partition-planner">Embedded daily-partition planner</h2>
+<p><code>python/duckorch_embedded.py</code> exposes <code>DailyPartitionPlanner(connection, models)</code>. Give it one tenant-scoped connection and a host-owned mapping from model IDs to registered <strong>daily</strong> asset names. <code>pending(model_id, start, end)</code> returns registered dates in the half-open interval whose latest attempt has not succeeded. Initialize the asset registry before planning.</p>
+<p><code>pending_ranges(model_id, start, end)</code> merges adjacent pending days into half-open intervals. For downstream invalidation, construct <code>ChangeWindowPlanner(dependencies, horizon)</code> with a registered graph, a <code>DateWindow</code>, and a <code>PartitionGrain</code> for each edge. Its <code>affected(source_id, changed_window)</code> method returns downstream windows clipped to the retained horizon. Planning is read-only.</p>
+<p>Give each active caller its own connection with the matching extension loaded. With Python 3.10+,
+the <code>duckdb</code> package and the matching installed extension, run the integration tests from the repository root:</p>
+<pre><code class="language-sh">python3 -m unittest discover -s python -v
+</code></pre>
+<p>Set <code>DUCKORCH_TEST_EXTENSION</code> to the absolute path of a trusted local build to test it instead of the installed package.</p>
+<h2 id="cli">CLI</h2>
+<pre><code>duck-orch [--db &lt;path&gt;] [--ext &lt;path&gt;] &lt;subcommand&gt; [--json]
+
+# Core (Phase 0–9)
+  register &lt;dir&gt;                       Load tasks from a directory of .sql files
+  run [--partition &lt;key&gt;]              Execute the DAG (or one partition)
+  status                               Recent run history
+  graph [lineage|dag|combined]         Mermaid output
+  test                                 Run @test assertions
+  validate &lt;file&gt;                      Validate one file (returns structured JSON)
+  impact &lt;table&gt;                       What breaks if I change &lt;table&gt;?
+  lineage &lt;table&gt;                      Upstream lineage of &lt;table&gt;
+  schedule add &lt;name&gt; &lt;cron&gt;           Register a cron schedule
+  schedule daemon                      Long-running poll loop (run-due every 30s)
+
+# Asset / Partition (Phase 13–14)
+  asset list [--group &lt;name&gt;]          All registered Assets
+  asset show &lt;name&gt;                    Single Asset details
+  asset lineage &lt;name&gt;                 Mermaid (Asset-level)
+  asset materializations &lt;name&gt;        Per-partition history
+  asset partitions &lt;name&gt;              Calendar-style ✅⚪ view
+  asset health                         Freshness + 24h run stats
+  backfill &lt;asset&gt; --from D --to D     Range
+  backfill &lt;asset&gt; --partition K       Single partition
+  backfill &lt;asset&gt; --missing           Only unmaterialized
+
+# Automation / Sensor (Phase 15)
+  automation status                    Per-Asset condition_met + reason
+  automation simulate &lt;asset&gt;          Dry-run (no log, no fire)
+  sensor start|stop|status             Toggle the background loop
+  sensor set-interval &lt;seconds&gt;        Polling cadence (default 30s)
+
+# Asset Check (Phase 16)
+  check run &lt;asset&gt;                    Execute every check declared on &lt;asset&gt;
+  check history &lt;asset&gt; [--limit N]    Recent results
+
+# Dynamic Asset / Snowflake migration (Phase 17)
+  dynamic list                         All Assets with automation_condition
+  dynamic refresh &lt;asset&gt;              Force-run, bypassing target_lag throttle
+  dynamic create &lt;name&gt; --target-lag &lt;dur&gt; --sql &lt;inline&gt;
+  dynamic create-from-sql &lt;file&gt;       Parse Snowflake-style file, register each block
+  dynamic migrate-from-snowflake &lt;file&gt;      Alias of create-from-sql
+
+# JSON ingestion (Phase 19)
+  ingest preview &lt;path&gt; &lt;target&gt;       Tables the source would produce; writes nothing
+  ingest run &lt;path&gt; &lt;target&gt; [--disposition append|replace|merge]
+                                       [--primary-key &lt;cols&gt;] [--max-nesting N]
+  ingest http &lt;url&gt; &lt;target&gt; [--secret &lt;name&gt; | --token &lt;t&gt;] [--paginate ...]
+  ingest schema [&lt;dataset&gt;]            Schema ledger versions
+  ingest changes [&lt;dataset&gt;]           What each version changed
+  ingest loads [--limit N]             Load history, failures included
+  ingest state / ingest reset &lt;source&gt; &lt;resource&gt;
+</code></pre>
+<p>Pass <code>--json</code> to any subcommand for Claude / agent-parseable output.</p>
+<h3 id="mcp-server-phase-11">MCP server (Phase 11)</h3>
+<p><code>duck-orch-mcp</code> exposes the CLI surface over stdio MCP for direct
+Claude Code integration:</p>
+<pre><code class="language-jsonc">// ~/.claude.json
+{
+  &quot;mcpServers&quot;: {
+    &quot;duckorch&quot;: {
+      &quot;command&quot;: &quot;/abs/path/to/target/release/duck-orch-mcp&quot;,
+      &quot;env&quot;: {
+        &quot;DUCKDB_BIN&quot;: &quot;/abs/path/to/build/release/duckdb&quot;,
+        &quot;DUCKORCH_EXT&quot;: &quot;/abs/path/to/build/release/extension/duckorch/duckorch.duckdb_extension&quot;,
+        &quot;DUCK_ORCH_DB&quot;: &quot;/abs/path/to/state.duckdb&quot;
+      }
+    }
+  }
+}
+</code></pre>
+<p>Read-only tools (always safe): <code>list_pipelines</code>, <code>list_assets</code>, <code>list_runs</code>,
+<code>describe_task</code>, <code>get_lineage</code>, <code>impact</code>, <code>validate</code>.
+Write tools (defaulted to safe modes): <code>run_pipeline</code> (<code>dry_run=true</code>),
+<code>register_task</code> (path-required), <code>unregister_task</code> (<code>confirm=true</code>),
+<code>schedule_add</code>.</p>
+<hr />
+<h2 id="sql-api">SQL API</h2>
+<pre><code class="language-sql">LOAD duckorch;
+
+-- Configuration
+SET orch_max_parallel = 4;
+SET orch_openlineage_url = 'http://marquez:5000/api/v1/lineage';
+SET orch_openlineage_debug = true;
+SET orch_namespace = 'my-warehouse';        -- OL job namespace
+SET orch_capture_interactive = true;        -- capture ad-hoc CTAS/INSERT
+
+-- Core (Phase 0–9)
+PRAGMA orch_init;                       -- create __orch__ schema
+PRAGMA orch_register('./tasks/');       -- load directory
+PRAGMA orch_run;                        -- execute the DAG
+PRAGMA orch_test;                       -- run @test assertions
+PRAGMA orch_visualize('lineage');       -- Mermaid
+
+-- Asset / Partition (Phase 13–14)
+PRAGMA orch_asset_list;                                  -- registered Assets
+PRAGMA orch_asset_show('analytics.user_stats');
+PRAGMA orch_asset_lineage('analytics.user_stats');
+PRAGMA orch_asset_materializations('analytics.user_stats', 50);
+PRAGMA orch_asset_partitions('analytics.daily');
+PRAGMA orch_asset_partitions_calendar('analytics.daily');
+PRAGMA orch_asset_health;
+PRAGMA orch_backfill('analytics.daily', '2026-01-01', '2026-12-31');
+PRAGMA orch_backfill_missing('analytics.daily');
+PRAGMA orch_run_partition('analytics.daily', '2026-05-17');
+
+-- Automation / Sensor (Phase 15)
+PRAGMA orch_automation_status;                  -- evaluation snapshot
+PRAGMA orch_automation_simulate('analytics.x'); -- dry-run
+PRAGMA orch_sensor_start;
+PRAGMA orch_sensor_stop;
+PRAGMA orch_sensor_status;
+PRAGMA orch_sensor_set_interval(30);
+
+-- Asset Check (Phase 16)
+PRAGMA orch_check_run('analytics.x');
+PRAGMA orch_check_history('analytics.x', 100);
+
+-- Dynamic Asset (Phase 17, Snowflake-compatible)
+PRAGMA orch_create_dynamic_asset(
+  'analytics.region_total', '5 minutes',
+  'SELECT region, SUM(total) FROM analytics.daily GROUP BY region');
+PRAGMA orch_dynamic_list;
+PRAGMA orch_dynamic_refresh('analytics.region_total');
+
+-- Pure scalar functions
+SELECT orch_extract_io('INSERT INTO x SELECT * FROM y');
+SELECT orch_extract_column_lineage(
+  'CREATE TABLE z AS SELECT a, UPPER(b) AS B_UP FROM t', '');
+
+-- State tables (Phase 0–17)
+SELECT * FROM __orch__.tasks;
+SELECT * FROM __orch__.runs WHERE status = 'failed';
+SELECT * FROM __orch__.lineage_edges;
+SELECT * FROM __orch__.column_lineage WHERE via_task = 'my_task';
+SELECT * FROM __orch__.assets;                       -- Phase 13
+SELECT * FROM __orch__.asset_materializations;       -- Phase 13/14
+SELECT * FROM __orch__.asset_edges;                  -- Phase 13/15
+SELECT * FROM __orch__.asset_partitions;             -- Phase 14
+SELECT * FROM __orch__.automation_evaluations;       -- Phase 15
+SELECT * FROM __orch__.asset_checks;                 -- Phase 16
+SELECT * FROM __orch__.asset_check_results;          -- Phase 16
+SELECT * FROM __orch__.ingest_schemas;               -- Phase 19
+SELECT * FROM __orch__.ingest_schema_changes;        -- Phase 19
+SELECT * FROM __orch__.ingest_loads;                 -- Phase 19
+SELECT * FROM __orch__.ingest_state;                 -- Phase 19
+SELECT * FROM __orch__.ingest_fetches;               -- Phase 19
+</code></pre>
+<h3 id="json-ingestion-phase-19">JSON ingestion (Phase 19)</h3>
+<p>Nested JSON becomes flat parent/child tables, and a schema ledger absorbs
+columns that appear later. Type inference is DuckDB's own: the source is read
+through <code>read_json</code> and the resulting types drive the normalization.</p>
+<pre><code class="language-sql">-- see the shape first; nothing is written
+PRAGMA orch_ingest_preview('orders.jsonl', 'raw.orders');
+
+-- load a file source
+PRAGMA orch_ingest_run('orders/*.jsonl', 'raw.orders');
+PRAGMA orch_ingest_run('orders.jsonl', 'raw.orders',
+                       disposition = 'merge', primary_key = 'id');
+
+-- load an API, resuming from the cursor the previous run stored
+CREATE SECRET orders_api (TYPE http, BEARER_TOKEN '...');
+PRAGMA orch_ingest_http('https://api.example.com/orders', 'raw.orders',
+                        secret = 'orders_api', paginate = 'cursor',
+                        records_path = 'data', cursor_path = 'meta.next',
+                        cursor_param = 'cursor', resource = 'orders');
+
+PRAGMA orch_ingest_state;
+PRAGMA orch_ingest_reset('https://api.example.com/orders', 'orders');
+</code></pre>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Normalization</strong></td>
+<td>Structs flatten into the parent (<code>customer__name</code>); arrays become child tables (<code>orders__items</code>). Control columns <code>_orch_id</code> / <code>_orch_parent_id</code> / <code>_orch_index</code> / <code>_orch_load_id</code> link and order the rows. <code>max_nesting</code> (default 3) caps how deep child tables go; anything deeper stays a JSON string column.</td>
+</tr>
+<tr>
+<td><strong>Schema ledger</strong></td>
+<td><code>ingest_schemas</code> gains a version only when the shape actually moves. Added columns and widening types (<code>INTEGER → BIGINT</code>, anything → <code>VARCHAR</code>) are absorbed with <code>ALTER</code>; an incompatible change fails the load with the column named. Columns that vanish stay and take NULLs.</td>
+</tr>
+<tr>
+<td><strong>Dispositions</strong></td>
+<td><code>append</code> (default), <code>replace</code> (keep only this load), <code>merge</code> (needs <code>primary_key</code>; replaces earlier rows whose key came back, children included).</td>
+</tr>
+<tr>
+<td><strong>HTTP</strong></td>
+<td><code>none</code> / <code>page</code> / <code>offset</code> / <code>cursor</code> / <code>link</code> pagination, bearer token from a DuckDB secret, resume cursor in <code>ingest_state</code>, per-page log in <code>ingest_fetches</code>. A <code>max_pages</code> ceiling is reported as <code>truncated</code>, never silently.</td>
+</tr>
+<tr>
+<td><strong>Destination</strong></td>
+<td>A three-part target (<code>lake.raw.orders</code>) loads into an attached catalog, so a DuckLake lakehouse is just a different target.</td>
+</tr>
+<tr>
+<td><strong>Lineage</strong></td>
+<td>Loaded tables register as Assets with a materialization per load, parent→child asset edges, and a <code>file://</code> / <code>http://</code> upstream in <code>lineage_edges</code>.</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="architecture">Architecture</h2>
+<p>A &quot;<strong>thin C++ shim + Rust core</strong>&quot; sandwich.</p>
+<pre><code>┌─ C++ extension (~3000 lines) ────────────────────────┐
+│  Registers PRAGMA / scalar functions                 │
+│  Executes SQL via per-thread Connection              │
+│  std::thread parallel dispatch                       │
+│  PREPARE + named bind for $param (multi-stmt aware)  │
+│  Sensor std::thread (Phase 15) — evaluates           │
+│    AutomationConditions every N seconds              │
+│  OptimizerExtension hook for ad-hoc column lineage   │
+│  Catalog API for DuckLake namespace                  │
+└──────────────┬───────────────────────────────────────┘
+               ↕ extern &quot;C&quot; FFI
+┌─ Rust workspace ─────────────────────────────────────┐
+│  orch_common   Task, PartitionDef, ParamSpec,        │
+│                AutomationCondition + evaluator,      │
+│                AssetCheck, Snowflake dump parser,    │
+│                FNV-1a code_version                   │
+│  orch_dag      DAG, topo layers, Mermaid             │
+│  orch_lineage  sqlparser-rs + column module          │
+│  orch_runtime  Header parser ($param/binding,        │
+│                @asset / @partitions_by /             │
+│                @automation / @target_lag /           │
+│                @freshness / @check), legacy {{}}     │
+│  orch_ol       OpenLineage HTTP worker               │
+│  orch_core     extern &quot;C&quot; facade (FFI shims)         │
+│  orch_cli      duck-orch binary (3-route CLI)        │
+│  orch_mcp      duck-orch-mcp (rmcp stdio, Phase 11)  │
+└──────────────────────────────────────────────────────┘
+</code></pre>
+<p>Why the C++ layer? DuckDB's stable C extension API doesn't yet expose
+optimizer / parser hooks, so a pure-Rust extension can't observe queries.
+The C++ shim handles DuckDB-internal calls; all logic lives in Rust.
+Same pattern as <code>ducksmiles</code>.</p>
+<p>See <a href="architecture.html">DESIGN.md</a> for the full design.</p>
+<hr />
+<h2 id="status">Status</h2>
+<p>All ROADMAP phases (0–17) shipped. See <a href="https://github.com/nkwork9999/duck-orch/blob/99e75181c1c88460d47a5f9e6d0e4e14680a0535/ROADMAP.md">ROADMAP.md</a> for the design
+of Phase 11–17 (Asset-centric, sensor-driven evolution).</p>
+<table>
+<thead>
+<tr>
+<th>Phase</th>
+<th>Topic</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0</td>
+<td>Project skeleton</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>1</td>
+<td>Parser + DAG + execution</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>2</td>
+<td>Optimizer hook (auto-interception)</td>
+<td>✅ (opt-in, <code>orch_capture_interactive</code>)</td>
+</tr>
+<tr>
+<td>3</td>
+<td>Mermaid visualization</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>4</td>
+<td>Retry + downstream skip</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>5</td>
+<td>Parallel execution</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>6</td>
+<td>CLI</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>7</td>
+<td>Incremental + tests</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>8</td>
+<td>Scheduler</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>9</td>
+<td>OpenLineage events</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>11</td>
+<td>MCP server (<code>duck-orch-mcp</code>, stdio, 9 tools)</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>12</td>
+<td>DuckDB-native <code>$param</code> binding</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>13</td>
+<td>Asset as first-class entity (schema + read API + edge projection)</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>14</td>
+<td>Partition (Daily/Static/Multi, backfill, calendar)</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>15</td>
+<td>AutomationCondition DSL + <code>@target_lag</code> + sensor</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>16</td>
+<td>Freshness + Asset Check + SLA surfaces</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>17</td>
+<td><code>CREATE DYNAMIC ASSET</code> + Snowflake dump migration</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>+</td>
+<td>Column-level lineage with subtype taxonomy</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>+</td>
+<td>DuckLake-aware OL namespace resolution</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>+</td>
+<td>OpenLineage <code>columnLineage</code> facet emission</td>
+<td>✅</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="development">Development</h2>
+<pre><code class="language-bash">cargo test --workspace --release    # Rust unit tests
+make                                # full DuckDB-bundled build
+make debug                          # debug build
+
+# Iterate quickly on Rust only
+cargo build -p duckorch_core --release
+cargo build -p duckorch_cli --release
+</code></pre>
+<p>DuckDB and <code>extension-ci-tools</code> are pinned at <code>v1.5.1</code> (submodules).
+When upgrading, bump both together.</p>
+<hr />
+<h2 id="license">License</h2>
+<p>MIT. See <a href="https://github.com/nkwork9999/duck-orch/blob/99e75181c1c88460d47a5f9e6d0e4e14680a0535/LICENSE">LICENSE</a>.</p>
+<h2 id="credits">Credits</h2>
+<p>All code in duckOrch is original. Design ideas (only — no code copied)
+were drawn from:</p>
+<ul>
+<li><a href="https://github.com/duckdb/community-extensions/tree/main/extensions/ducksmiles">ducksmiles</a> — C++ + Rust hybrid build layout</li>
+<li><a href="https://sqlmesh.readthedocs.io">SQLMesh</a> — comment-header task file format</li>
+<li><a href="https://docs.getdbt.com">dbt</a> — testing, downstream skip, <code>--full-refresh</code></li>
+<li><a href="https://openlineage.io">OpenLineage</a> — event spec (Apache-2.0; compatibility comes from following a public spec, not from any specific implementation)</li>
+<li><a href="https://docs.dagster.io">Dagster</a> (Phase 13–16) — Software-Defined Assets concept, <code>AutomationCondition</code>, partition + backfill UX</li>
+<li><a href="https://docs.snowflake.com/en/user-guide/dynamic-tables-about">Snowflake Dynamic Tables</a> (Phase 17) — <code>TARGET_LAG</code> declarative freshness; <code>CREATE DYNAMIC ASSET</code> syntax is intentionally close to <code>CREATE DYNAMIC TABLE</code> so dumps migrate without rewriting</li>
+<li><a href="https://github.com/modelcontextprotocol">Anthropic Model Context Protocol</a> (Phase 11) — <code>rmcp</code> Rust SDK powers the stdio MCP server</li>
+</ul>
+<p>duckOrch's positioning is &quot;<strong>laptop-sized Asset orchestrator with cloud-grade
+semantics</strong>.&quot; It is not trying to replace Airflow / Dagster / Snowflake at
+enterprise scale; it is trying to deliver their best ideas in a single
+<code>LOAD duckorch;</code> you can run on a plane.</p>
+
+<footer>対応ソース <a href="https://github.com/nkwork9999/duck-orch/tree/99e75181c1c88460d47a5f9e6d0e4e14680a0535"><code>99e75181c1c8</code></a> · DuckDB 2.0.0</footer>
+</main></div></body></html>

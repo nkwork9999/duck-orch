@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="DuckDB上で依存関係を解決し、パーティションやデータ品質を管理するオーケストレーション拡張。">
+<title>MCP サーバー · duckOrch</title><link rel="stylesheet" href="style.css">
+<script src="search.js" defer></script>
+</head>
+<body data-project="duck-orch">
+<a class="skip" href="#main">本文へ移動</a>
+<header class="masthead"><a href="index.html" class="product">duckOrch</a>
+<a href="https://github.com/nkwork9999/duck-orch">GitHub ↗</a></header>
+<div class="layout"><nav aria-label="ドキュメント"><a href="index.html">概要</a><a href="functions.html">SQL リファレンス</a><a href="python.html">Python 組み込み API</a><a href="guide.html">利用ガイド</a><a href="architecture.html">設計・実行モデル</a><a href="mcp.html" aria-current="page">MCP サーバー</a></nav>
+<main id="main"><details class="toc" open><summary>このページの目次</summary><ul><li class="h2"><a href="#what-it-exposes">What it exposes</a></li><li class="h3"><a href="#read-only">Read-only</a></li><li class="h3"><a href="#write-safety-defaulted">Write (safety-defaulted)</a></li><li class="h2"><a href="#build">Build</a></li><li class="h2"><a href="#configure-via-env">Configure via env</a></li><li class="h2"><a href="#wire-into-claude-code">Wire into Claude Code</a></li><li class="h2"><a href="#smoke-test-outside-claude">Smoke-test outside Claude</a></li></ul></details><h1 id="orch_mcp--duckorch-mcp-server">orch_mcp — duckOrch MCP server</h1>
+<p>A thin <a href="https://modelcontextprotocol.io">MCP (Model Context Protocol)</a> server
+that wraps the existing <code>duck-orch</code> CLI so Claude Code (or any MCP client) can
+drive duckOrch over <strong>stdio</strong>.</p>
+<p>Built on the official Rust SDK <a href="https://crates.io/crates/rmcp"><code>rmcp</code></a> v0.3
+with features <code>server</code>, <code>macros</code>, <code>transport-io</code>.</p>
+<h2 id="what-it-exposes">What it exposes</h2>
+<h3 id="read-only">Read-only</h3>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Wraps</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>list_pipelines</code></td>
+<td><code>duck-orch status --json</code></td>
+<td>(Punt: a dedicated <code>tasks</code> subcommand on the CLI would be cleaner.)</td>
+</tr>
+<tr>
+<td><code>list_runs</code></td>
+<td><code>duck-orch status --json</code></td>
+<td><code>limit</code> argument (default 20) truncates client-side.</td>
+</tr>
+<tr>
+<td><code>describe_task</code></td>
+<td><code>duck-orch lineage</code> + <code>impact</code></td>
+<td>Returns upstream + downstream edges for the task's output table.</td>
+</tr>
+<tr>
+<td><code>get_lineage</code></td>
+<td><code>duck-orch lineage</code> + <code>graph</code></td>
+<td>Returns rows + full Mermaid graph.</td>
+</tr>
+<tr>
+<td><code>validate</code></td>
+<td><code>duck-orch validate &lt;file&gt; --json</code></td>
+<td>Parse + validate one <code>.sql</code> task file.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="write-safety-defaulted">Write (safety-defaulted)</h3>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Wraps</th>
+<th>Safety default</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>run_pipeline</code></td>
+<td><code>duck-orch run --json</code></td>
+<td><strong><code>dry_run=true</code></strong> — returns the lineage Mermaid + recent runs as a preview, no execution. Pass <code>dry_run=false</code> to actually run.</td>
+</tr>
+<tr>
+<td><code>register_task</code></td>
+<td><code>duck-orch register &lt;path&gt; --json</code></td>
+<td>Rejects unless <code>path</code> is an existing file/directory (no raw SQL).</td>
+</tr>
+<tr>
+<td><code>unregister_task</code></td>
+<td><code>DELETE FROM __orch__.tasks</code> via direct <code>duckdb</code></td>
+<td><strong>Requires <code>confirm=true</code></strong> (default <code>false</code> → refused). The CLI has no <code>unregister</code> subcommand yet, so this tool talks to <code>duckdb</code> directly using <code>DUCK_ORCH_DB</code> / <code>DUCKORCH_EXT</code>.</td>
+</tr>
+<tr>
+<td><code>schedule_add</code></td>
+<td><code>duck-orch schedule add &lt;name&gt; &lt;cron&gt;</code></td>
+<td>Cron is validated by the CLI.</td>
+</tr>
+</tbody>
+</table>
+<p><code>schedule_remove</code> is not exposed (the CLI has no matching subcommand yet — punted).</p>
+<h2 id="build">Build</h2>
+<pre><code class="language-bash">cargo build -p orch_mcp --release
+# binary: target/release/duck-orch-mcp
+</code></pre>
+<p>Requires the <code>duck-orch</code> binary (crate <code>duckorch_cli</code>) to be on <code>$PATH</code>,
+<strong>and</strong> the duckOrch DuckDB extension already built (see top-level README).</p>
+<h2 id="configure-via-env">Configure via env</h2>
+<table>
+<thead>
+<tr>
+<th>Var</th>
+<th>Default</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>DUCK_ORCH_BIN</code></td>
+<td><code>duck-orch</code> (on PATH)</td>
+<td>Path to the <code>duck-orch</code> CLI binary.</td>
+</tr>
+<tr>
+<td><code>DUCK_ORCH_DB</code></td>
+<td>(CLI default <code>./mydata.duckdb</code>)</td>
+<td>Passed as <code>--db &lt;path&gt;</code> to every subcommand.</td>
+</tr>
+<tr>
+<td><code>DUCKORCH_EXT</code></td>
+<td>(CLI auto-detect)</td>
+<td>Passed as <code>--ext &lt;path&gt;</code> if set.</td>
+</tr>
+</tbody>
+</table>
+<p>The MCP server itself writes a single boot line to <strong>stderr</strong> then speaks
+JSON-RPC over stdio. Do not write anything to stdout from hooks.</p>
+<h2 id="wire-into-claude-code">Wire into Claude Code</h2>
+<p>Add an <code>mcpServers</code> entry to <code>~/.claude.json</code>:</p>
+<pre><code class="language-jsonc">{
+  &quot;mcpServers&quot;: {
+    &quot;duckorch&quot;: {
+      &quot;command&quot;: &quot;/absolute/path/to/target/release/duck-orch-mcp&quot;,
+      &quot;args&quot;: [],
+      &quot;env&quot;: {
+        &quot;DUCK_ORCH_BIN&quot;: &quot;/absolute/path/to/target/release/duck-orch&quot;,
+        &quot;DUCK_ORCH_DB&quot;:  &quot;/absolute/path/to/your/project.duckdb&quot;,
+        &quot;DUCKORCH_EXT&quot;:  &quot;/absolute/path/to/build/release/extension/duckorch/duckorch.duckdb_extension&quot;
+      }
+    }
+  }
+}
+</code></pre>
+<p>Restart Claude Code and the <code>duckorch</code> server should appear under <code>/mcp</code>.
+Tools will be namespaced as <code>mcp__duckorch__list_runs</code>, etc.</p>
+<h2 id="smoke-test-outside-claude">Smoke-test outside Claude</h2>
+<pre><code class="language-bash"># Should print a JSON-RPC initialize response and then wait on stdin.
+DUCK_ORCH_DB=./mydata.duckdb ./target/release/duck-orch-mcp &lt;&lt;'EOF'
+{&quot;jsonrpc&quot;:&quot;2.0&quot;,&quot;id&quot;:1,&quot;method&quot;:&quot;initialize&quot;,&quot;params&quot;:{&quot;protocolVersion&quot;:&quot;2024-11-05&quot;,&quot;capabilities&quot;:{},&quot;clientInfo&quot;:{&quot;name&quot;:&quot;smoke&quot;,&quot;version&quot;:&quot;0&quot;}}}
+EOF
+</code></pre>
+
+<footer>対応ソース <a href="https://github.com/nkwork9999/duck-orch/tree/99e75181c1c88460d47a5f9e6d0e4e14680a0535"><code>99e75181c1c8</code></a> · DuckDB 2.0.0</footer>
+</main></div></body></html>
