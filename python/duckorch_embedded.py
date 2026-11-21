@@ -665,6 +665,10 @@ class StaleReleasePlan(ValueError):
     """The active generation or source inputs changed since preparation."""
 
 
+class ReleaseRequestConflict(ValueError):
+    """A publication key was already used with a different request."""
+
+
 class GenerationCatalog:
     """Publish immutable checked manifests through one DuckDB transaction per environment."""
 
@@ -699,6 +703,13 @@ class GenerationCatalog:
                     environment VARCHAR NOT NULL, epoch BIGINT NOT NULL, event_id UUID UNIQUE NOT NULL,
                     revision VARCHAR NOT NULL, kind VARCHAR NOT NULL, delivered BOOLEAN NOT NULL,
                     PRIMARY KEY (environment, epoch)
+                )
+            """)
+            tx.execute("""
+                CREATE TABLE IF NOT EXISTS __orch__.release_requests (
+                    environment VARCHAR, request_key VARCHAR, digest VARCHAR NOT NULL,
+                    revision VARCHAR NOT NULL, epoch BIGINT NOT NULL,
+                    PRIMARY KEY (environment, request_key)
                 )
             """)
             tx.execute("""
@@ -766,10 +777,29 @@ class GenerationCatalog:
         if self.prepare(plan.revision) != plan:
             raise StaleReleasePlan("active generation or source version changed")
 
-    def publish(self, plan: ReleasePlan) -> PublishedGeneration:
+    def publish(self, plan: ReleasePlan, *, request_key: str | None = None) -> PublishedGeneration:
         if type(plan) is not ReleasePlan:
             raise TypeError("expected a ReleasePlan")
+        if request_key is not None and (type(request_key) is not str or not 1 <= len(request_key) <= 255):
+            raise ValueError("request_key must contain between 1 and 255 characters")
+        signature = None
+        if request_key is not None:
+            payload = dumps([str(plan.environment_id), plan.revision, plan.base_epoch, plan.input_epoch],
+                            separators=(",", ":")).encode("utf-8")
+            signature = sha256(payload).hexdigest()
+
         def switch(tx):
+            if request_key is not None:
+                prior = tx.execute("""
+                    SELECT digest, revision, epoch FROM __orch__.release_requests
+                    WHERE environment = ? AND request_key = ?
+                """, [self._environment, request_key]).fetchone()
+                if prior is not None:
+                    digest, revision, epoch = prior
+                    if digest != signature:
+                        raise ReleaseRequestConflict("request_key belongs to another publication plan")
+                    manifest = self._manifest(tx, revision, published_only=True)
+                    return self._snapshot(revision, epoch, *manifest)
             manifest = self._manifest(tx, plan.revision, published_only=False)
             epoch = tx.execute("""
                 UPDATE __orch__.release_environments AS e SET active = ?, epoch = epoch + 1
@@ -784,6 +814,10 @@ class GenerationCatalog:
                 UPDATE __orch__.release_manifests SET published = true WHERE environment = ? AND revision = ?
             """, [self._environment, plan.revision])
             self._notify(tx, epoch[0], plan.revision, "publish")
+            if request_key is not None:
+                tx.execute("""
+                    INSERT INTO __orch__.release_requests VALUES (?, ?, ?, ?, ?)
+                """, [self._environment, request_key, signature, plan.revision, epoch[0]])
             return self._snapshot(plan.revision, epoch[0], *manifest)
         return _write_transaction(self._db, switch)
 

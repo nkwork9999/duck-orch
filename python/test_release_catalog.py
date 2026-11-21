@@ -153,6 +153,35 @@ os._exit(42)
                 self.assertEqual(catalog.acknowledge_notifications([first.event_id]), 0)
                 self.assertEqual(catalog.pending_notifications(limit=10), all_events[1:])
 
+    def test_parallel_request_replay_returns_one_durable_publication(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = str(Path(directory) / "tenant.duckdb")
+            with duckdb.connect(database) as db:
+                catalog = GenerationCatalog(db, "production", {"orders"})
+                for revision in ("v1", "v2"):
+                    catalog.stage(revision, {"orders": ReleaseModel(revision, "schema")},
+                                  inputs={}, checks={"quality": True})
+                plan = catalog.prepare("v1")
+                barrier = Barrier(10)
+
+                def publish(attempt):
+                    if attempt < 10:
+                        barrier.wait()
+                    return catalog.publish(plan, request_key="run-1")
+
+                with ThreadPoolExecutor(10) as pool:
+                    results = list(pool.map(publish, range(100)))
+                self.assertTrue(all(result == results[0] for result in results))
+                self.assertEqual(len(catalog.pending_notifications(limit=10)), 1)
+                with self.assertRaises(ValueError):
+                    catalog.publish(catalog.prepare("v2"), request_key="run-1")
+                catalog.publish(catalog.prepare("v2"), request_key="run-2")
+            with duckdb.connect(database) as db:
+                catalog = GenerationCatalog(db, "production", {"orders"})
+                self.assertEqual(catalog.active().revision, "v2")
+                self.assertEqual(catalog.publish(plan, request_key="run-1"), results[0])
+                self.assertEqual(len(catalog.pending_notifications(limit=10)), 2)
+
     def test_trial_reuses_unchanged_versions_and_stays_pinned(self):
         with duckdb.connect() as db:
             production = GenerationCatalog(db, "production", {"sales", "report"})

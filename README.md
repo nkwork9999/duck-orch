@@ -253,6 +253,9 @@ isolated trial environment with the same immutable physical references.
 Read a bounded batch with `pending_notifications(limit=100)`, deliver its stable event IDs, then call
 `acknowledge_notifications` with the delivered IDs. Publication and rollback commit their notices with
 the pointer update. A missing acknowledgement leaves the same notice available for retry.
+Use `publish(plan, request_key=...)` when a host request can be retried. Store the original plan and
+key together. A retry returns the original publication even after a later publication. Reusing its
+key with a different plan raises `ReleaseRequestConflict`.
 `RelationContract.inspect` compares candidate column names, types and declared nullability using the DuckDB catalog.
 `JsonProjector(connection, fields)` projects registered paths and reports malformed documents, missing keys,
 JSON nulls and incompatible values per row. `VariantEventLog` stores events in typed columns and a VARIANT
