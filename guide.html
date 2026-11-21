@@ -1,17 +1,18 @@
 <!doctype html>
-<html lang="ja">
+<html lang="en">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="description" content="DuckDB上で依存関係を解決し、パーティションやデータ品質を管理するオーケストレーション拡張。">
-<title>利用ガイド · duckOrch</title><link rel="stylesheet" href="style.css">
+<meta name="description" content="Run dependency-aware data pipelines, manage partitions, and check data quality inside DuckDB.">
+<title>User guide · duckOrch</title><link rel="stylesheet" href="style.css">
 <script src="search.js" defer></script>
 </head>
 <body data-project="duck-orch">
-<a class="skip" href="#main">本文へ移動</a>
+<a class="skip" href="#main">Skip to content</a>
 <header class="masthead"><a href="index.html" class="product">duckOrch</a>
 <a href="https://github.com/nkwork9999/duck-orch">GitHub ↗</a></header>
-<div class="layout"><nav aria-label="ドキュメント"><a href="index.html">概要</a><a href="functions.html">SQL リファレンス</a><a href="settings.html">設定</a><a href="python.html">Python 組み込み API</a><a href="guide.html" aria-current="page">利用ガイド</a><a href="architecture.html">設計・実行モデル</a><a href="mcp.html">MCP サーバー</a></nav>
-<main id="main"><details class="toc" open><summary>このページの目次</summary><ul><li class="h2"><a href="#what-it-does">What it does</a></li><li class="h3"><a href="#core-phase-09">Core (Phase 0–9)</a></li><li class="h3"><a href="#asset--partition--sensor-phase-1117">Asset + Partition + Sensor (Phase 11–17)</a></li><li class="h2"><a href="#quick-start">Quick start</a></li><li class="h3"><a href="#1-build">1. Build</a></li><li class="h3"><a href="#2-define-tasks">2. Define tasks</a></li><li class="h3"><a href="#3-run">3. Run</a></li><li class="h2"><a href="#task-file-format">Task file format</a></li><li class="h3"><a href="#variable-substitution">Variable substitution</a></li><li class="h3"><a href="#snowflake-style-declaration">Snowflake-style declaration</a></li><li class="h2"><a href="#embedded-daily-partition-planner">Embedded daily-partition planner</a></li><li class="h2"><a href="#cli">CLI</a></li><li class="h3"><a href="#mcp-server-phase-11">MCP server (Phase 11)</a></li><li class="h2"><a href="#sql-api">SQL API</a></li><li class="h3"><a href="#json-ingestion-phase-19">JSON ingestion (Phase 19)</a></li><li class="h2"><a href="#architecture">Architecture</a></li><li class="h2"><a href="#status">Status</a></li><li class="h2"><a href="#development">Development</a></li><li class="h2"><a href="#license">License</a></li><li class="h2"><a href="#credits">Credits</a></li></ul></details><h1 id="duckorch">duckOrch</h1>
+<div class="layout"><nav aria-label="Documentation"><a href="index.html">Overview</a><a href="functions.html">SQL reference</a><a href="settings.html">Settings</a><a href="python.html">Embedded Python API</a><a href="guide.html" aria-current="page">User guide</a><a href="architecture.html">Architecture and execution</a><a href="mcp.html">MCP server</a></nav>
+<main id="main"><details class="toc" open><summary>On this page</summary><ul><li class="h2"><a href="#what-it-does">What it does</a></li><li class="h3"><a href="#core-phase-09">Core (Phase 0–9)</a></li><li class="h3"><a href="#asset--partition--sensor-phase-1117">Asset + Partition + Sensor (Phase 11–17)</a></li><li class="h2"><a href="#quick-start">Quick start</a></li><li class="h3"><a href="#1-build">1. Build</a></li><li class="h3"><a href="#2-define-tasks">2. Define tasks</a></li><li class="h3"><a href="#3-run">3. Run</a></li><li class="h2"><a href="#task-file-format">Task file format</a></li><li class="h3"><a href="#variable-substitution">Variable substitution</a></li><li class="h3"><a href="#snowflake-style-declaration">Snowflake-style declaration</a></li><li class="h2"><a href="#embedded-daily-partition-planner">Embedded daily-partition planner</a></li><li class="h2"><a href="#cli">CLI</a></li><li class="h3"><a href="#mcp-server-phase-11">MCP server (Phase 11)</a></li><li class="h2"><a href="#sql-api">SQL API</a></li><li class="h3"><a href="#json-ingestion-phase-19">JSON ingestion (Phase 19)</a></li><li class="h2"><a href="#architecture">Architecture</a></li><li class="h2"><a href="#status">Status</a></li><li class="h2"><a href="#development">Development</a></li><li class="h2"><a href="#license">License</a></li><li class="h2"><a href="#credits">Credits</a></li></ul></details><h1 id="duckorch">duckOrch</h1>
+<p><a href="https://nkwork9999.github.io/duck-orch/">Full documentation</a></p>
 <p><strong>Asset-centric data orchestration with lineage, partitions, and a sensor
 loop</strong>, packaged as a single DuckDB extension. Define tasks → automatic DAG +
 asset graph, partition-aware execution, Dagster-style declarative automation,
@@ -272,6 +273,50 @@ upstream changes.</p>
 <h2 id="embedded-daily-partition-planner">Embedded daily-partition planner</h2>
 <p><code>python/duckorch_embedded.py</code> exposes <code>DailyPartitionPlanner(connection, models)</code>. Give it one tenant-scoped connection and a host-owned mapping from model IDs to registered <strong>daily</strong> asset names. <code>pending(model_id, start, end)</code> returns registered dates in the half-open interval whose latest attempt has not succeeded. Initialize the asset registry before planning.</p>
 <p><code>pending_ranges(model_id, start, end)</code> merges adjacent pending days into half-open intervals. For downstream invalidation, construct <code>ChangeWindowPlanner(dependencies, horizon)</code> with a registered graph, a <code>DateWindow</code>, and a <code>PartitionGrain</code> for each edge. Its <code>affected(source_id, changed_window)</code> method returns downstream windows clipped to the retained horizon. Planning is read-only.</p>
+<p>Use <code>GenerationCoverage(connection, models)</code> when workers need durable reservations.
+<code>enqueue(model_id, generation, DateWindow(start, end))</code> atomically returns claims for gaps in the requested interval.
+It considers both completed work and outstanding claims for the same asset and generation. Call
+<code>finish(claim, success=True)</code> after the work commits, or pass <code>success=False</code> to release it for retry.
+Store the claim with the worker's job so it can be settled after restarting. A persistent DuckDB file retains
+the reservations across restarts. An outstanding claim continues to own its interval until explicitly settled.
+Use <code>batches(claims)</code> to group adjacent reservations for a single worker job. Call
+<code>settle(batch, succeeded)</code> with the successful claim IDs to commit their outcomes together and release failures.</p>
+<p>For daily rolling models, set an edge to <code>RollingDependency(lookback=6)</code> for a seven-day trailing window.
+<code>affected_many({model_id: [window, ...]})</code> maps several source changes to downstream output ranges and merges
+overlapping or adjacent ranges. Keep the inputs needed for the rolling window when refreshing those outputs.
+<code>QualityCheckSelector(checks).select(changes)</code> picks checks by model and column dependencies.
+Register both inputs of a referential check and use <code>ForeignKeyCheck</code> to count child keys missing from the parent.
+<code>SharedQualityScan</code> evaluates <code>RowCountRule</code>, <code>NullRule</code> and <code>NumericRangeRule</code> together over a
+host-registered table and date interval. Numeric rules count nonfinite values as out of range
+and let the separate NULL rule determine whether missing values fail.
+Use <code>ChangeLedger(connection, models)</code> to record durable source intervals by revision and pass a revision
+and its <code>ChangeWindowPlanner</code> to <code>plan</code>. Use <code>explain</code> to iterate through source and parent-edge reasons
+with optional per-model byte estimates. Open a separate database file for each tenant.
+<code>FileIngestionLedger(connection, input_id).pending(files)</code> returns only immutable file revisions without
+a completion record. Supply <code>FileRevision(uri, version)</code> values from the host's inventory, and call
+<code>complete(files)</code> after those revisions have been committed to the destination.
+<code>GroupDelta(connection, source, target).refresh(revision, changes)</code> recomputes sums and counts for affected
+regions, including both sides of a move. The registered source has <code>region</code> and <code>amount</code> columns. The target
+has <code>region</code>, <code>value</code> and <code>n</code> columns. Pass <code>MembershipChange</code> values from the same committed source revision.
+<code>ModelFingerprint.capture</code> records definition, upstream versions, macros, settings and engine version.
+<code>FingerprintStore</code> keeps named revisions, and <code>FingerprintPlanner</code> returns reasons for invalidation.
+<code>GenerationCatalog</code> keeps checked manifests and a versioned active pointer in DuckDB. Stage all required
+model references and their passed checks, prepare a plan, and call <code>validate</code> before running work.
+<code>publish</code> checks the source and active epochs again before switching the entire manifest.
+<code>rollback</code> restores a previously published manifest and its input baseline. <code>fork</code> can create an
+isolated trial environment with the same immutable physical references.
+Read a bounded batch with <code>pending_notifications(limit=100)</code>, deliver its stable event IDs, then call
+<code>acknowledge_notifications</code> with the delivered IDs. Publication and rollback commit their notices with
+the pointer update. A missing acknowledgement leaves the same notice available for retry.
+Use <code>publish(plan, request_key=...)</code> when a host request can be retried. Store the original plan and
+key together. A retry returns the original publication even after a later publication. Reusing its
+key with a different plan raises <code>ReleaseRequestConflict</code>.
+<code>RelationContract.inspect</code> compares candidate column names, types and declared nullability using the DuckDB catalog.
+<code>JsonProjector(connection, fields)</code> projects registered paths and reports malformed documents, missing keys,
+JSON nulls and incompatible values per row. <code>VariantEventLog</code> stores events in typed columns and a VARIANT
+attribute object on DuckDB builds with VARIANT support. Register a frequent text key to project it at ingest.
+<code>CriticalPathScheduler.ready</code> selects dependency-ready tasks using path duration estimates and tenant quotas.
+The host supplies current task state and dispatches the selected IDs to workers.</p>
 <p>Give each active caller its own connection with the matching extension loaded. With Python 3.10+,
 the <code>duckdb</code> package and the matching installed extension, run the integration tests from the repository root:</p>
 <pre><code class="language-sh">python3 -m unittest discover -s python -v
@@ -519,7 +564,7 @@ Same pattern as <code>ducksmiles</code>.</p>
 <p>See <a href="architecture.html">DESIGN.md</a> for the full design.</p>
 <hr />
 <h2 id="status">Status</h2>
-<p>All ROADMAP phases (0–17) shipped. See <a href="https://github.com/nkwork9999/duck-orch/blob/99e75181c1c88460d47a5f9e6d0e4e14680a0535/ROADMAP.md">ROADMAP.md</a> for the design
+<p>All ROADMAP phases (0–17) shipped. See <a href="https://github.com/nkwork9999/duck-orch/blob/fd1c38fa7a4a19e8095ce1348f78cde0261cb245/ROADMAP.md">ROADMAP.md</a> for the design
 of Phase 11–17 (Asset-centric, sensor-driven evolution).</p>
 <table>
 <thead>
@@ -646,7 +691,7 @@ cargo build -p duckorch_cli --release
 When upgrading, bump both together.</p>
 <hr />
 <h2 id="license">License</h2>
-<p>MIT. See <a href="https://github.com/nkwork9999/duck-orch/blob/99e75181c1c88460d47a5f9e6d0e4e14680a0535/LICENSE">LICENSE</a>.</p>
+<p>MIT. See <a href="https://github.com/nkwork9999/duck-orch/blob/fd1c38fa7a4a19e8095ce1348f78cde0261cb245/LICENSE">LICENSE</a>.</p>
 <h2 id="credits">Credits</h2>
 <p>All code in duckOrch is original. Design ideas (only — no code copied)
 were drawn from:</p>
@@ -664,5 +709,5 @@ semantics</strong>.&quot; It is not trying to replace Airflow / Dagster / Snowfl
 enterprise scale; it is trying to deliver their best ideas in a single
 <code>LOAD duckorch;</code> you can run on a plane.</p>
 
-<footer>対応ソース <a href="https://github.com/nkwork9999/duck-orch/tree/99e75181c1c88460d47a5f9e6d0e4e14680a0535"><code>99e75181c1c8</code></a> · DuckDB 2.0.0</footer>
+<footer>Source revision <a href="https://github.com/nkwork9999/duck-orch/tree/fd1c38fa7a4a19e8095ce1348f78cde0261cb245"><code>fd1c38fa7a4a</code></a> · DuckDB 2.0.0</footer>
 </main></div></body></html>

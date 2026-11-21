@@ -1,1058 +1,118 @@
 <!doctype html>
-<html lang="ja">
+<html lang="en">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="description" content="DuckDB上で依存関係を解決し、パーティションやデータ品質を管理するオーケストレーション拡張。">
-<title>設計・実行モデル · duckOrch</title><link rel="stylesheet" href="style.css">
+<meta name="description" content="Run dependency-aware data pipelines, manage partitions, and check data quality inside DuckDB.">
+<title>Architecture and execution · duckOrch</title><link rel="stylesheet" href="style.css">
 <script src="search.js" defer></script>
 </head>
 <body data-project="duck-orch">
-<a class="skip" href="#main">本文へ移動</a>
+<a class="skip" href="#main">Skip to content</a>
 <header class="masthead"><a href="index.html" class="product">duckOrch</a>
 <a href="https://github.com/nkwork9999/duck-orch">GitHub ↗</a></header>
-<div class="layout"><nav aria-label="ドキュメント"><a href="index.html">概要</a><a href="functions.html">SQL リファレンス</a><a href="settings.html">設定</a><a href="python.html">Python 組み込み API</a><a href="guide.html">利用ガイド</a><a href="architecture.html" aria-current="page">設計・実行モデル</a><a href="mcp.html">MCP サーバー</a></nav>
-<main id="main"><details class="toc" open><summary>このページの目次</summary><ul><li class="h2"><a href="#%E5%AE%9F%E8%A3%85%E3%82%B9%E3%83%86%E3%83%BC%E3%82%BF%E3%82%B9-2026-05-02">実装ステータス (2026-05-02)</a></li><li class="h2"><a href="#%E7%9B%AE%E6%AC%A1">目次</a></li><li class="h2"><a href="#%E8%83%8C%E6%99%AF%E3%81%A8%E3%82%B4%E3%83%BC%E3%83%AB">背景とゴール</a></li><li class="h3"><a href="#%E8%AA%B2%E9%A1%8C">課題</a></li><li class="h3"><a href="#%E3%82%B4%E3%83%BC%E3%83%AB">ゴール</a></li><li class="h3"><a href="#%E9%9D%9E%E3%82%B4%E3%83%BC%E3%83%AB-mvp">非ゴール (MVP)</a></li><li class="h2"><a href="#%E3%82%A2%E3%83%BC%E3%82%AD%E3%83%86%E3%82%AF%E3%83%81%E3%83%A3">アーキテクチャ</a></li><li class="h3"><a href="#c-%E8%96%84%E7%9A%AE--rust-%E6%9C%AC%E4%BD%93%E3%82%B5%E3%83%B3%E3%83%89%E3%82%A4%E3%83%83%E3%83%81%E6%A7%8B%E6%88%90">「C++ 薄皮 + Rust 本体」サンドイッチ構成</a></li><li class="h3"><a href="#%E3%83%87%E3%82%A3%E3%83%AC%E3%82%AF%E3%83%88%E3%83%AA%E6%A7%8B%E6%88%90">ディレクトリ構成</a></li><li class="h3"><a href="#%E3%83%87%E3%83%BC%E3%82%BF%E3%83%95%E3%83%AD%E3%83%BC">データフロー</a></li><li class="h2"><a href="#%E3%82%BF%E3%82%B9%E3%82%AF%E5%AE%9A%E7%BE%A9%E3%83%95%E3%82%A9%E3%83%BC%E3%83%9E%E3%83%83%E3%83%88">タスク定義フォーマット</a></li><li class="h3"><a href="#%E8%A8%AD%E8%A8%88%E6%96%B9%E9%87%9D">設計方針</a></li><li class="h3"><a href="#%E4%BE%8B-%E5%BF%85%E9%A0%88%E3%83%95%E3%82%A3%E3%83%BC%E3%83%AB%E3%83%89%E3%81%A0%E3%81%91">例: 必須フィールドだけ</a></li><li class="h3"><a href="#%E4%BE%8B-%E5%85%A8%E3%83%95%E3%82%A3%E3%83%BC%E3%83%AB%E3%83%89">例: 全フィールド</a></li><li class="h3"><a href="#%E3%82%B5%E3%83%9D%E3%83%BC%E3%83%88%E3%81%99%E3%82%8B%E3%83%98%E3%83%83%E3%83%80%E3%83%95%E3%82%A3%E3%83%BC%E3%83%AB%E3%83%89">サポートするヘッダフィールド</a></li><li class="h3"><a href="#%E3%83%91%E3%82%A4%E3%83%97%E3%83%A9%E3%82%A4%E3%83%B3%E5%85%A8%E4%BD%93%E8%A8%AD%E5%AE%9A-orchtoml">パイプライン全体設定 (orch.toml)</a></li><li class="h3"><a href="#%E3%83%90%E3%83%AA%E3%83%87%E3%83%BC%E3%82%B7%E3%83%A7%E3%83%B3%E3%83%AB%E3%83%BC%E3%83%AB">バリデーションルール</a></li><li class="h2"><a href="#cli-%E8%A8%AD%E8%A8%88">CLI 設計</a></li><li class="h3"><a href="#%E5%8E%9F%E5%89%87">原則</a></li><li class="h3"><a href="#%E3%82%B3%E3%83%9E%E3%83%B3%E3%83%89%E4%B8%80%E8%A6%A7">コマンド一覧</a></li><li class="h3"><a href="#--db-%E3%82%AA%E3%83%97%E3%82%B7%E3%83%A7%E3%83%B3">--db オプション</a></li><li class="h3"><a href="#--json-%E5%87%BA%E5%8A%9B%E4%BE%8B">--json 出力例</a></li><li class="h2"><a href="#sql-%E9%96%A2%E6%95%B0-api">SQL 関数 API</a></li><li class="h2"><a href="#%E7%8A%B6%E6%85%8B%E7%AE%A1%E7%90%86">状態管理</a></li><li class="h3"><a href="#%E3%82%B9%E3%82%AD%E3%83%BC%E3%83%9E">スキーマ</a></li><li class="h3"><a href="#%E7%8A%B6%E6%85%8B%E4%BF%9D%E7%AE%A1%E5%85%88%E3%81%AE%E6%8A%BD%E8%B1%A1%E5%8C%96">状態保管先の抽象化</a></li><li class="h2"><a href="#%E5%8F%AF%E8%A6%96%E5%8C%96">可視化</a></li><li class="h3"><a href="#%E6%96%B9%E9%87%9D-mermaid--openlineage-%E3%81%AE%E4%B8%A1%E7%AB%8B">方針: Mermaid + OpenLineage の両立</a></li><li class="h3"><a href="#mermaid-%E5%87%BA%E5%8A%9B">Mermaid 出力</a></li><li class="h3"><a href="#openlineage-%E5%87%BA%E5%8A%9B">OpenLineage 出力</a></li><li class="h3"><a href="#%E4%BB%96-openlineage-extension-%E3%81%A8%E3%81%AE%E9%80%A3%E6%90%BA%E3%83%A2%E3%83%BC%E3%83%89">他 OpenLineage extension との連携モード</a></li><li class="h3"><a href="#html-%E5%87%BA%E5%8A%9B-optional">HTML 出力 (optional)</a></li><li class="h2"><a href="#%E5%A4%B1%E6%95%97%E5%87%A6%E7%90%86--%E3%83%AA%E3%83%88%E3%83%A9%E3%82%A4">失敗処理 / リトライ</a></li><li class="h3"><a href="#%E5%A4%B1%E6%95%97%E6%99%82%E3%81%AE%E4%BC%9D%E6%92%AD%E3%83%9D%E3%83%AA%E3%82%B7%E3%83%BC-dbt-%E6%B5%81">失敗時の伝播ポリシー (dbt 流)</a></li><li class="h3"><a href="#%E3%83%AA%E3%83%88%E3%83%A9%E3%82%A4%E6%88%A6%E7%95%A5">リトライ戦略</a></li><li class="h3"><a href="#%E3%82%A8%E3%83%A9%E3%83%BC%E8%A9%B3%E7%B4%B0%E3%81%AE%E4%BF%9D%E5%AD%98">エラー詳細の保存</a></li><li class="h3"><a href="#claude-%E9%80%A3%E6%90%BA-%E5%A4%B1%E6%95%97%E6%99%82%E3%81%AE%E8%87%AA%E5%8B%95%E3%82%B3%E3%83%B3%E3%83%86%E3%82%AD%E3%82%B9%E3%83%88">Claude 連携: 失敗時の自動コンテキスト</a></li><li class="h2"><a href="#%E3%82%A4%E3%83%B3%E3%82%AF%E3%83%AA%E3%83%A1%E3%83%B3%E3%82%BF%E3%83%AB%E5%AE%9F%E8%A1%8C">インクリメンタル実行</a></li><li class="h3"><a href="#%E5%9F%BA%E6%9C%AC%E3%83%A2%E3%83%87%E3%83%AB">基本モデル</a></li><li class="h3"><a href="#jinja-%E9%A2%A8%E3%83%97%E3%83%AC%E3%83%BC%E3%82%B9%E3%83%9B%E3%83%AB%E3%83%80">Jinja 風プレースホルダ</a></li><li class="h3"><a href="#--full-refresh-%E3%83%95%E3%83%A9%E3%82%B0">--full-refresh フラグ</a></li><li class="h2"><a href="#%E3%83%86%E3%82%B9%E3%83%88--%E3%82%A2%E3%82%B5%E3%83%BC%E3%82%B7%E3%83%A7%E3%83%B3">テスト / アサーション</a></li><li class="h3"><a href="#test-%E3%83%98%E3%83%83%E3%83%80">@test ヘッダ</a></li><li class="h3"><a href="#%E3%82%B5%E3%83%9D%E3%83%BC%E3%83%88%E3%81%99%E3%82%8B%E3%82%A2%E3%82%B5%E3%83%BC%E3%82%B7%E3%83%A7%E3%83%B3">サポートするアサーション</a></li><li class="h3"><a href="#%E5%AE%9F%E8%A1%8C">実行</a></li><li class="h2"><a href="#%E4%B8%A6%E5%88%97%E5%AE%9F%E8%A1%8C">並列実行</a></li><li class="h3"><a href="#%E5%9F%BA%E6%9C%AC%E8%A8%AD%E8%A8%88">基本設計</a></li><li class="h3"><a href="#rust-%E5%81%B4%E3%81%AE%E5%AE%9F%E8%A3%85">Rust 側の実装</a></li><li class="h3"><a href="#duckdb-connection-%E3%81%AE%E6%89%B1%E3%81%84">DuckDB Connection の扱い</a></li><li class="h2"><a href="#claude--%E3%82%A8%E3%83%BC%E3%82%B8%E3%82%A7%E3%83%B3%E3%83%88%E9%80%A3%E6%90%BA">Claude / エージェント連携</a></li><li class="h3"><a href="#%E8%A8%AD%E8%A8%88%E5%8E%9F%E5%89%87">設計原則</a></li><li class="h3"><a href="#%E6%A9%9F%E8%83%BD">機能</a></li><li class="h2"><a href="#%E3%82%B9%E3%82%B1%E3%82%B8%E3%83%A5%E3%83%BC%E3%83%A9">スケジューラ</a></li><li class="h3"><a href="#%E5%AE%9F%E8%A3%85">実装</a></li><li class="h3"><a href="#cli">CLI</a></li><li class="h3"><a href="#duckdb-%E3%83%97%E3%83%AD%E3%82%BB%E3%82%B9%E5%86%85%E3%83%A2%E3%83%BC%E3%83%89">DuckDB プロセス内モード</a></li><li class="h2"><a href="#%E6%8B%A1%E5%BC%B5%E3%81%A8%E3%81%AE%E5%85%B1%E5%AD%98">拡張との共存</a></li><li class="h3"><a href="#%E6%83%B3%E5%AE%9A%E3%82%B7%E3%83%8A%E3%83%AA%E3%82%AA">想定シナリオ</a></li><li class="h3"><a href="#%E8%A1%9D%E7%AA%81%E5%9B%9E%E9%81%BF">衝突回避</a></li><li class="h2"><a href="#%E9%96%8B%E7%99%BA%E3%82%B9%E3%83%86%E3%83%83%E3%83%97-mvppro">開発ステップ (MVP→Pro)</a></li><li class="h3"><a href="#phase-0-%E7%92%B0%E5%A2%83%E6%A7%8B%E7%AF%89-1%E6%97%A5">Phase 0: 環境構築 (1日)</a></li><li class="h3"><a href="#phase-1-%E6%9C%80%E5%B0%8F%E3%83%AB%E3%83%BC%E3%83%97-1%E9%80%B1">Phase 1: 最小ループ (1週)</a></li><li class="h3"><a href="#phase-2-optimizer-%E3%83%95%E3%83%83%E3%82%AF--%E8%87%AA%E5%8B%95%E3%83%AA%E3%83%8D%E3%83%BC%E3%82%B8-1%E9%80%B1-%E5%BB%B6%E6%9C%9F">Phase 2: optimizer フック + 自動リネージ (1週) [延期]</a></li><li class="h3"><a href="#phase-3-%E5%8F%AF%E8%A6%96%E5%8C%96-1%E9%80%B1">Phase 3: 可視化 (1週)</a></li><li class="h3"><a href="#phase-4-%E5%A4%B1%E6%95%97%E5%87%A6%E7%90%86--%E3%83%AA%E3%83%88%E3%83%A9%E3%82%A4-3%E6%97%A5">Phase 4: 失敗処理 + リトライ (3日)</a></li><li class="h3"><a href="#phase-5-%E4%B8%A6%E5%88%97%E5%AE%9F%E8%A1%8C-3%E6%97%A5">Phase 5: 並列実行 (3日)</a></li><li class="h3"><a href="#phase-6-cli--claude-%E9%80%A3%E6%90%BA-1%E9%80%B1">Phase 6: CLI + Claude 連携 (1週)</a></li><li class="h3"><a href="#phase-7-%E3%82%A4%E3%83%B3%E3%82%AF%E3%83%AA%E3%83%A1%E3%83%B3%E3%82%BF%E3%83%AB--%E3%83%86%E3%82%B9%E3%83%88-1%E9%80%B1">Phase 7: インクリメンタル + テスト (1週)</a></li><li class="h3"><a href="#phase-8-%E3%82%B9%E3%82%B1%E3%82%B8%E3%83%A5%E3%83%BC%E3%83%A9-3%E6%97%A5">Phase 8: スケジューラ (3日)</a></li><li class="h3"><a href="#phase-9-openlineage-%E7%B5%B1%E5%90%88-3%E6%97%A5">Phase 9: OpenLineage 統合 (3日)</a></li><li class="h3"><a href="#phase-10-%E3%83%89%E3%82%AD%E3%83%A5%E3%83%A1%E3%83%B3%E3%83%88--%E3%83%AA%E3%83%AA%E3%83%BC%E3%82%B9">Phase 10: ドキュメント + リリース</a></li><li class="h2"><a href="#%E3%83%AA%E3%82%B9%E3%82%AF%E3%81%A8%E6%9C%AA%E8%A7%A3%E6%B1%BA%E4%BA%8B%E9%A0%85">リスクと未解決事項</a></li><li class="h3"><a href="#%E6%8A%80%E8%A1%93%E3%83%AA%E3%82%B9%E3%82%AF">技術リスク</a></li><li class="h3"><a href="#%E6%9C%AA%E8%A7%A3%E6%B1%BA%E3%81%AE%E8%A8%AD%E8%A8%88%E5%88%A4%E6%96%AD">未解決の設計判断</a></li><li class="h2"><a href="#%E5%8F%82%E8%80%83%E3%81%AB%E3%81%97%E3%81%9F%E3%83%97%E3%83%AD%E3%82%B8%E3%82%A7%E3%82%AF%E3%83%88%E3%82%B3%E3%83%BC%E3%83%89%E3%81%AF%E3%82%B3%E3%83%94%E3%83%BC%E3%81%97%E3%81%A6%E3%81%84%E3%81%AA%E3%81%84">参考にしたプロジェクト(コードはコピーしていない)</a></li><li class="h3"><a href="#%E8%91%97%E4%BD%9C%E6%A8%A9%E5%B8%B0%E5%B1%9E%E3%81%AB%E3%81%A4%E3%81%84%E3%81%A6">著作権・帰属について</a></li></ul></details><h1 id="duckorch--duckdb-orchestration--lineage-extension">duckOrch — DuckDB Orchestration + Lineage Extension</h1>
-<p>DuckDB の中で「DAG オーケストレーション + 自動リネージ + 可視化」を 1 拡張で完結させる。
-SQLMesh 風のファイルフォーマット + Claude エージェント連携前提の CLI を備える。</p>
-<h2 id="実装ステータス-2026-05-02">実装ステータス (2026-05-02)</h2>
+<div class="layout"><nav aria-label="Documentation"><a href="index.html">Overview</a><a href="functions.html">SQL reference</a><a href="settings.html">Settings</a><a href="python.html">Embedded Python API</a><a href="guide.html">User guide</a><a href="architecture.html" aria-current="page">Architecture and execution</a><a href="mcp.html">MCP server</a></nav>
+<main id="main"><details class="toc" open><summary>On this page</summary><ul><li class="h2"><a href="#extension-and-workers">Extension and workers</a></li><li class="h2"><a href="#task-definitions">Task definitions</a></li><li class="h2"><a href="#execution-state-and-retries">Execution, state, and retries</a></li><li class="h2"><a href="#incremental-runs-and-assets">Incremental runs and assets</a></li><li class="h2"><a href="#lineage-and-scheduling">Lineage and scheduling</a></li><li class="h2"><a href="#design-history-and-compatibility">Design history and compatibility</a></li></ul></details><h1 id="duckorch-architecture-and-execution">duckOrch architecture and execution</h1>
+<p>duckOrch stores task definitions, asset state, and run history in DuckDB. It executes a directed acyclic graph of tasks, records dataset dependencies, and exposes orchestration to SQL, the CLI, and the MCP server. The <a href="guide.html">user guide</a> and the <a href="functions.html">SQL reference</a> describe the interfaces available in the documented release. The <a href="https://github.com/nkwork9999/duck-orch/blob/fd1c38fa7a4a19e8095ce1348f78cde0261cb245/DESIGN.md">original design record</a> includes the prototype roadmap, schema sketches, and design decisions.</p>
+<h2 id="extension-and-workers">Extension and workers</h2>
+<p>The C++ extension registers DuckDB operations and executes prepared statements. Rust implements task metadata parsing, dependency analysis, graph traversal, scheduling, and lineage serialization. The native interface passes validated values and results between the components. Code that calls DuckDB's C++ internals targets a supported DuckDB revision.</p>
 <table>
 <thead>
 <tr>
-<th>Phase</th>
-<th>内容</th>
-<th>状態</th>
+<th>Area</th>
+<th>Responsibility</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td>0</td>
-<td>プロジェクト骨組み(C++薄皮+Rust本体、ducksmiles流)</td>
-<td>✅ 完了</td>
+<td>Task registration</td>
+<td>Read SQL files, parse their metadata, and store source identity and input/output information.</td>
 </tr>
 <tr>
-<td>1</td>
-<td>タスクパーサ + DAG + 直列実行</td>
-<td>✅ 完了</td>
+<td>Graph planning</td>
+<td>Resolve explicit dependencies and inferred table relationships, detect cycles, and order the affected tasks.</td>
 </tr>
 <tr>
-<td>2</td>
-<td>optimizer フック自動リネージ</td>
-<td>⏸ 延期 (sqlparser-rs で代替可)</td>
+<td>Execution</td>
+<td>Dispatch ready tasks, execute SQL on a worker connection, and record success, failure, or skip outcomes.</td>
 </tr>
 <tr>
-<td>3</td>
-<td>Mermaid 可視化(lineage/dag/combined)</td>
-<td>✅ 完了</td>
+<td>Assets</td>
+<td>Track partitions, materializations, checks, dynamic refresh, and automation conditions.</td>
 </tr>
 <tr>
-<td>4</td>
-<td>失敗時 downstream skip + exp backoff retry</td>
-<td>✅ 完了</td>
+<td>Lineage</td>
+<td>Record dependencies and generate Mermaid diagrams or OpenLineage events.</td>
 </tr>
 <tr>
-<td>5</td>
-<td>並列実行(topo layer + N std::thread)</td>
-<td>✅ 完了</td>
-</tr>
-<tr>
-<td>6</td>
-<td>duck-orch CLI(register/run/status/graph/test/validate/impact/lineage/schedule)+ --json</td>
-<td>✅ 完了</td>
-</tr>
-<tr>
-<td>7</td>
-<td>インクリメンタル(Jinja {{ var }} + 動的 watermark)+ @test</td>
-<td>✅ 完了</td>
-</tr>
-<tr>
-<td>8</td>
-<td>スケジューラ(CLI daemon + cron)</td>
-<td>✅ 完了</td>
-</tr>
-<tr>
-<td>9</td>
-<td>OpenLineage HTTP 発行(背景 worker thread + queue)</td>
-<td>✅ 完了</td>
-</tr>
-<tr>
-<td>11-17</td>
-<td><strong>Asset 一級化 + MCP + Snowflake Dynamic Tables 互換</strong></td>
-<td>📋 設計確定 → <a href="https://github.com/nkwork9999/duck-orch/blob/99e75181c1c88460d47a5f9e6d0e4e14680a0535/ROADMAP.md">ROADMAP.md</a></td>
+<td>Host integrations</td>
+<td>Expose typed planning and state operations in Python, asset tools through MCP, and machine-readable CLI output.</td>
 </tr>
 </tbody>
 </table>
-<p>検証済み: 4タスクの DAG パイプラインが PRAGMA / CLI 両方で動作、Mermaid 出力、並列実行、インクリメンタル差分、OL イベント送信、cron 登録すべて確認済み。</p>
-<p><strong>Phase 11 以降の設計は <a href="https://github.com/nkwork9999/duck-orch/blob/99e75181c1c88460d47a5f9e6d0e4e14680a0535/ROADMAP.md">ROADMAP.md</a> を参照</strong> (Asset 中心アーキテクチャへの転換、MCP サーバ追加、Snowflake <code>TARGET_LAG</code> 互換、3 経路 CLI/SQL/MCP カバレッジ)。</p>
-<hr />
-<h2 id="目次">目次</h2>
-<ol>
-<li><a href="#%E8%83%8C%E6%99%AF%E3%81%A8%E3%82%B4%E3%83%BC%E3%83%AB">背景とゴール</a></li>
-<li><a href="#%E3%82%A2%E3%83%BC%E3%82%AD%E3%83%86%E3%82%AF%E3%83%81%E3%83%A3">アーキテクチャ</a></li>
-<li><a href="#%E3%82%BF%E3%82%B9%E3%82%AF%E5%AE%9A%E7%BE%A9%E3%83%95%E3%82%A9%E3%83%BC%E3%83%9E%E3%83%83%E3%83%88">タスク定義フォーマット</a></li>
-<li><a href="#cli-%E8%A8%AD%E8%A8%88">CLI 設計</a></li>
-<li><a href="#sql-%E9%96%A2%E6%95%B0-api">SQL 関数 API</a></li>
-<li><a href="#%E7%8A%B6%E6%85%8B%E7%AE%A1%E7%90%86">状態管理</a></li>
-<li><a href="#%E5%8F%AF%E8%A6%96%E5%8C%96">可視化</a></li>
-<li><a href="#%E5%A4%B1%E6%95%97%E5%87%A6%E7%90%86--%E3%83%AA%E3%83%88%E3%83%A9%E3%82%A4">失敗処理 / リトライ</a></li>
-<li><a href="#%E3%82%A4%E3%83%B3%E3%82%AF%E3%83%AA%E3%83%A1%E3%83%B3%E3%82%BF%E3%83%AB%E5%AE%9F%E8%A1%8C">インクリメンタル実行</a></li>
-<li><a href="#%E3%83%86%E3%82%B9%E3%83%88--%E3%82%A2%E3%82%B5%E3%83%BC%E3%82%B7%E3%83%A7%E3%83%B3">テスト / アサーション</a></li>
-<li><a href="#%E4%B8%A6%E5%88%97%E5%AE%9F%E8%A1%8C">並列実行</a></li>
-<li><a href="#claude--%E3%82%A8%E3%83%BC%E3%82%B8%E3%82%A7%E3%83%B3%E3%83%88%E9%80%A3%E6%90%BA">Claude / エージェント連携</a></li>
-<li><a href="#%E3%82%B9%E3%82%B1%E3%82%B8%E3%83%A5%E3%83%BC%E3%83%A9">スケジューラ</a></li>
-<li><a href="#%E6%8B%A1%E5%BC%B5%E3%81%A8%E3%81%AE%E5%85%B1%E5%AD%98">拡張との共存</a></li>
-<li><a href="#%E9%96%8B%E7%99%BA%E3%82%B9%E3%83%86%E3%83%83%E3%83%97-mvppro">開発ステップ (MVP→Pro)</a></li>
-<li><a href="#%E3%83%AA%E3%82%B9%E3%82%AF%E3%81%A8%E6%9C%AA%E8%A7%A3%E6%B1%BA%E4%BA%8B%E9%A0%85">リスクと未解決事項</a></li>
-<li><a href="#%E5%8F%82%E8%80%83%E3%81%AB%E3%81%97%E3%81%9F%E3%83%97%E3%83%AD%E3%82%B8%E3%82%A7%E3%82%AF%E3%83%88%E3%82%B3%E3%83%BC%E3%83%89%E3%81%AF%E3%82%B3%E3%83%94%E3%83%BC%E3%81%97%E3%81%A6%E3%81%84%E3%81%AA%E3%81%84">参考にしたプロジェクト</a></li>
-</ol>
-<hr />
-<h2 id="背景とゴール">背景とゴール</h2>
-<h3 id="課題">課題</h3>
-<ul>
-<li>dbt + Airflow + Marquez を別言語・別プロセスで運用するのは重い</li>
-<li>DuckDB ユーザーは「単一ファイル + 単一コマンド」の体験を期待する</li>
-<li>AI エージェント(Claude 等)からパイプラインを生成・修正・実行できる設計が欲しい</li>
-</ul>
-<h3 id="ゴール">ゴール</h3>
-<ul>
-<li><code>LOAD duckorch;</code> 1 行で使える</li>
-<li>タスク = 1 SQL ファイル(SQLMesh 流ヘッダ付き)</li>
-<li>DAG・リネージ両方を<strong>1 つの定義から</strong>自動生成</li>
-<li>Mermaid と OpenLineage 両方で可視化</li>
-<li>全 CLI コマンドに <code>--json</code> フラグでエージェントが parse 可能</li>
-</ul>
-<h3 id="非ゴール-mvp">非ゴール (MVP)</h3>
-<ul>
-<li>分散実行 (将来 DuckLake state で対応)</li>
-<li>Web UI (Mermaid と OpenLineage 互換で代替)</li>
-<li>Python/JS API (DuckDB SQL と CLI で十分)</li>
-</ul>
-<hr />
-<h2 id="アーキテクチャ">アーキテクチャ</h2>
-<h3 id="c-薄皮--rust-本体サンドイッチ構成">「C++ 薄皮 + Rust 本体」サンドイッチ構成</h3>
-<p>DuckDB の C API は関数登録系のみで、optimizer / parser フックが未公開 (<code>duckdb_extension.h</code> 確認済、2026-05)。
-クエリへの自動割り込みが必要なので C++ 拡張本体にし、ロジックは Rust に逃がす。
-このビルド構成は DuckDB extension-template-rs を踏襲した一般的な形式(ducksmiles 等多くの拡張で採用)。</p>
-<pre><code>┌─────────────────────────────────────────────┐
-│ C++ 薄ラッパー (~数百行)                    │
-│  ・OptimizerExtension::pre_optimize 登録    │
-│  ・LogicalOrchSentinel / PhysicalOrchSentinel│
-│  ・ScalarFunction / TableFunction 登録      │
-│  ・FFI で Rust 関数呼び出し                 │
-└─────────────────────────────────────────────┘
-                  ↕ extern &quot;C&quot; FFI
-┌─────────────────────────────────────────────┐
-│ Rust 本体                                   │
-│  ・タスクファイルパーサ                     │
-│  ・DAG 構築 / トポソート (petgraph)         │
-│  ・SQL 解析で I/O 抽出 (sqlparser-rs)       │
-│  ・状態管理 (DuckDB Connection 経由)        │
-│  ・スケジューラ (cron + worker thread)      │
-│  ・Mermaid 生成                              │
-│  ・OpenLineage イベント生成                  │
-└─────────────────────────────────────────────┘
-</code></pre>
-<h3 id="ディレクトリ構成">ディレクトリ構成</h3>
-<pre><code>duckOrch/
-├── DESIGN.md                          ← このファイル
-├── CMakeLists.txt
-├── Makefile                           ← ducksmiles 流
-├── extension_config.cmake
-├── vcpkg.json
-├── Cargo.toml                         ← workspace
-├── docs/                              ← 詳細 docs (後述)
-├── src/                               ← C++ 薄皮
-│   ├── duckorch_extension.cpp        ← entry, フック登録
-│   ├── duckorch_extension.hpp
-│   ├── orch_optimizer.cpp            ← PreOptimize, plan 解析
-│   ├── orch_optimizer.hpp
-│   ├── logical_orch_sentinel.cpp
-│   ├── logical_orch_sentinel.hpp
-│   ├── physical_orch_sentinel.cpp
-│   ├── physical_orch_sentinel.hpp
-│   ├── ffi_bridge.cpp                ← C++ ⇔ Rust 橋
-│   ├── ffi_bridge.hpp
-│   └── include/
-│       └── duckorch.h                ← Rust 側 extern &quot;C&quot; 宣言
-├── crates/                            ← Rust workspace
-│   ├── orch_core/
-│   │   ├── Cargo.toml
-│   │   └── src/
-│   │       ├── lib.rs                ← extern &quot;C&quot; exports
-│   │       ├── task_parser.rs        ← @task ヘッダ解析
-│   │       ├── dag.rs                ← petgraph トポソート
-│   │       ├── lineage.rs            ← sqlparser-rs で I/O 抽出
-│   │       ├── state.rs              ← DuckDB Connection 経由
-│   │       ├── scheduler.rs          ← cron + worker
-│   │       ├── executor.rs           ← タスク実行
-│   │       ├── mermaid.rs            ← グラフ生成
-│   │       └── openlineage.rs        ← OL イベント生成
-│   └── orch_cli/                     ← duck-orch CLI
-│       ├── Cargo.toml
-│       └── src/main.rs
-├── tasks/                             ← サンプルパイプライン
-│   └── example/
-│       ├── orch.toml
-│       ├── clean_users.sql
-│       ├── clean_orders.sql
-│       ├── user_stats.sql
-│       └── revenue_daily.sql
-└── test/
-    ├── unit/                          ← Rust unit
-    └── e2e/                           ← Python pytest または shell ベース
-</code></pre>
-<h3 id="データフロー">データフロー</h3>
-<pre><code>┌──── タスクファイル ────┐
-│ tasks/user_stats.sql  │
-│ -- @task name=...     │
-│ -- @inputs ...        │
-│ -- @outputs ...       │
-│ SELECT ...            │
-└──────────┬─────────────┘
-           │
-           ▼ orch_load_directory()
-   ┌───────────────────┐
-   │ __orch__.tasks    │  ← Rust が parse + 保存
-   └─────────┬─────────┘
-             │
-             ▼ orch_run_dag('pipeline')
-   ┌───────────────────┐
-   │ DAG 構築          │  ← Rust petgraph トポソート
-   │ (循環検知)        │
-   └─────────┬─────────┘
-             │
-             ▼ 各タスク順次実行
-   ┌───────────────────┐
-   │ Connection.Query  │  ← C++ 側で実行
-   └─────────┬─────────┘
-             │
-             ▼ ★ Optimizer フック発火
-   ┌───────────────────┐
-   │ plan から I/O 抽出 │  ← C++ で plan 解析
-   │ + 自動リネージ     │
-   └─────────┬─────────┘
-             │
-             ▼ Sentinel デストラクタ
-   ┌───────────────────┐
-   │ Rust に通知        │
-   │  ・runs 更新       │
-   │  ・lineage 追記    │
-   │  ・OL イベント発行 │
-   └────────────────────┘
-</code></pre>
-<hr />
-<h2 id="タスク定義フォーマット">タスク定義フォーマット</h2>
-<h3 id="設計方針">設計方針</h3>
-<ul>
-<li><strong>1 タスク = 1 SQL ファイル</strong></li>
-<li><strong>メタ情報は SQL コメントに埋め込む</strong>(SQL として valid 維持)</li>
-<li><strong><code>-- @key value</code> または <code>-- @key=value</code> の単純なフォーマット</strong></li>
-<li><strong>YAML / TOML を別ファイルにしない</strong>(乖離事故を防ぐ)</li>
-</ul>
-<h3 id="例-必須フィールドだけ">例: 必須フィールドだけ</h3>
+<h2 id="task-definitions">Task definitions</h2>
+<p>A task is a trusted SQL file with metadata in SQL comments. A deployment can validate task definitions before registering them. The parser can infer some inputs from the statements. Declare dependencies explicitly when a query's inputs or side effects are opaque to analysis.</p>
 <pre><code class="language-sql">-- @task name=user_stats
--- @outputs analytics.user_stats
-
-CREATE OR REPLACE TABLE analytics.user_stats AS
-SELECT country, COUNT(*) AS users
-FROM analytics.clean_users
-GROUP BY country;
-</code></pre>
-<p><code>inputs</code> と <code>depends_on</code> は <code>sqlparser-rs</code> で SQL から自動抽出される。
-ユーザーが書かなくて良い場合がほとんど。</p>
-<h3 id="例-全フィールド">例: 全フィールド</h3>
-<pre><code class="language-sql">-- @task name=user_stats
--- @description 国別アクティブユーザー数
--- @owner data-team@example.com
+-- @description Active users by country
 -- @inputs analytics.clean_users
 -- @outputs analytics.user_stats
 -- @depends_on clean_users
--- @schedule &quot;0 6 * * *&quot;
 -- @retries 3
 -- @timeout 300
--- @incremental_by updated_at
--- @tags daily, analytics
 -- @test &quot;SELECT COUNT(*) FROM analytics.user_stats WHERE users &lt; 0&quot; expect 0
 
 CREATE OR REPLACE TABLE analytics.user_stats AS
 SELECT country, COUNT(*) AS users
 FROM analytics.clean_users
-WHERE updated_at &gt; {{ last_run_at }}
 GROUP BY country;
 </code></pre>
-<h3 id="サポートするヘッダフィールド">サポートするヘッダフィールド</h3>
 <table>
 <thead>
 <tr>
-<th>フィールド</th>
-<th>必須</th>
-<th>用途</th>
+<th>Metadata</th>
+<th>Purpose</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td><code>name</code></td>
-<td>✓</td>
-<td>タスク識別子(ファイル名から自動推定もする)</td>
+<td><code>name</code>, <code>description</code>, <code>owner</code>, <code>tags</code></td>
+<td>Identify a task and provide ownership, description, and grouping.</td>
 </tr>
 <tr>
-<td><code>description</code></td>
-<td></td>
-<td>説明</td>
-</tr>
-<tr>
-<td><code>owner</code></td>
-<td></td>
-<td>担当者</td>
-</tr>
-<tr>
-<td><code>inputs</code></td>
-<td></td>
-<td>入力テーブル(自動抽出可)</td>
-</tr>
-<tr>
-<td><code>outputs</code></td>
-<td>✓</td>
-<td>出力テーブル</td>
-</tr>
-<tr>
-<td><code>depends_on</code></td>
-<td></td>
-<td>明示的なタスク依存(通常 inputs から自動算出)</td>
+<td><code>inputs</code>, <code>outputs</code>, <code>depends_on</code></td>
+<td>Declare source relations, produced relations, and task edges.</td>
 </tr>
 <tr>
 <td><code>schedule</code></td>
-<td></td>
-<td>cron 式</td>
+<td>Store a cron schedule for recurring work.</td>
 </tr>
 <tr>
-<td><code>retries</code></td>
-<td></td>
-<td>リトライ回数(デフォルト 0)</td>
-</tr>
-<tr>
-<td><code>timeout</code></td>
-<td></td>
-<td>秒(デフォルト無制限)</td>
+<td><code>retries</code>, <code>timeout</code></td>
+<td>Set retry and deadline policies.</td>
 </tr>
 <tr>
 <td><code>incremental_by</code></td>
-<td></td>
-<td>インクリメンタル列</td>
-</tr>
-<tr>
-<td><code>tags</code></td>
-<td></td>
-<td>グルーピング用</td>
+<td>Name the source watermark column for incremental processing.</td>
 </tr>
 <tr>
 <td><code>test</code></td>
-<td></td>
-<td>アサーション SQL</td>
+<td>Declare a SQL assertion for the task output.</td>
 </tr>
 </tbody>
 </table>
-<h3 id="パイプライン全体設定-orchtoml">パイプライン全体設定 (orch.toml)</h3>
-<pre><code class="language-toml">[pipeline]
-name = &quot;daily&quot;
-state_db = &quot;default&quot;  # default = 同じ DuckDB ファイル
+<p>Registration identifies missing dependencies, duplicate names, and cycles. A task should declare outputs that later stages consume. The planner relies on correct registration of dependencies when scheduling independent writes in parallel.</p>
+<h2 id="execution-state-and-retries">Execution, state, and retries</h2>
+<p>Register tasks with <code>PRAGMA orch_register</code> and execute their DAG with <code>PRAGMA orch_run</code>. Initialize the registry with <code>PRAGMA orch_init</code>. The CLI also exposes registration, execution, inspection, and graph operations. Use <code>--json</code> for machine-readable CLI responses.</p>
+<p>The internal schema records task definitions, run attempts, and lineage edges. Its run data includes the task identity, timestamps, status, row count where available, and error details. A downstream task can run when its prerequisites succeed. When a prerequisite fails, dependent tasks are skipped while unaffected branches may continue. The worker scheduler allows independent tasks to run concurrently subject to the configured concurrency setting.</p>
+<p>The execution design uses per-worker connections and transaction boundaries. A retry starts a fresh transaction and records its own outcome. Keep data mutation atomic and idempotent so that a retry produces the same intended output. Inspect <code>__orch__.runs</code> and the CLI output to diagnose failed work and skipped descendants.</p>
+<h2 id="incremental-runs-and-assets">Incremental runs and assets</h2>
+<p>Incremental tasks can use a watermark from earlier successful work. Resolve runtime values through supported named bindings. The guide documents legacy templating and the named-parameter path. A full refresh provides the complete rebuild path when prior state or inputs need to be replaced.</p>
+<p>Assets add explicit partitions and materialization state. Use partition-scoped runs for isolated refreshes and backfills. Automation conditions and dynamic assets can evaluate upstream changes and refresh selected outputs. Quality checks can attach assertions to asset or task outputs and retain the results in the catalog.</p>
+<p>The embedded Python module includes half-open change windows, durable generation coverage, manifest publication and rollback, and schema checks. The host chooses the database and trusted model IDs, then passes typed values. See the <a href="python.html">embedded Python API</a> for signatures and the <a href="guide.html">user guide</a> for setup and examples.</p>
+<h2 id="lineage-and-scheduling">Lineage and scheduling</h2>
+<p>Mermaid diagrams show task and dataset relationships. OpenLineage events identify jobs, runs, and input/output datasets for systems that ingest the OpenLineage format. Review declared dependencies and the recorded lineage together when investigating an unexpected run or planning a change.</p>
+<p>The worker scheduler processes dependency-ready tasks. CLI scheduling and asset automation are separate entry points. Run scheduling in the intended host process and coordinate who owns writes to a database. Use the <a href="mcp.html">MCP server guide</a> for registered asset and inspection operations exposed to agents.</p>
+<h2 id="design-history-and-compatibility">Design history and compatibility</h2>
+<p>The original design covers task-format decisions, state-store interfaces, graph visualization, retry policies, and agent integration. Historical sketches include optimizer hooks, column-level lineage, configurable state stores, and approaches to coordinating with other extensions. Check the SQL reference and guide for the current public API. The <a href="https://github.com/nkwork9999/duck-orch/blob/fd1c38fa7a4a19e8095ce1348f78cde0261cb245/DESIGN.md">original design record</a> preserves historical examples, diagrams, phase milestones, implementation risks, and attribution.</p>
 
-[execution]
-max_parallel = 4
-default_retries = 0
-default_timeout = 600
-
-[lineage]
-emit_openlineage = true
-openlineage_url = &quot;http://marquez:5000/api/v1/lineage&quot;
-
-[ai]
-# Claude 連携時の補助
-emit_explain_on_fail = true  # 失敗時にテーブル統計を JSON で出す
-</code></pre>
-<h3 id="バリデーションルール">バリデーションルール</h3>
-<ul>
-<li>ファイル名と <code>name</code> が違う場合は警告</li>
-<li>同名タスクが 2 ファイルにあったらエラー</li>
-<li>自動抽出した inputs に存在しないテーブルがあったら警告(ただし他タスクの outputs にあれば OK)</li>
-<li><code>outputs</code> に書かれていないが <code>CREATE TABLE</code> 文が存在したら警告</li>
-<li>DAG に循環があったらエラー(タスク登録時に検知)</li>
-</ul>
-<hr />
-<h2 id="cli-設計">CLI 設計</h2>
-<h3 id="原則">原則</h3>
-<ul>
-<li><strong>動詞 1 単語</strong>(register, run, status, graph, validate, etc.)</li>
-<li><strong>全コマンドに <code>--json</code></strong> : エージェントが parse できる</li>
-<li><strong>ローカル実行は DuckDB ファイルに対して直接行う</strong>(別プロセスのデーモン不要)</li>
-<li><strong>設定ファイル不要</strong>(<code>./tasks/</code> ディレクトリと DuckDB ファイルだけで動く)</li>
-</ul>
-<h3 id="コマンド一覧">コマンド一覧</h3>
-<pre><code class="language-bash"># 登録
-duck-orch register ./tasks/                      # ディレクトリ全部
-duck-orch register ./tasks/user_stats.sql        # 1 ファイル
-duck-orch unregister user_stats
-
-# 実行
-duck-orch run daily                              # パイプライン全体
-duck-orch run daily --task user_stats            # 1 タスクだけ
-duck-orch run daily --from user_stats            # ここから後続全部
-duck-orch run daily --full-refresh               # 増分無視
-duck-orch run daily --dry-run                    # 何が動くかだけ表示
-
-# 状態
-duck-orch status                                 # 直近 run 一覧
-duck-orch status --task user_stats               # 履歴
-duck-orch status --failed                        # 失敗のみ
-duck-orch logs &lt;run_id&gt;
-
-# 可視化
-duck-orch graph daily --format mermaid           # Mermaid 標準出力
-duck-orch graph daily --format json              # ノード/エッジ JSON
-duck-orch graph daily --format html              # 自己完結 HTML 出力
-duck-orch graph daily --output graph.md          # ファイル書き込み
-
-# 検査
-duck-orch validate ./tasks/                      # 構文 + 依存チェック
-duck-orch impact analytics.clean_users           # この列を変更したら何が壊れる?
-duck-orch lineage analytics.user_stats           # このテーブルの上流
-
-# テスト
-duck-orch test                                   # 全 @test 実行
-duck-orch test --task user_stats
-
-# スケジューラ
-duck-orch schedule start                         # 背景デーモン起動
-duck-orch schedule stop
-duck-orch schedule list                          # 登録済み cron 一覧
-</code></pre>
-<h3 id="--db-オプション"><code>--db</code> オプション</h3>
-<pre><code class="language-bash">duck-orch --db mydata.duckdb run daily
-</code></pre>
-<p>省略時は <code>./mydata.duckdb</code> を探す → 無ければ作成。</p>
-<h3 id="--json-出力例"><code>--json</code> 出力例</h3>
-<pre><code class="language-bash">$ duck-orch run daily --json
-{
-  &quot;pipeline&quot;: &quot;daily&quot;,
-  &quot;started_at&quot;: &quot;2026-05-01T12:00:00Z&quot;,
-  &quot;tasks&quot;: [
-    {&quot;name&quot;: &quot;clean_users&quot;, &quot;status&quot;: &quot;success&quot;, &quot;rows&quot;: 12300, &quot;elapsed_ms&quot;: 145},
-    {&quot;name&quot;: &quot;user_stats&quot;,  &quot;status&quot;: &quot;success&quot;, &quot;rows&quot;: 42, &quot;elapsed_ms&quot;: 23}
-  ],
-  &quot;finished_at&quot;: &quot;2026-05-01T12:00:00.500Z&quot;,
-  &quot;status&quot;: &quot;success&quot;
-}
-</code></pre>
-<p>エージェントは <code>jq '.tasks[] | select(.status == &quot;failed&quot;)'</code> で失敗タスクを抜ける。</p>
-<hr />
-<h2 id="sql-関数-api">SQL 関数 API</h2>
-<p>CLI と同じ機能を SQL からも呼べる(DuckDB 内のシェル/ノートブックから使うため)。</p>
-<pre><code class="language-sql">LOAD duckorch;
-
--- 設定
-SET orch_state_schema = '__orch__';
-SET orch_max_parallel = 4;
-SET orch_openlineage_url = 'http://marquez:5000/api/v1/lineage';
-
--- タスク登録
-CALL orch_load_directory('./tasks/');
-CALL orch_load_file('./tasks/user_stats.sql');
-
--- 実行
-SELECT * FROM orch_run_dag('daily');
-SELECT * FROM orch_run_task('user_stats');
-
--- 状態
-SELECT * FROM __orch__.tasks;
-SELECT * FROM __orch__.runs ORDER BY started_at DESC LIMIT 10;
-SELECT * FROM __orch__.lineage_edges;
-
--- 可視化
-SELECT mermaid FROM orch_visualize('daily');
-SELECT json FROM orch_visualize('daily', format := 'json');
-
--- 影響分析
-SELECT * FROM orch_impact('analytics.clean_users');
-SELECT * FROM orch_lineage_upstream('analytics.user_stats');
-SELECT * FROM orch_lineage_downstream('analytics.raw_users');
-</code></pre>
-<hr />
-<h2 id="状態管理">状態管理</h2>
-<h3 id="スキーマ">スキーマ</h3>
-<p>すべて <code>__orch__</code> スキーマ配下(<code>SET orch_state_schema = '...'</code> で変更可)。</p>
-<pre><code class="language-sql">-- タスク定義(register 時に書き込む)
-CREATE TABLE __orch__.tasks (
-    name VARCHAR PRIMARY KEY,
-    description VARCHAR,
-    owner VARCHAR,
-    sql VARCHAR NOT NULL,
-    inputs VARCHAR[],
-    outputs VARCHAR[],
-    depends_on VARCHAR[],
-    schedule_cron VARCHAR,
-    retries INT DEFAULT 0,
-    timeout_seconds INT,
-    incremental_by VARCHAR,
-    tags VARCHAR[],
-    file_path VARCHAR,
-    file_hash VARCHAR,
-    registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- 実行履歴
-CREATE TABLE __orch__.runs (
-    run_id UUID PRIMARY KEY,
-    pipeline_run_id UUID,         -- 同一 run_dag 内の親 run
-    task_name VARCHAR,
-    started_at TIMESTAMP,
-    finished_at TIMESTAMP,
-    status VARCHAR,                -- pending / running / success / failed / skipped
-    rows BIGINT,
-    error_message VARCHAR,
-    error_stack VARCHAR,
-    retry_count INT DEFAULT 0,
-    last_processed_at TIMESTAMP   -- インクリメンタル用ウォーターマーク
-);
-
--- リネージエッジ(タスク実行時に更新)
-CREATE TABLE __orch__.lineage_edges (
-    src_dataset VARCHAR,           -- catalog.schema.table
-    dst_dataset VARCHAR,
-    via_task VARCHAR,
-    transform_type VARCHAR,        -- DIRECT / INDIRECT / AGGREGATE / etc.
-    discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    source VARCHAR,                -- declared / sql_parser / plan_extract
-    PRIMARY KEY (src_dataset, dst_dataset, via_task)
-);
-
--- カラムリネージ(オプション、後フェーズ)
-CREATE TABLE __orch__.column_lineage (
-    src_dataset VARCHAR,
-    src_column VARCHAR,
-    dst_dataset VARCHAR,
-    dst_column VARCHAR,
-    via_task VARCHAR,
-    transform_type VARCHAR
-);
-
--- スケジュール
-CREATE TABLE __orch__.schedules (
-    pipeline_or_task VARCHAR PRIMARY KEY,
-    cron_expr VARCHAR,
-    timezone VARCHAR DEFAULT 'UTC',
-    enabled BOOLEAN DEFAULT true,
-    last_triggered_at TIMESTAMP,
-    next_trigger_at TIMESTAMP
-);
-</code></pre>
-<h3 id="状態保管先の抽象化">状態保管先の抽象化</h3>
-<pre><code>┌─ デフォルト: 同じ DuckDB ファイル
-│  state_db = &quot;default&quot;
-│
-├─ 別の DuckDB ファイル
-│  state_db = &quot;/path/to/orch_state.duckdb&quot;
-│
-└─ DuckLake (将来)
-   state_db = &quot;ducklake://my-catalog&quot;
-</code></pre>
-<p><code>crates/orch_core/src/state.rs</code> に <code>StateStore</code> trait を切って、後で差し替え可能にしておく。</p>
-<hr />
-<h2 id="可視化">可視化</h2>
-<h3 id="方針-mermaid--openlineage-の両立">方針: <strong>Mermaid + OpenLineage の両立</strong></h3>
-<p>UI は自作しない。既存エコシステムに乗る。</p>
-<table>
-<thead>
-<tr>
-<th>出力</th>
-<th>ターゲット</th>
-<th>理由</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>Mermaid</td>
-<td>GitHub PR / VSCode / Claude</td>
-<td>軽量、テキスト、レビュー可能</td>
-</tr>
-<tr>
-<td>OpenLineage</td>
-<td>Marquez / DataHub / Atlan</td>
-<td>業界標準、本格運用</td>
-</tr>
-<tr>
-<td>HTML 静的</td>
-<td>ローカル確認</td>
-<td>optional、Cytoscape.js 使用</td>
-</tr>
-</tbody>
-</table>
-<h3 id="mermaid-出力">Mermaid 出力</h3>
-<h4 id="グラフタイプ">グラフタイプ</h4>
-<p><strong>(1) リネージグラフ</strong> = テーブル間の矢印</p>
-<pre><code class="language-sql">SELECT mermaid FROM orch_visualize('daily', mode := 'lineage');
-</code></pre>
-<pre><code class="language-mermaid">graph LR
-    raw_users[(raw_users)] --&gt; clean_users[(clean_users)]
-    clean_users --&gt; user_stats[(user_stats)]
-    raw_orders[(raw_orders)] --&gt; clean_orders[(clean_orders)]
-    clean_orders --&gt; revenue_daily[(revenue_daily)]
-</code></pre>
-<p><strong>(2) DAG グラフ</strong> = タスク間の矢印</p>
-<pre><code class="language-sql">SELECT mermaid FROM orch_visualize('daily', mode := 'dag');
-</code></pre>
-<pre><code class="language-mermaid">graph LR
-    clean_users_task --&gt; user_stats_task
-    clean_orders_task --&gt; revenue_daily_task
-</code></pre>
-<p><strong>(3) 統合グラフ</strong> = テーブル + タスク両方</p>
-<pre><code class="language-sql">SELECT mermaid FROM orch_visualize('daily', mode := 'combined');
-</code></pre>
-<pre><code class="language-mermaid">graph LR
-    raw_users[(raw_users)] --&gt;|clean_users_task| clean_users[(clean_users)]
-    clean_users --&gt;|user_stats_task| user_stats[(user_stats)]
-</code></pre>
-<p><strong>(4) 状態付きグラフ</strong> = 直近 run の成功/失敗で色分け</p>
-<pre><code class="language-sql">SELECT mermaid FROM orch_visualize('daily', mode := 'lineage', with_status := true);
-</code></pre>
-<pre><code class="language-mermaid">graph LR
-    raw_users --&gt; clean_users
-    clean_users --&gt; user_stats
-    
-    classDef success fill:#cfc,stroke:#393
-    classDef failed  fill:#fcc,stroke:#933
-    classDef running fill:#ffc,stroke:#993
-    
-    class clean_users success
-    class user_stats failed
-</code></pre>
-<h3 id="openlineage-出力">OpenLineage 出力</h3>
-<p>OpenLineage 仕様 (https://openlineage.io/spec) に従ってイベントを emit する。</p>
-<ul>
-<li><code>orch_run_dag</code> 開始時 = pipeline START イベント (<code>run_id</code> を pipeline_run_id として保持)</li>
-<li>各タスク開始時 = task START イベント (<code>parent</code> facet に pipeline_run_id)</li>
-<li>各タスク完了時 = task COMPLETE/FAIL イベント</li>
-<li>pipeline 完了時 = pipeline COMPLETE/FAIL イベント</li>
-</ul>
-<pre><code class="language-rust">// crates/orch_core/src/openlineage.rs
-fn emit_event(event: OLEvent) {
-    if let Some(url) = config.openlineage_url() {
-        // 非同期 worker thread に enqueue(HTTP 送信はブロックしない)
-        QUEUE.send(event);
-    }
-}
-</code></pre>
-<h3 id="他-openlineage-extension-との連携モード">他 OpenLineage extension との連携モード</h3>
-<p>他の OpenLineage emitter 拡張がロードされている場合、duckOrch は親 pipeline run の facet を環境変数 <code>OPENLINEAGE_PARENT_RUN_ID</code> 経由で公開する。これにより同じバックエンドで親子関係付きで観測できる。</p>
-<pre><code class="language-rust">// 各タスク実行直前
-std::env::set_var(&quot;OPENLINEAGE_PARENT_RUN_ID&quot;, pipeline_run_id);
-std::env::set_var(&quot;OPENLINEAGE_PARENT_JOB_NAMESPACE&quot;, &quot;duckorch&quot;);
-std::env::set_var(&quot;OPENLINEAGE_PARENT_JOB_NAME&quot;, pipeline_name);
-conn.execute(&amp;task.sql)?;
-</code></pre>
-<p>これだけで Marquez UI 上で DAG 構造として見える。</p>
-<h3 id="html-出力-optional">HTML 出力 (optional)</h3>
-<p><code>duck-orch graph daily --format html --output graph.html</code> で 1 ファイル HTML を吐く。Cytoscape.js を CDN から読み込み、ノード/エッジ JSON を埋め込む。</p>
-<hr />
-<h2 id="失敗処理--リトライ">失敗処理 / リトライ</h2>
-<h3 id="失敗時の伝播ポリシー-dbt-流">失敗時の伝播ポリシー (dbt 流)</h3>
-<pre><code>[clean_users] ──→ [user_stats] (失敗)──X→ [user_breakdown]  ← skipped
-       │
-       └─→ [revenue_daily]  ← 続行
-</code></pre>
-<ul>
-<li>失敗ノードの <strong>downstream は skipped</strong>(状態 = <code>skipped</code>)</li>
-<li>独立した枝は続行</li>
-<li>パイプライン全体の最終状態 = 「全部成功」なら <code>success</code>、1 つでも失敗があれば <code>failed_with_partial_success</code> または <code>failed</code></li>
-</ul>
-<h3 id="リトライ戦略">リトライ戦略</h3>
-<pre><code>@retries 3 のタスクが失敗
-   │
-   ├─ 1 回目失敗 → 2 秒待つ → リトライ
-   ├─ 2 回目失敗 → 4 秒待つ → リトライ
-   ├─ 3 回目失敗 → 8 秒待つ → リトライ
-   └─ 4 回目失敗 → 諦めて failed
-</code></pre>
-<p>exponential backoff (<code>2^n</code> 秒)。<code>SET orch_retry_base_seconds = 2</code> で変更可。</p>
-<h3 id="エラー詳細の保存">エラー詳細の保存</h3>
-<pre><code class="language-sql">SELECT task_name, error_message, error_stack
-FROM __orch__.runs
-WHERE status = 'failed'
-ORDER BY started_at DESC;
-</code></pre>
-<p><code>error_stack</code> には DuckDB の例外メッセージ + Rust の panic 情報を入れる。</p>
-<h3 id="claude-連携-失敗時の自動コンテキスト">Claude 連携: 失敗時の自動コンテキスト</h3>
-<p><code>SET orch_emit_explain_on_fail = true</code> の場合:</p>
-<ul>
-<li>失敗タスクの <code>EXPLAIN</code> 結果</li>
-<li>入力テーブルの <code>DESCRIBE</code> と先頭 5 行</li>
-<li>直近成功時との rows 差分</li>
-</ul>
-<p>をまとめて <code>runs.error_context_json</code> に書く。Claude が「失敗を直して」と頼まれた時にこの JSON だけ読めば原因究明できる。</p>
-<hr />
-<h2 id="インクリメンタル実行">インクリメンタル実行</h2>
-<h3 id="基本モデル">基本モデル</h3>
-<p><code>@incremental_by updated_at</code> を指定したタスクは、前回 run 以降の差分だけ処理する。</p>
-<pre><code class="language-sql">-- @task name=user_events
--- @outputs analytics.user_events
--- @incremental_by event_time
-
-INSERT INTO analytics.user_events
-SELECT * FROM raw.events
-WHERE event_time &gt; {{ last_processed_at }}
-  AND event_time &lt;= {{ now }};
-</code></pre>
-<h3 id="jinja-風プレースホルダ">Jinja 風プレースホルダ</h3>
-<p>サポートする変数:</p>
-<ul>
-<li><code>{{ last_processed_at }}</code> — 前回 run の <code>last_processed_at</code>(初回は <code>'1970-01-01'</code>)</li>
-<li><code>{{ now }}</code> — 現在時刻</li>
-<li><code>{{ run_id }}</code> — 今回の run_id</li>
-</ul>
-<p>実装は単純な文字列置換 (<code>regex</code> または <code>minijinja</code> クレート)。</p>
-<h3 id="--full-refresh-フラグ"><code>--full-refresh</code> フラグ</h3>
-<pre><code class="language-bash">duck-orch run daily --full-refresh
-</code></pre>
-<ul>
-<li>インクリメンタル状態を無視 → <code>last_processed_at = '1970-01-01'</code> として実行</li>
-<li><code>CREATE OR REPLACE TABLE</code> 系のタスクは元から full、影響なし</li>
-</ul>
-<hr />
-<h2 id="テスト--アサーション">テスト / アサーション</h2>
-<h3 id="test-ヘッダ"><code>@test</code> ヘッダ</h3>
-<pre><code class="language-sql">-- @task name=user_stats
--- @outputs analytics.user_stats
--- @test &quot;SELECT COUNT(*) FROM analytics.user_stats WHERE users &lt; 0&quot; expect 0
--- @test &quot;SELECT COUNT(DISTINCT country) FROM analytics.user_stats&quot; expect_gt 0
-
-CREATE OR REPLACE TABLE analytics.user_stats AS ...;
-</code></pre>
-<h3 id="サポートするアサーション">サポートするアサーション</h3>
-<table>
-<thead>
-<tr>
-<th>形式</th>
-<th>意味</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td><code>expect 0</code></td>
-<td>結果の単一値が 0 と等しい</td>
-</tr>
-<tr>
-<td><code>expect_gt N</code></td>
-<td>結果 &gt; N</td>
-</tr>
-<tr>
-<td><code>expect_lt N</code></td>
-<td>結果 &lt; N</td>
-</tr>
-<tr>
-<td><code>expect_empty</code></td>
-<td>結果行数が 0</td>
-</tr>
-<tr>
-<td><code>expect_non_empty</code></td>
-<td>結果行数 &gt; 0</td>
-</tr>
-</tbody>
-</table>
-<h3 id="実行">実行</h3>
-<pre><code class="language-bash">duck-orch test                  # 全タスクの @test を実行
-duck-orch test --task user_stats
-</code></pre>
-<p>タスク実行直後に自動でテスト走らせるオプション:</p>
-<pre><code class="language-toml"># orch.toml
-[execution]
-test_after_run = true   # デフォルト false
-</code></pre>
-<p>失敗するとそのタスクは status = <code>test_failed</code>、downstream は skip。</p>
-<hr />
-<h2 id="並列実行">並列実行</h2>
-<h3 id="基本設計">基本設計</h3>
-<p>DAG 上で互いに依存しないタスクは並列で動かす。</p>
-<pre><code>[clean_users]  [clean_orders]  [clean_events]    ← この 3 つは並列
-       │             │              │
-       ▼             ▼              ▼
-   [user_stats] [revenue]      [event_agg]       ← これも並列
-</code></pre>
-<h3 id="rust-側の実装">Rust 側の実装</h3>
-<pre><code class="language-rust">// crates/orch_core/src/executor.rs
-fn run_dag(tasks: &amp;[Task]) -&gt; Result&lt;()&gt; {
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(config.max_parallel())
-        .build()?;
-    
-    let layers = topological_layers(tasks);  // 同時実行可能なタスクの層
-    for layer in layers {
-        pool.scope(|s| {
-            for task in layer {
-                s.spawn(|_| run_task(task));
-            }
-        });
-        // 1 層終わるまで次に進まない
-    }
-    Ok(())
-}
-</code></pre>
-<h3 id="duckdb-connection-の扱い">DuckDB Connection の扱い</h3>
-<p>DuckDB は <code>Connection</code> がスレッドセーフではないので、各タスクで <code>db.connect()</code> で新しい接続を取る。<code>Database</code> 自体はマルチスレッド OK。</p>
-<hr />
-<h2 id="claude--エージェント連携">Claude / エージェント連携</h2>
-<h3 id="設計原則">設計原則</h3>
-<p>「Claude が触りやすい形」を優先機能として最初から作り込む。</p>
-<h3 id="機能">機能</h3>
-<h4 id="1-全-cli-に---json">(1) 全 CLI に <code>--json</code></h4>
-<ul>
-<li>詳細は<a href="#cli-%E8%A8%AD%E8%A8%88">CLI 設計</a>を参照</li>
-<li><code>jq</code> でパイプライン化できること</li>
-</ul>
-<h4 id="2-スキーマ自己記述">(2) スキーマ自己記述</h4>
-<pre><code class="language-bash">duck-orch describe-format
-</code></pre>
-<p>→ タスクファイルの全フィールド仕様を JSON で出力。Claude のシステムプロンプトに食わせて「正しいフォーマットで生成して」と言える。</p>
-<h4 id="3-validate-コマンド">(3) <code>validate</code> コマンド</h4>
-<pre><code class="language-bash">duck-orch validate ./tasks/new_task.sql --json
-{
-  &quot;valid&quot;: false,
-  &quot;errors&quot;: [
-    {&quot;line&quot;: 1, &quot;message&quot;: &quot;Missing required field: outputs&quot;},
-    {&quot;line&quot;: 5, &quot;message&quot;: &quot;Reference to undefined table: clean_userz (did you mean clean_users?)&quot;}
-  ]
-}
-</code></pre>
-<p>Claude が生成 → validate → 修正 のループが回せる。</p>
-<h4 id="4-impact-コマンド">(4) <code>impact</code> コマンド</h4>
-<pre><code class="language-bash">duck-orch impact analytics.clean_users --json
-{
-  &quot;table&quot;: &quot;analytics.clean_users&quot;,
-  &quot;downstream_tables&quot;: [&quot;analytics.user_stats&quot;, &quot;analytics.user_breakdown&quot;],
-  &quot;downstream_tasks&quot;:  [&quot;user_stats&quot;, &quot;user_breakdown&quot;]
-}
-</code></pre>
-<p>「このテーブルのスキーマ変えたい、何が壊れる?」が一発で分かる。</p>
-<h4 id="5-失敗時の自動コンテキスト">(5) 失敗時の自動コンテキスト</h4>
-<ul>
-<li><a href="#%E5%A4%B1%E6%95%97%E5%87%A6%E7%90%86--%E3%83%AA%E3%83%88%E3%83%A9%E3%82%A4">失敗処理</a> の <code>error_context_json</code> 参照</li>
-</ul>
-<h4 id="6-memorymd-自動生成-optional">(6) <code>MEMORY.md</code> 自動生成 (optional)</h4>
-<pre><code class="language-bash">duck-orch describe-pipeline daily --format claude-md &gt; tasks/CLAUDE.md
-</code></pre>
-<p>→ Claude Code の CLAUDE.md 形式でパイプライン全体の説明を生成。</p>
-<hr />
-<h2 id="スケジューラ">スケジューラ</h2>
-<h3 id="実装">実装</h3>
-<p>Rust の background thread で cron 式を評価。</p>
-<pre><code class="language-rust">// crates/orch_core/src/scheduler.rs
-fn spawn_scheduler(state: StateStore) -&gt; JoinHandle&lt;()&gt; {
-    std::thread::spawn(move || loop {
-        let now = chrono::Utc::now();
-        let due = state.due_schedules(now);
-        for sched in due {
-            run_pipeline_async(sched.pipeline);
-            state.update_next_trigger(&amp;sched, next_cron(now, &amp;sched.cron));
-        }
-        std::thread::sleep(Duration::from_secs(30));
-    })
-}
-</code></pre>
-<h3 id="cli">CLI</h3>
-<pre><code class="language-bash">duck-orch schedule start          # ファイルロックで多重起動防止
-duck-orch schedule stop
-duck-orch schedule list
-duck-orch schedule add daily &quot;0 6 * * *&quot;
-</code></pre>
-<h3 id="duckdb-プロセス内モード">DuckDB プロセス内モード</h3>
-<p>「DuckDB CLI を立ち上げっぱなしで使う」場合、拡張ロード時に scheduler thread を spawn するオプション:</p>
-<pre><code class="language-sql">SET orch_scheduler_enabled = true;
-LOAD duckorch;  -- 自動で scheduler が動き出す
-</code></pre>
-<hr />
-<h2 id="拡張との共存">拡張との共存</h2>
-<h3 id="想定シナリオ">想定シナリオ</h3>
-<ol>
-<li><strong>duckorch 単独</strong>: タスク内 SQL のリネージは duckorch の plan 解析で取る</li>
-<li><strong>複数の OpenLineage emitter 同時ロード</strong>: duckOrch は pipeline 単位の親 run を発行、他拡張がクエリ単位を発行する想定。OpenLineage の <code>parent</code> facet で親子関係を保つ</li>
-</ol>
-<h3 id="衝突回避">衝突回避</h3>
-<p>他の OpenLineage emitter 拡張と一緒にロードして使う場合、両者が独立した OpenLineage イベントを emit する。
-duckOrch は pipeline_run_id を環境変数で渡し、他側でそのクエリを「duckOrch run の子」として記録する想定。</p>
-<p>(duckOrch が将来 Phase 2 で自前 optimizer フックを実装した場合は、両者が plan を見ることになる。
-DuckDB は複数 OptimizerExtension の登録を許容するので、登録順に発火する。両者ともプラン読み取りのみで変更しない設計にしておけば衝突しない。これはテストで確認すること。)</p>
-<hr />
-<h2 id="開発ステップ-mvppro">開発ステップ (MVP→Pro)</h2>
-<h3 id="phase-0-環境構築-1日">Phase 0: 環境構築 (1日)</h3>
-<ul>
-<li>[ ] ducksmiles ディレクトリを参考に構成複製</li>
-<li>[ ] DuckDB submodule 追加</li>
-<li>[ ] CMake / Makefile / vcpkg.json</li>
-<li>[ ] Rust workspace (<code>crates/orch_core</code>, <code>crates/orch_cli</code>)</li>
-<li>[ ] FFI hello world (C++ から Rust 関数呼べるところまで)</li>
-</ul>
-<h3 id="phase-1-最小ループ-1週">Phase 1: 最小ループ (1週)</h3>
-<ul>
-<li>[ ] タスクファイルパーサ (Rust, <code>task_parser.rs</code>)</li>
-<li>[ ] <code>__orch__</code> スキーマ作成</li>
-<li>[ ] <code>orch_load_directory</code> table function (C++ → Rust)</li>
-<li>[ ] DAG トポソート (Rust, petgraph)</li>
-<li>[ ] <code>orch_run_dag</code> table function — 直列実行のみ</li>
-<li>[ ] <code>__orch__.runs</code> への状態書き込み</li>
-</ul>
-<h3 id="phase-2-optimizer-フック--自動リネージ-1週-延期">Phase 2: optimizer フック + 自動リネージ (1週) [延期]</h3>
-<ul>
-<li>[ ] <code>OptimizerExtension::pre_optimize_function</code> を独自実装で登録</li>
-<li>[ ] LogicalGet/Insert/CreateTable から I/O 抽出</li>
-<li>[ ] LogicalOrchSentinel / PhysicalOrchSentinel</li>
-<li>[ ] Sentinel デストラクタから Rust 通知 FFI</li>
-<li>[ ] <code>__orch__.lineage_edges</code> 自動更新</li>
-</ul>
-<blockquote>
-<p>実装パターン(Sentinel + デストラクタで finalize)はソフトウェア工学の一般的手法。
-自前実装で書き起こす。</p>
-</blockquote>
-<h3 id="phase-3-可視化-1週">Phase 3: 可視化 (1週)</h3>
-<ul>
-<li>[ ] <code>mermaid.rs</code> 実装</li>
-<li>[ ] <code>orch_visualize</code> table function (lineage / dag / combined / with_status)</li>
-<li>[ ] <code>duck-orch graph</code> CLI</li>
-</ul>
-<h3 id="phase-4-失敗処理--リトライ-3日">Phase 4: 失敗処理 + リトライ (3日)</h3>
-<ul>
-<li>[ ] downstream skip ロジック</li>
-<li>[ ] exponential backoff リトライ</li>
-<li>[ ] <code>error_context_json</code> (Claude 向け)</li>
-</ul>
-<h3 id="phase-5-並列実行-3日">Phase 5: 並列実行 (3日)</h3>
-<ul>
-<li>[ ] rayon 統合</li>
-<li>[ ] DuckDB Connection per task</li>
-<li>[ ] e2e テスト</li>
-</ul>
-<h3 id="phase-6-cli--claude-連携-1週">Phase 6: CLI + Claude 連携 (1週)</h3>
-<ul>
-<li>[ ] <code>duck-orch</code> CLI 全コマンド</li>
-<li>[ ] 全コマンドに <code>--json</code></li>
-<li>[ ] <code>validate</code> / <code>impact</code> / <code>describe-format</code></li>
-</ul>
-<h3 id="phase-7-インクリメンタル--テスト-1週">Phase 7: インクリメンタル + テスト (1週)</h3>
-<ul>
-<li>[ ] Jinja プレースホルダ置換</li>
-<li>[ ] <code>last_processed_at</code> 管理</li>
-<li>[ ] <code>@test</code> 実行</li>
-<li>[ ] <code>--full-refresh</code></li>
-</ul>
-<h3 id="phase-8-スケジューラ-3日">Phase 8: スケジューラ (3日)</h3>
-<ul>
-<li>[ ] cron 評価</li>
-<li>[ ] background thread</li>
-<li>[ ] <code>duck-orch schedule</code> CLI</li>
-</ul>
-<h3 id="phase-9-openlineage-統合-3日">Phase 9: OpenLineage 統合 (3日)</h3>
-<ul>
-<li>[ ] OL イベント生成</li>
-<li>[ ] 他の OpenLineage emitter 拡張との共存テスト</li>
-<li>[ ] Marquez での動作確認 (docker-compose)</li>
-</ul>
-<h3 id="phase-10-ドキュメント--リリース">Phase 10: ドキュメント + リリース</h3>
-<ul>
-<li>[ ] README</li>
-<li>[ ] tutorial</li>
-<li>[ ] DuckDB community extension 申請</li>
-</ul>
-<hr />
-<h2 id="リスクと未解決事項">リスクと未解決事項</h2>
-<h3 id="技術リスク">技術リスク</h3>
-<table>
-<thead>
-<tr>
-<th>項目</th>
-<th>影響</th>
-<th>緩和策</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>C++ 内部 API がバージョンアップで壊れる</td>
-<td>High</td>
-<td>submodule 固定、CI で複数バージョン test</td>
-</tr>
-<tr>
-<td>optimizer フックが複数拡張で衝突</td>
-<td>Medium</td>
-<td>共存テスト充実</td>
-</tr>
-<tr>
-<td>FFI 境界の panic</td>
-<td>High</td>
-<td><code>catch_unwind</code> 必須、Rust 側で全 panic を Result に</td>
-</tr>
-<tr>
-<td>Sentinel デストラクタで例外</td>
-<td>High</td>
-<td>全 try/catch、<code>uncaught_exceptions()</code> 複数形を使用</td>
-</tr>
-<tr>
-<td>並列実行で同じテーブル書き込み競合</td>
-<td>Medium</td>
-<td>DAG が依存検出していれば衝突しない、ユーザー責任</td>
-</tr>
-</tbody>
-</table>
-<h3 id="未解決の設計判断">未解決の設計判断</h3>
-<ul>
-<li>[ ] <code>inputs</code> 自動抽出で view を深堀りするか?(<code>Connection::Prepare()</code> で binder 通す案)</li>
-<li>[ ] DuckLake state store の優先度</li>
-<li>[ ] WASM ビルドサポートの可否</li>
-<li>[ ] Web UI を将来作るか?(DuckDB UI extension 統合か独立か)</li>
-<li>[ ] パイプライン定義に変数 (<code>{{ env.X }}</code> 等) を許すか?</li>
-<li>[ ] タスク間で値を渡す (XCom 相当) の必要性</li>
-<li>[ ] 外部システム連携(S3 アップロード、Slack 通知等)はプラグイン化?</li>
-<li>[ ] パッケージ管理(他人の作ったタスクライブラリを取り込む) — dbt packages 相当</li>
-</ul>
-<hr />
-<h2 id="参考にしたプロジェクトコードはコピーしていない">参考にしたプロジェクト(コードはコピーしていない)</h2>
-<p>duckOrch のコードはすべて scratch から書きました。下記は<strong>設計の参考にしただけ</strong>で、コード自体の流用はありません。</p>
-<table>
-<thead>
-<tr>
-<th>プロジェクト</th>
-<th>ライセンス</th>
-<th>何を参考にしたか</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td><a href="https://github.com/duckdb/community-extensions/tree/main/extensions/ducksmiles">ducksmiles</a></td>
-<td>MIT</td>
-<td>C++ + Rust ハイブリッド拡張の <strong>CMake / Makefile / vcpkg ビルド構成</strong>。同じ extension-template-rs ベースの定石形式</td>
-</tr>
-<tr>
-<td><a href="https://sqlmesh.readthedocs.io">SQLMesh</a></td>
-<td>Apache-2.0</td>
-<td>タスクファイルフォーマット(<code>MODEL(...)</code> ヘッダ)の<strong>書き味</strong>を真似た。SQLMesh 自体は依存していない</td>
-</tr>
-<tr>
-<td><a href="https://docs.getdbt.com">dbt</a></td>
-<td>Apache-2.0</td>
-<td>テストアサーション、タグ、failed downstream skip、<code>--full-refresh</code> などの<strong>運用パターン</strong></td>
-</tr>
-<tr>
-<td><a href="https://openlineage.io">OpenLineage</a></td>
-<td>Apache-2.0</td>
-<td>公開仕様。誰の所有物でもなく、互換イベント形式に従っているだけ</td>
-</tr>
-<tr>
-<td><a href="https://github.com/tobymao/sqlglot">sqlglot lineage</a></td>
-<td>MIT</td>
-<td>column-level lineage の Scope-based アルゴリズム発想元(コードコピーは無し、AST 巡回の組み立て方のみ参考)</td>
-</tr>
-</tbody>
-</table>
-<h3 id="著作権帰属について">著作権・帰属について</h3>
-<ul>
-<li>duckOrch のソースコードはすべて新規執筆</li>
-<li>ライセンスは MIT(LICENSE 参照)</li>
-<li>OpenLineage 互換は仕様遵守であり、特定実装の派生ではない</li>
-</ul>
-
-<footer>対応ソース <a href="https://github.com/nkwork9999/duck-orch/tree/99e75181c1c88460d47a5f9e6d0e4e14680a0535"><code>99e75181c1c8</code></a> · DuckDB 2.0.0</footer>
+<footer>Source revision <a href="https://github.com/nkwork9999/duck-orch/tree/fd1c38fa7a4a19e8095ce1348f78cde0261cb245"><code>fd1c38fa7a4a</code></a> · DuckDB 2.0.0</footer>
 </main></div></body></html>

@@ -1,23 +1,23 @@
 <!doctype html>
-<html lang="ja">
+<html lang="en">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="description" content="DuckDB上で依存関係を解決し、パーティションやデータ品質を管理するオーケストレーション拡張。">
-<title>概要 · duckOrch</title><link rel="stylesheet" href="style.css">
+<meta name="description" content="Run dependency-aware data pipelines, manage partitions, and check data quality inside DuckDB.">
+<title>Overview · duckOrch</title><link rel="stylesheet" href="style.css">
 <script src="search.js" defer></script>
 </head>
 <body data-project="duck-orch">
-<a class="skip" href="#main">本文へ移動</a>
+<a class="skip" href="#main">Skip to content</a>
 <header class="masthead"><a href="index.html" class="product">duckOrch</a>
 <a href="https://github.com/nkwork9999/duck-orch">GitHub ↗</a></header>
-<div class="layout"><nav aria-label="ドキュメント"><a href="index.html" aria-current="page">概要</a><a href="functions.html">SQL リファレンス</a><a href="settings.html">設定</a><a href="python.html">Python 組み込み API</a><a href="guide.html">利用ガイド</a><a href="architecture.html">設計・実行モデル</a><a href="mcp.html">MCP サーバー</a></nav>
-<main id="main"><section class="intro"><h1>duckOrch</h1><p>DuckDB上で依存関係を解決し、パーティションやデータ品質を管理するオーケストレーション拡張。</p>
-<div class="quick-links"><a href="guide.html">利用ガイド</a><a href="functions.html">SQL リファレンス</a></div></section>
-<h2>クイックスタート</h2><pre><code>INSTALL duckorch FROM community;
+<div class="layout"><nav aria-label="Documentation"><a href="index.html" aria-current="page">Overview</a><a href="functions.html">SQL reference</a><a href="settings.html">Settings</a><a href="python.html">Embedded Python API</a><a href="guide.html">User guide</a><a href="architecture.html">Architecture and execution</a><a href="mcp.html">MCP server</a></nav>
+<main id="main"><section class="intro"><h1>duckOrch</h1><p>Run dependency-aware data pipelines, manage partitions, and check data quality inside DuckDB.</p>
+<div class="quick-links"><a href="guide.html">User guide</a><a href="functions.html">SQL reference</a></div></section>
+<h2>Quick start</h2><pre><code>INSTALL duckorch FROM community;
 LOAD duckorch;
 PRAGMA orch_asset_list;</code></pre>
-<h2>機能ガイド</h2><div class="sections"><a class="section" href="guide.html"><strong>DAGと増分実行</strong><span>タスク定義、依存解決、差分実行、テスト、リネージを確認します。</span></a><a class="section" href="guide.html"><strong>アセット運用</strong><span>パーティション、バックフィル、センサー、動的アセット、データ取り込みを扱います。</span></a><a class="section" href="architecture.html"><strong>実行基盤とCLI</strong><span>スケジューリング、失敗時の扱い、メタデータの設計とコマンドを説明します。</span></a><a class="section" href="mcp.html"><strong>MCPと埋め込み</strong><span>MCPの利用手順と、アプリから呼び出す機能を掲載しています。</span></a></div>
-<h2>関連ツール</h2><div class="siblings"><a href="https://nkwork9999.github.io/duckSMILES/">duckSMILES</a><a href="https://nkwork9999.github.io/duckgl/">DuckGL</a><a href="https://nkwork9999.github.io/miniplot/">Miniplot</a></div>
+<h2>Feature guides</h2><div class="sections"><a class="section" href="guide.html"><strong>DAGs and incremental execution</strong><span>Define tasks and dependencies, run changes, test outputs, and inspect lineage.</span></a><a class="section" href="guide.html"><strong>Asset operations</strong><span>Manage partitions, backfills, sensors, dynamic assets, and ingestion.</span></a><a class="section" href="architecture.html"><strong>Execution and CLI</strong><span>See how scheduling, failures, state, and commands fit together.</span></a><a class="section" href="mcp.html"><strong>MCP server</strong><span>Connect an MCP client and use the registered asset operations.</span></a></div>
+<h2>Related tools</h2><div class="siblings"><a href="https://nkwork9999.github.io/duckSMILES/">duckSMILES</a><a href="https://nkwork9999.github.io/duckgl/">DuckGL</a><a href="https://nkwork9999.github.io/miniplot/">Miniplot</a></div>
 
-<footer>対応ソース <a href="https://github.com/nkwork9999/duck-orch/tree/99e75181c1c88460d47a5f9e6d0e4e14680a0535"><code>99e75181c1c8</code></a> · DuckDB 2.0.0</footer>
+<footer>Source revision <a href="https://github.com/nkwork9999/duck-orch/tree/fd1c38fa7a4a19e8095ce1348f78cde0261cb245"><code>fd1c38fa7a4a</code></a> · DuckDB 2.0.0</footer>
 </main></div></body></html>

@@ -1,17 +1,17 @@
 <!doctype html>
-<html lang="ja">
+<html lang="en">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="description" content="DuckDB上で依存関係を解決し、パーティションやデータ品質を管理するオーケストレーション拡張。">
-<title>MCP サーバー · duckOrch</title><link rel="stylesheet" href="style.css">
+<meta name="description" content="Run dependency-aware data pipelines, manage partitions, and check data quality inside DuckDB.">
+<title>MCP server · duckOrch</title><link rel="stylesheet" href="style.css">
 <script src="search.js" defer></script>
 </head>
 <body data-project="duck-orch">
-<a class="skip" href="#main">本文へ移動</a>
+<a class="skip" href="#main">Skip to content</a>
 <header class="masthead"><a href="index.html" class="product">duckOrch</a>
 <a href="https://github.com/nkwork9999/duck-orch">GitHub ↗</a></header>
-<div class="layout"><nav aria-label="ドキュメント"><a href="index.html">概要</a><a href="functions.html">SQL リファレンス</a><a href="settings.html">設定</a><a href="python.html">Python 組み込み API</a><a href="guide.html">利用ガイド</a><a href="architecture.html">設計・実行モデル</a><a href="mcp.html" aria-current="page">MCP サーバー</a></nav>
-<main id="main"><details class="toc" open><summary>このページの目次</summary><ul><li class="h2"><a href="#what-it-exposes">What it exposes</a></li><li class="h3"><a href="#read-only">Read-only</a></li><li class="h3"><a href="#write-safety-defaulted">Write (safety-defaulted)</a></li><li class="h2"><a href="#build">Build</a></li><li class="h2"><a href="#configure-via-env">Configure via env</a></li><li class="h2"><a href="#wire-into-claude-code">Wire into Claude Code</a></li><li class="h2"><a href="#smoke-test-outside-claude">Smoke-test outside Claude</a></li></ul></details><h1 id="orch_mcp--duckorch-mcp-server">orch_mcp — duckOrch MCP server</h1>
+<div class="layout"><nav aria-label="Documentation"><a href="index.html">Overview</a><a href="functions.html">SQL reference</a><a href="settings.html">Settings</a><a href="python.html">Embedded Python API</a><a href="guide.html">User guide</a><a href="architecture.html">Architecture and execution</a><a href="mcp.html" aria-current="page">MCP server</a></nav>
+<main id="main"><details class="toc" open><summary>On this page</summary><ul><li class="h2"><a href="#what-it-exposes">What it exposes</a></li><li class="h3"><a href="#read-only">Read-only</a></li><li class="h3"><a href="#write-safety-defaulted">Write (safety-defaulted)</a></li><li class="h2"><a href="#build">Build</a></li><li class="h2"><a href="#configure-via-env">Configure via env</a></li><li class="h2"><a href="#wire-into-claude-code">Wire into Claude Code</a></li><li class="h2"><a href="#smoke-test-outside-claude">Smoke-test outside Claude</a></li></ul></details><h1 id="orch_mcp--duckorch-mcp-server">orch_mcp — duckOrch MCP server</h1>
 <p>A thin <a href="https://modelcontextprotocol.io">MCP (Model Context Protocol)</a> server
 that wraps the existing <code>duck-orch</code> CLI so Claude Code (or any MCP client) can
 drive duckOrch over <strong>stdio</strong>.</p>
@@ -148,5 +148,5 @@ DUCK_ORCH_DB=./mydata.duckdb ./target/release/duck-orch-mcp &lt;&lt;'EOF'
 EOF
 </code></pre>
 
-<footer>対応ソース <a href="https://github.com/nkwork9999/duck-orch/tree/99e75181c1c88460d47a5f9e6d0e4e14680a0535"><code>99e75181c1c8</code></a> · DuckDB 2.0.0</footer>
+<footer>Source revision <a href="https://github.com/nkwork9999/duck-orch/tree/fd1c38fa7a4a19e8095ce1348f78cde0261cb245"><code>fd1c38fa7a4a</code></a> · DuckDB 2.0.0</footer>
 </main></div></body></html>
