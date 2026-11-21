@@ -233,6 +233,10 @@ For daily rolling models, set an edge to `RollingDependency(lookback=6)` for a s
 overlapping or adjacent ranges. Keep the inputs needed for the rolling window when refreshing those outputs.
 `QualityCheckSelector(checks).select(changes)` picks checks by model and column dependencies.
 Register both inputs of a referential check and use `ForeignKeyCheck` to count child keys missing from the parent.
+Use `ChangeLedger(connection, models)` to record durable source intervals by revision and pass a revision
+and its `ChangeWindowPlanner` to `plan`. Open a separate database file for each tenant.
+`ModelFingerprint.capture` records definition, upstream versions, macros, settings and engine version.
+`FingerprintStore` keeps named revisions, and `FingerprintPlanner` returns reasons for invalidation.
 
 Give each active caller its own connection with the matching extension loaded. With Python 3.10+,
 the `duckdb` package and the matching installed extension, run the integration tests from the repository root:

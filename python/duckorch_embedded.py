@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from enum import Enum
 from graphlib import CycleError, TopologicalSorter
+from hashlib import sha256
+from json import dumps, loads
 from time import sleep
 from uuid import UUID
 
@@ -92,13 +94,31 @@ class CoverageClaim:
     window: DateWindow
 
 
+def _write_transaction(connection, operation):
+    # Retrying after a concurrent writer commits requires a fresh snapshot.
+    for attempt in range(12):
+        try:
+            with connection.cursor() as tx:
+                tx.execute("BEGIN TRANSACTION")
+                result = operation(tx)
+                tx.execute("COMMIT")
+                return result
+        except (TransactionException, ConstraintException) as error:
+            # Concurrent first inserts can report a duplicate key after both
+            # transactions observed the key as absent.
+            if attempt == 11 or (isinstance(error, ConstraintException)
+                                 and "duplicate key" not in str(error).lower()):
+                raise
+            sleep(min(0.002 * 2**attempt, 0.1))
+
+
 class GenerationCoverage:
     """Durable half-open work intervals on a host-owned, tenant-specific database."""
 
     def __init__(self, connection: DuckDBPyConnection, models: Mapping[str, str]):
         self._db = connection
         self._models = dict(models)
-        self._write(self._initialize)
+        _write_transaction(self._db, self._initialize)
 
     @staticmethod
     def _initialize(tx):
@@ -116,24 +136,6 @@ class GenerationCoverage:
                 CHECK (lo < hi)
             )
         """)
-
-    def _write(self, operation):
-        # An independent cursor owns the transaction. Retrying after a concurrent
-        # writer commits must recompute the gaps from a fresh snapshot.
-        for attempt in range(12):
-            try:
-                with self._db.cursor() as tx:
-                    tx.execute("BEGIN TRANSACTION")
-                    result = operation(tx)
-                    tx.execute("COMMIT")
-                    return result
-            except (TransactionException, ConstraintException) as error:
-                # Concurrent first inserts can surface as a duplicate-key error
-                # even with ON CONFLICT when their snapshots started together.
-                if attempt == 11 or (isinstance(error, ConstraintException)
-                                     and "duplicate key" not in str(error).lower()):
-                    raise
-                sleep(min(0.002 * 2**attempt, 0.1))
 
     def enqueue(self, model_id: str, generation: str, requested: DateWindow) -> list[CoverageClaim]:
         """Atomically reserve just the pieces not already queued or completed."""
@@ -171,7 +173,7 @@ class GenerationCoverage:
             return [CoverageClaim(key, model_id, generation, DateWindow(lo, hi))
                     for key, lo, hi in sorted(rows, key=lambda row: row[1])]
 
-        return self._write(reserve)
+        return _write_transaction(self._db, reserve)
 
     def finish(self, claim: CoverageClaim, *, success: bool) -> bool:
         """Keep successful coverage or release a failed reservation for retry."""
@@ -185,7 +187,7 @@ class GenerationCoverage:
               AND NOT completed RETURNING claim_id
         """
         args = [claim.claim_id, asset, claim.generation, claim.window.start, claim.window.end]
-        return self._write(lambda tx: tx.execute(sql, args).fetchone() is not None)
+        return _write_transaction(self._db, lambda tx: tx.execute(sql, args).fetchone() is not None)
 
 
 class ChangeWindowPlanner:
@@ -277,6 +279,66 @@ class ChangeWindowPlanner:
         return outputs
 
 
+class ChangeLedger:
+    """Persist source corrections by revision in a tenant-scoped DuckDB file."""
+
+    def __init__(self, connection: DuckDBPyConnection, models: Mapping[str, str]):
+        self._db = connection
+        self._models = dict(models)
+        if any(type(model) is not str or type(asset) is not str or not model or not asset
+               for model, asset in self._models.items()):
+            raise ValueError("model IDs and asset names must be nonempty strings")
+        self._by_asset = {}
+        for model, asset in self._models.items():
+            self._by_asset.setdefault(asset, []).append(model)
+
+        def initialize(tx):
+            tx.execute("CREATE SCHEMA IF NOT EXISTS __orch__")
+            tx.execute("""
+                CREATE TABLE IF NOT EXISTS __orch__.changed_input_windows (
+                    revision VARCHAR, asset VARCHAR, lo DATE, hi DATE,
+                    PRIMARY KEY (revision, asset, lo, hi), CHECK (lo < hi)
+                )
+            """)
+        _write_transaction(self._db, initialize)
+
+    @staticmethod
+    def _require_revision(revision):
+        if type(revision) is not str or not revision:
+            raise ValueError("revision must be a nonempty string")
+
+    def record(self, model_id: str, revision: str, changed: DateWindow) -> bool:
+        """Insert a source interval once and return whether it was new."""
+        asset = self._models[model_id]
+        self._require_revision(revision)
+        if type(changed) is not DateWindow:
+            raise TypeError("expected a DateWindow")
+        if changed.start == changed.end:
+            return False
+        def insert(tx):
+            return tx.execute("""
+                INSERT INTO __orch__.changed_input_windows VALUES (?, ?, ?, ?)
+                ON CONFLICT DO NOTHING RETURNING 1
+            """, [revision, asset, changed.start, changed.end]).fetchone() is not None
+        return _write_transaction(self._db, insert)
+
+    def plan(self, revision: str, planner: ChangeWindowPlanner) -> dict[str, tuple[DateWindow, ...]]:
+        """Map the recorded source ranges to their downstream windows."""
+        self._require_revision(revision)
+        if type(planner) is not ChangeWindowPlanner:
+            raise TypeError("expected a ChangeWindowPlanner")
+        rows = self._db.execute("""
+            SELECT asset, lo, hi FROM __orch__.changed_input_windows
+            WHERE revision = ? AND asset IN (SELECT unnest(?::VARCHAR[]))
+        """, [revision, list(self._by_asset)]).fetchall()
+        changes = {}
+        for asset, start, end in rows:
+            window = DateWindow(start, end)
+            for model in self._by_asset[asset]:
+                changes.setdefault(model, []).append(window)
+        return planner.affected_many(changes)
+
+
 class QualityCheckSelector:
     """Choose registered checks from changes to their model and column inputs."""
 
@@ -331,3 +393,121 @@ class ForeignKeyCheck:
             WHERE c.{child_key} IS NOT NULL
         """).fetchone()
         return missing
+
+
+def _fingerprint(value):
+    return sha256(dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class ModelFingerprint:
+    """Hashes of executable inputs and the versions of referenced models."""
+
+    definition: str
+    upstream_versions: tuple[tuple[str, str | None], ...]
+    macros: str
+    settings: str
+    engine: str
+
+    @classmethod
+    def capture(cls, sql: str, *, engine_version: str, macros: Mapping[str, str] | None = None,
+                settings: Mapping[str, str] | None = None,
+                upstream_versions: Mapping[str, str | None] | None = None):
+        if type(sql) is not str or not sql.strip() or type(engine_version) is not str or not engine_version:
+            raise ValueError("provide the executable SQL definition and engine version")
+        macros, settings, versions = dict(macros or {}), dict(settings or {}), dict(upstream_versions or {})
+        for mapping in (macros, settings):
+            if any(type(key) is not str or type(value) is not str for key, value in mapping.items()):
+                raise TypeError("macro definitions and settings must map strings to strings")
+        if any(type(key) is not str or (value is not None and type(value) is not str)
+               for key, value in versions.items()):
+            raise TypeError("reference versions must map string IDs to strings or None")
+        return cls(_fingerprint(sql), tuple(sorted(versions.items())), _fingerprint(macros),
+                   _fingerprint(settings), _fingerprint(engine_version))
+
+    def differences(self, other: "ModelFingerprint") -> tuple[str, ...]:
+        if type(other) is not ModelFingerprint:
+            raise TypeError("expected ModelFingerprint")
+        components = ("definition", "upstream_versions", "macros", "settings", "engine")
+        return tuple(name for name in components if getattr(self, name) != getattr(other, name))
+
+
+class FingerprintPlanner:
+    """Return invalidation reasons from consecutive executable model snapshots."""
+
+    def __init__(self, dependencies: Mapping[str, Iterable[str]]):
+        self._dependencies = {model: tuple(sorted(set(parents))) for model, parents in dependencies.items()}
+        internal = {model: tuple(parent for parent in parents if parent in self._dependencies)
+                    for model, parents in self._dependencies.items()}
+        try:
+            self._order = tuple(TopologicalSorter(internal).static_order())
+        except CycleError as exc:
+            raise ValueError("model dependencies contain a cycle") from exc
+
+    def plan(self, previous: Mapping[str, ModelFingerprint],
+             current: Mapping[str, ModelFingerprint]) -> dict[str, tuple[str, ...]]:
+        if current.keys() != self._dependencies.keys():
+            raise ValueError("current fingerprints must match the registered model graph")
+        changes = {}
+        for model in self._order:
+            snapshot = current[model]
+            baseline = previous.get(model)
+            reasons = list(baseline.differences(snapshot) if baseline is not None else ("new",))
+            upstream = dict(snapshot.upstream_versions)
+            unresolved = {parent for parent in self._dependencies[model] if not upstream.get(parent)}
+            unresolved.update(parent for parent, version in upstream.items() if version is None)
+            reasons.extend(f"unresolved:{parent}" for parent in sorted(unresolved))
+            reasons.extend(f"dependency:{parent}" for parent in self._dependencies[model] if parent in changes)
+            if reasons:
+                changes[model] = tuple(reasons)
+        return changes
+
+
+class FingerprintStore:
+    """Keep immutable named fingerprints in the tenant's DuckDB file."""
+
+    def __init__(self, connection: DuckDBPyConnection):
+        self._db = connection
+        connection.execute("CREATE SCHEMA IF NOT EXISTS __orch__")
+        connection.execute("CREATE TABLE IF NOT EXISTS __orch__.fingerprint_revisions (revision VARCHAR PRIMARY KEY)")
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS __orch__.model_fingerprints (
+              revision VARCHAR, model VARCHAR, definition VARCHAR NOT NULL, upstream JSON NOT NULL,
+              macros VARCHAR NOT NULL, settings VARCHAR NOT NULL, engine VARCHAR NOT NULL,
+              PRIMARY KEY (revision, model)
+            )
+        """)
+
+    def save(self, revision: str, models: Mapping[str, ModelFingerprint]) -> None:
+        if type(revision) is not str or not revision or not models:
+            raise ValueError("provide a revision name and at least one model fingerprint")
+        if any(type(model) is not str or not model or type(value) is not ModelFingerprint
+               for model, value in models.items()):
+            raise TypeError("expected model IDs and ModelFingerprint values")
+        entries = [{"model": name, "definition": f.definition, "upstream": dumps(f.upstream_versions),
+                    "macros": f.macros, "settings": f.settings, "engine": f.engine}
+                   for name, f in models.items()]
+        with self._db.cursor() as tx:
+            tx.execute("BEGIN TRANSACTION")
+            if tx.execute("SELECT 1 FROM __orch__.fingerprint_revisions WHERE revision = ?",
+                          [revision]).fetchone():
+                raise ValueError("revision already exists")
+            tx.execute("INSERT INTO __orch__.fingerprint_revisions VALUES (?)", [revision])
+            tx.execute("""
+                INSERT INTO __orch__.model_fingerprints
+                SELECT ?, f.model, f.definition, f.upstream::JSON, f.macros, f.settings, f.engine
+                FROM unnest(?::STRUCT(model VARCHAR, definition VARCHAR, upstream VARCHAR,
+                                      macros VARCHAR, settings VARCHAR, engine VARCHAR)[]) AS t(f)
+            """, [revision, entries])
+            tx.execute("COMMIT")
+
+    def load(self, revision: str) -> dict[str, ModelFingerprint]:
+        rows = self._db.execute("""
+            SELECT model, definition, upstream, macros, settings, engine
+            FROM __orch__.model_fingerprints WHERE revision = ?
+        """, [revision]).fetchall()
+        if not rows:
+            raise KeyError(revision)
+        return {name: ModelFingerprint(definition, tuple(tuple(pair) for pair in loads(upstream)),
+                                       macros, settings, engine)
+                for name, definition, upstream, macros, settings, engine in rows}
