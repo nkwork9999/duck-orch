@@ -242,6 +242,12 @@ model references and their passed checks, prepare a plan, and call `validate` be
 `publish` checks the source and active epochs again before switching the entire manifest.
 `rollback` restores a previously published manifest and its input baseline. `fork` can create an
 isolated trial environment with the same immutable physical references.
+`RelationContract.inspect` compares candidate column names, types and declared nullability using the DuckDB catalog.
+`JsonProjector(connection, fields)` projects registered paths and reports malformed documents, missing keys,
+JSON nulls and incompatible values per row. `VariantEventLog` stores events in typed columns and a VARIANT
+attribute object on DuckDB builds with VARIANT support. Register a frequent text key to project it at ingest.
+`CriticalPathScheduler.ready` selects dependency-ready tasks using path duration estimates and tenant quotas.
+The host supplies current task state and dispatches the selected IDs to workers.
 
 Give each active caller its own connection with the matching extension loaded. With Python 3.10+,
 the `duckdb` package and the matching installed extension, run the integration tests from the repository root:

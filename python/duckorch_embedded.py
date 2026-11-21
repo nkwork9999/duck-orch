@@ -1,7 +1,7 @@
 """Read-side planning for a host-provisioned, tenant-scoped duckOrch connection."""
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from graphlib import CycleError, TopologicalSorter
 from hashlib import sha256
@@ -9,7 +9,7 @@ from json import dumps, loads
 from time import sleep
 from uuid import UUID
 
-from duckdb import ConstraintException, DuckDBPyConnection, TransactionException
+from duckdb import ConstraintException, DuckDBPyConnection, InvalidInputException, TransactionException
 
 
 class DailyPartitionPlanner:
@@ -722,3 +722,337 @@ class GenerationCatalog:
         return PublishedGeneration(revision, epoch,
                                    tuple((name, ReleaseModel(*value)) for name, value in sorted(loads(models).items())),
                                    tuple(sorted(loads(inputs).items())))
+
+
+class JsonType(Enum):
+    INTEGER = ("BIGINT", ("BIGINT", "UBIGINT"))
+    NUMBER = ("DOUBLE", ("BIGINT", "UBIGINT", "DOUBLE"))
+    TEXT = ("VARCHAR", ("VARCHAR",))
+    BOOLEAN = ("BOOLEAN", ("BOOLEAN",))
+
+
+@dataclass(frozen=True)
+class JsonField:
+    path: tuple[str, ...]
+    kind: JsonType
+
+    def __post_init__(self):
+        if type(self.path) is not tuple or not self.path or any(type(part) is not str for part in self.path):
+            raise ValueError("path must be a nonempty tuple of JSON object keys or array offsets")
+        if type(self.kind) is not JsonType:
+            raise TypeError("expected a JsonType")
+
+
+@dataclass(frozen=True)
+class ProjectedJson:
+    values: dict[str, int | float | str | bool | None]
+    issues: dict[str, str]
+    source: str | None
+
+
+class JsonProjector:
+    """Project a host-registered set of JSON paths to typed DuckDB STRUCT fields."""
+
+    def __init__(self, connection: DuckDBPyConnection, fields: Mapping[str, JsonField], *,
+                 keep_source: bool = False):
+        if type(keep_source) is not bool or not 1 <= len(fields) <= 256:
+            raise ValueError("provide at least one and at most 256 registered fields")
+        self._db = connection
+        self._paths = []
+        casts, values, issues = [], [], []
+        seen = set()
+        for index, (name, field) in enumerate(fields.items(), 1):
+            if type(name) is not str or not name or "\0" in name or type(field) is not JsonField:
+                raise ValueError("expected nonempty column IDs and JsonField definitions")
+            if name.casefold() in seen:
+                raise ValueError("field IDs must be distinct")
+            seen.add(name.casefold())
+            quoted = '"' + name.replace('"', '""') + '"'
+            self._paths.append("/" + "/".join(part.replace("~", "~0").replace("/", "~1") for part in field.path))
+            value = f"extracted[{index}]"
+            type_name, allowed = field.kind.value
+            matching_types = ", ".join(f"'{item}'" for item in allowed)
+            conversion = (f"json_extract_string({value}, '$')" if field.kind is JsonType.TEXT
+                          else f"try_cast({value} AS {type_name})")
+            if field.kind is JsonType.NUMBER:
+                conversion = f"CASE WHEN isfinite({conversion}) THEN {conversion} END"
+            casts.extend([f"json_type({value}) AS kind_{index}", f"{conversion} AS value_{index}"])
+            reason = f"""
+                CASE WHEN decoded IS NULL THEN 'invalid_document'
+                     WHEN kind_{index} IS NULL THEN 'missing'
+                     WHEN kind_{index} = 'NULL' THEN 'null'
+                     WHEN kind_{index} NOT IN ({matching_types}) THEN 'invalid_type'
+                     WHEN value_{index} IS NULL THEN 'out_of_range' END
+            """
+            issues.append(f"{quoted} := {reason}")
+            values.append(f"{quoted} := CASE WHEN ({reason}) IS NULL THEN value_{index} END")
+        retained = "raw" if keep_source else "NULL::VARCHAR"
+        self._sql = f"""
+            WITH docs AS (
+                SELECT raw, ord, try_cast(raw AS JSON) AS decoded
+                FROM unnest(?::VARCHAR[]) WITH ORDINALITY AS t(raw, ord)
+            ), projected AS MATERIALIZED (
+                SELECT raw, ord, decoded, json_extract(decoded, ?::VARCHAR[]) AS extracted FROM docs
+            ), typed AS (
+                SELECT raw, ord, decoded, {", ".join(casts)} FROM projected
+            )
+            SELECT struct_pack({", ".join(values)}), struct_pack({", ".join(issues)}), {retained}
+            FROM typed ORDER BY ord
+        """
+
+    def project(self, documents: list[str]) -> list[ProjectedJson]:
+        """Expose missing, null, type and range issues without dropping a row."""
+        if type(documents) is not list or any(type(item) is not str for item in documents):
+            raise TypeError("expected a list of JSON strings")
+        return [ProjectedJson(values, {key: error for key, error in issues.items() if error}, raw)
+                for values, issues, raw in self._db.execute(self._sql, [documents, self._paths]).fetchall()]
+
+
+@dataclass(frozen=True)
+class VariantEvent:
+    event_id: str
+    kind: str
+    occurred_at: datetime
+    json_attributes: str
+
+    def __post_init__(self):
+        if any(type(value) is not str or not value for value in (self.event_id, self.kind, self.json_attributes)):
+            raise ValueError("provide an event ID, kind and JSON attributes")
+        if type(self.occurred_at) is not datetime or self.occurred_at.utcoffset() is None:
+            raise ValueError("event time must carry a timezone")
+
+
+@dataclass(frozen=True)
+class ReadVariantEvent:
+    event_id: str
+    kind: str
+    occurred_at: datetime
+    attributes: dict
+
+
+class VariantEventLog:
+    """Keep event keys in typed columns and tenant-specific attributes in VARIANT."""
+
+    def __init__(self, connection: DuckDBPyConnection, stream: str, *, promoted_text: str | None = None):
+        if type(stream) is not str or not stream:
+            raise ValueError("stream must be a nonempty string")
+        if promoted_text is not None and (type(promoted_text) is not str or not promoted_text):
+            raise ValueError("the promoted key must be a nonempty string or None")
+        self._db = connection
+        self._stream = stream
+        self._promoted = promoted_text
+        def create(tx):
+            tx.execute("CREATE SCHEMA IF NOT EXISTS __orch__")
+            tx.execute("""
+                CREATE TABLE IF NOT EXISTS __orch__.event_streams (stream VARCHAR PRIMARY KEY, promoted VARCHAR)
+            """)
+            tx.execute("""
+                CREATE TABLE IF NOT EXISTS __orch__.variant_events (
+                    stream VARCHAR, event_id VARCHAR, kind VARCHAR NOT NULL, occurred_at TIMESTAMPTZ NOT NULL,
+                    attributes VARIANT NOT NULL, promoted_text VARCHAR, PRIMARY KEY (stream, event_id)
+                )
+            """)
+            tx.execute("INSERT INTO __orch__.event_streams VALUES (?, ?) ON CONFLICT DO NOTHING",
+                       [stream, promoted_text])
+            registered, = tx.execute("SELECT promoted FROM __orch__.event_streams WHERE stream = ?", [stream]).fetchone()
+            if registered != promoted_text:
+                raise ValueError("the stream already has a different promoted key")
+        _write_transaction(self._db, create)
+
+    def append(self, events: list[VariantEvent]) -> None:
+        if type(events) is not list or any(type(event) is not VariantEvent for event in events):
+            raise TypeError("expected a list of VariantEvent values")
+        rows = [{"id": e.event_id, "kind": e.kind, "created": e.occurred_at, "content": e.json_attributes}
+                for e in events]
+        try:
+            self._db.execute("""
+                INSERT INTO __orch__.variant_events
+                WITH parsed AS (
+                    SELECT e.id AS id, e.kind AS kind, e.created AS created, try_cast(e.content AS JSON) AS doc
+                    FROM unnest(?::STRUCT(id VARCHAR, kind VARCHAR, created TIMESTAMPTZ, content VARCHAR)[]) AS t(e)
+                ), typed AS MATERIALIZED (
+                    SELECT id, kind, created, CASE WHEN json_type(doc) IS DISTINCT FROM 'OBJECT'
+                        THEN error('event attributes must be a valid JSON object') ELSE doc::VARIANT END AS attributes
+                    FROM parsed
+                ), promoted AS (
+                    SELECT *, variant_extract(attributes, ?::VARCHAR) AS candidate FROM typed
+                )
+                SELECT ?, id, kind, created, attributes,
+                       CASE WHEN variant_typeof(candidate) = 'VARCHAR' THEN candidate::VARCHAR END
+                FROM promoted
+            """, [rows, self._promoted, self._stream])
+        except InvalidInputException as error:
+            if "event attributes must be a valid JSON object" not in str(error):
+                raise
+            raise ValueError("event attributes must be a valid JSON object") from error
+
+    def read(self, kind: str, *, key: str | None = None, value: str | None = None) -> list[ReadVariantEvent]:
+        if type(kind) is not str or not kind:
+            raise ValueError("kind must be a nonempty string")
+        predicates = ["stream = ?", "kind = ?"]
+        args = [self._stream, kind]
+        if key is not None or value is not None:
+            if type(key) is not str or not key or type(value) is not str:
+                raise ValueError("a text match requires a key and a string value")
+            if key == self._promoted:
+                predicates.append("promoted_text = ?")
+                args.append(value)
+            else:
+                predicates.append("""
+                    CASE WHEN variant_typeof(variant_extract(attributes, ?)) = 'VARCHAR'
+                         THEN variant_extract(attributes, ?)::VARCHAR END = ?
+                """)
+                args.extend([key, key, value])
+        where = " AND ".join(predicates)
+        rows = self._db.execute(f"""
+            SELECT event_id, kind, occurred_at AT TIME ZONE 'UTC', to_json(attributes)
+            FROM __orch__.variant_events WHERE {where} ORDER BY occurred_at, event_id
+        """, args).fetchall()
+        return [ReadVariantEvent(i, k, when.replace(tzinfo=timezone.utc), loads(attributes))
+                for i, k, when, attributes in rows]
+
+
+class ColumnType(Enum):
+    BOOLEAN = "BOOLEAN"
+    SMALLINT = "SMALLINT"
+    INTEGER = "INTEGER"
+    BIGINT = "BIGINT"
+    HUGEINT = "HUGEINT"
+    FLOAT = "FLOAT"
+    DOUBLE = "DOUBLE"
+    TEXT = "VARCHAR"
+    DATE = "DATE"
+    TIMESTAMP = "TIMESTAMP"
+    INSTANT = "TIMESTAMP WITH TIME ZONE"
+    JSON = "JSON"
+
+
+@dataclass(frozen=True)
+class ColumnContract:
+    kind: ColumnType
+    nullable: bool = True
+
+    def __post_init__(self):
+        if type(self.kind) is not ColumnType or type(self.nullable) is not bool:
+            raise TypeError("a column declaration needs a ColumnType and nullability")
+
+
+@dataclass(frozen=True)
+class SchemaViolation:
+    column: str
+    kind: str
+    expected: str | bool | None
+    actual: str | bool | None
+
+
+class RelationContract:
+    """Check declared column names, types and nullability against DuckDB metadata."""
+
+    def __init__(self, columns: Mapping[str, ColumnContract], *, allow_extra: bool = True):
+        self._columns = dict(columns)
+        if type(allow_extra) is not bool or not self._columns or any(
+            type(name) is not str or not name or type(rule) is not ColumnContract
+            for name, rule in self._columns.items()
+        ):
+            raise ValueError("register logical column names and their ColumnContract values")
+        self._allow_extra = allow_extra
+
+    def inspect(self, connection: DuckDBPyConnection, relation: str) -> tuple[SchemaViolation, ...]:
+        if type(relation) is not str or not relation:
+            raise ValueError("relation must be a nonempty name")
+        rows = connection.execute("""
+            SELECT column_name, data_type, is_nullable FROM duckdb_columns()
+            WHERE database_name = current_database() AND schema_name = 'main' AND table_name = ?
+            ORDER BY column_index
+        """, [relation]).fetchall()
+        if not rows:
+            raise KeyError(relation)
+        actual = {name: (kind, nullable) for name, kind, nullable in rows}
+        problems = []
+        for name, rule in self._columns.items():
+            kind, nullable = actual.get(name, (None, None))
+            if kind is None:
+                problems.append(SchemaViolation(name, "missing", rule.kind.value, None))
+                continue
+            if kind != rule.kind.value:
+                problems.append(SchemaViolation(name, "type", rule.kind.value, kind))
+            if nullable and not rule.nullable:
+                problems.append(SchemaViolation(name, "nullability", False, True))
+        if not self._allow_extra:
+            for name, kind, _ in rows:
+                if name not in self._columns:
+                    problems.append(SchemaViolation(name, "unexpected", None, kind))
+        return tuple(problems)
+
+
+@dataclass(frozen=True)
+class ScheduledTask:
+    tenant: str
+    depends_on: tuple[str, ...]
+    duration: int | None
+
+    def __post_init__(self):
+        if type(self.tenant) is not str or not self.tenant:
+            raise ValueError("task tenant must be a nonempty string")
+        if type(self.depends_on) is not tuple or any(type(name) is not str or not name for name in self.depends_on):
+            raise ValueError("task dependencies must be a tuple of task IDs")
+        if self.duration is not None and (type(self.duration) is not int or self.duration <= 0):
+            raise ValueError("task duration must be positive or unavailable")
+
+
+class CriticalPathScheduler:
+    """Prioritize ready tasks by estimated remaining path under tenant quotas."""
+
+    def __init__(self, tasks: Mapping[str, ScheduledTask], quotas: Mapping[str, int],
+                 *, default_duration: int = 1):
+        self._tasks = dict(tasks)
+        self._quotas = dict(quotas)
+        if type(default_duration) is not int or default_duration <= 0 or any(
+            type(value) is not int or value <= 0 for value in self._quotas.values()
+        ):
+            raise ValueError("task durations and tenant quotas must be positive integers")
+        if any(type(name) is not str or not name or type(task) is not ScheduledTask
+               for name, task in self._tasks.items()):
+            raise TypeError("register task IDs and ScheduledTask values")
+        children = {name: [] for name in tasks}
+        parents = {}
+        for name, task in tasks.items():
+            if task.tenant not in self._quotas:
+                raise ValueError("task tenant has no slot quota")
+            parents[name] = frozenset(task.depends_on)
+            for parent in parents[name]:
+                if parent not in tasks or tasks[parent].tenant != task.tenant:
+                    raise ValueError("task dependencies must be registered in the same tenant")
+                children[parent].append(name)
+        try:
+            order = tuple(TopologicalSorter(parents).static_order())
+        except CycleError as error:
+            raise ValueError("task graph contains a dependency cycle") from error
+        lengths = {}
+        for name in reversed(order):
+            lengths[name] = (tasks[name].duration or default_duration) + max(
+                (lengths[child] for child in children[name]), default=0,
+            )
+        self._parents = parents
+        self._priority = sorted(tasks, key=lambda name: (-lengths[name], name))
+
+    def ready(self, *, completed: set[str], running: set[str], slots: int) -> tuple[str, ...]:
+        """Return a deterministic dispatch order with no more than total slots."""
+        if type(slots) is not int or slots < 0:
+            raise ValueError("slots must be a nonnegative integer")
+        busy = completed | running
+        if completed & running or not busy <= self._tasks.keys():
+            raise ValueError("task state contains invalid or unknown IDs")
+        remaining = slots - len(running)
+        counts = dict.fromkeys(self._quotas, 0)
+        for name in running:
+            counts[self._tasks[name].tenant] += 1
+        ready = []
+        for name in self._priority:
+            if len(ready) >= remaining:
+                break
+            tenant = self._tasks[name].tenant
+            if name not in busy and counts[tenant] < self._quotas[tenant] and self._parents[name] <= completed:
+                ready.append(name)
+                counts[tenant] += 1
+        return tuple(ready)
