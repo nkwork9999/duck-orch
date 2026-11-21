@@ -673,6 +673,129 @@ class SharedQualityScan:
                 for name, count, (lower, upper) in zip(checks, observed, ranges)]
 
 
+@dataclass(frozen=True)
+class RevisionExample:
+    key: int
+    kind: str
+    previous: dict | None
+    current: dict | None
+
+
+@dataclass(frozen=True)
+class RevisionComparison:
+    added: int
+    removed: int
+    changed: int
+    unchanged: int
+    previous_duplicate_keys: int
+    current_duplicate_keys: int
+    previous_null_keys: int
+    current_null_keys: int
+    column_changes: dict[str, int]
+    examples: tuple[RevisionExample, ...]
+
+
+class RevisionDifference:
+    """Compare two compatible relations with a registered BIGINT key."""
+
+    def __init__(self, connection: DuckDBPyConnection, previous: str, current: str, *,
+                 key: str, columns: Mapping[str, str]):
+        if not 1 <= len(columns) <= 256:
+            raise ValueError("register between 1 and 256 comparison columns")
+        if any(type(alias) is not str for alias in columns) or len({alias.casefold() for alias in columns}) != len(columns):
+            raise ValueError("register distinct column aliases")
+        self._db = connection
+        self._aliases = tuple(columns)
+        name_of = SharedQualityScan._identifier
+        key = name_of(key)
+        source_names = [name_of(column) for column in columns.values()]
+        self._sources = tuple(f"main.{name_of(relation)}" for relation in (previous, current))
+        selected = [f"{key} AS row_id"]
+        selected.extend(f"{name} AS col_{i}" for i, name in enumerate(source_names))
+        self._projection = ", ".join(selected)
+
+        aliases = [name_of(alias) for alias in self._aliases]
+        sides = ("old", "new")
+        self._values = ", ".join(f"{side}.col_{i} AS {side}_{i}"
+                                 for side in sides for i in range(len(aliases)))
+        self._diffs = ", ".join(f"old.col_{i} IS DISTINCT FROM new.col_{i} AS diff_{i}"
+                                for i in range(len(aliases)))
+        self._changed = " OR ".join(f"diff_{i}" for i in range(len(aliases)))
+        self._digest = ", ".join(f"count(*) FILTER (WHERE kind = 'changed' AND diff_{i})"
+                                 for i in range(len(aliases)))
+        self._snapshots = [
+            "to_json(struct_pack(" +
+            ", ".join(f"{alias} := {side}_{i}" for i, alias in enumerate(aliases)) + "))"
+            for side in sides
+        ]
+
+    def compare(self, *, example_limit: int = 20) -> RevisionComparison:
+        if type(example_limit) is not int or not 0 <= example_limit <= 10_000:
+            raise ValueError("example_limit must be an integer between 0 and 10000")
+        with self._db.cursor() as db:
+            db.execute("BEGIN TRANSACTION")
+            schemas = [[row[1] for row in db.execute(f"DESCRIBE SELECT {self._projection} FROM {source}").fetchall()]
+                       for source in self._sources]
+            if schemas[0] != schemas[1] or schemas[0][0] != "BIGINT":
+                raise ValueError("use matching column types and a BIGINT key in both relations")
+            row = self._compare(db, example_limit)
+            db.execute("COMMIT")
+        counts, differs, examples = row[:8], row[8:-1], row[-1]
+        return RevisionComparison(*counts, dict(zip(self._aliases, differs)), tuple(
+            RevisionExample(e["id"], e["kind"],
+                            loads(e["previous"]) if e["previous"] is not None else None,
+                            loads(e["current"]) if e["current"] is not None else None)
+            for e in (examples or [])
+        ))
+
+    def _compare(self, db, example_limit):
+        previous, current = self._sources
+        left, right = self._snapshots
+        return db.execute(f"""
+            WITH previous AS MATERIALIZED (
+                SELECT {self._projection}, count(*) OVER (PARTITION BY row_id) AS copies FROM {previous}
+            ), candidate AS MATERIALIZED (
+                SELECT {self._projection}, count(*) OVER (PARTITION BY row_id) AS copies FROM {current}
+            ), bad_keys AS MATERIALIZED (
+                SELECT row_id FROM previous WHERE copies > 1 AND row_id IS NOT NULL
+                UNION
+                SELECT row_id FROM candidate WHERE copies > 1 AND row_id IS NOT NULL
+            ), old AS (
+                SELECT * FROM previous ANTI JOIN bad_keys USING (row_id) WHERE row_id IS NOT NULL
+            ), new AS (
+                SELECT * FROM candidate ANTI JOIN bad_keys USING (row_id) WHERE row_id IS NOT NULL
+            ), paired AS (
+                SELECT coalesce(old.row_id, new.row_id) AS row_id,
+                       old.row_id IS NULL AS added, new.row_id IS NULL AS removed,
+                       {self._values}, {self._diffs}
+                FROM old FULL OUTER JOIN new USING (row_id)
+            ), classified AS MATERIALIZED (
+                SELECT *, CASE WHEN added THEN 'added' WHEN removed THEN 'removed'
+                               WHEN {self._changed} THEN 'changed' ELSE 'unchanged' END AS kind
+                FROM paired
+            ), counts AS (
+                SELECT count(*) FILTER (WHERE kind = 'added'),
+                       count(*) FILTER (WHERE kind = 'removed'),
+                       count(*) FILTER (WHERE kind = 'changed'),
+                       count(*) FILTER (WHERE kind = 'unchanged'),
+                       (SELECT count(DISTINCT row_id) FROM previous WHERE copies > 1),
+                       (SELECT count(DISTINCT row_id) FROM candidate WHERE copies > 1),
+                       (SELECT count(*) FROM previous WHERE row_id IS NULL),
+                       (SELECT count(*) FROM candidate WHERE row_id IS NULL),
+                       {self._digest}
+                FROM classified
+            ), limited AS (
+                SELECT * FROM classified WHERE kind <> 'unchanged' ORDER BY row_id LIMIT ?
+            ), samples AS (
+                SELECT list(struct_pack(id := row_id, kind := kind,
+                             previous := CASE WHEN NOT added THEN {left} END,
+                             current := CASE WHEN NOT removed THEN {right} END) ORDER BY row_id)
+                FROM limited
+            )
+            SELECT counts.*, samples.* FROM counts CROSS JOIN samples
+        """, [example_limit]).fetchone()
+
+
 def _fingerprint(value):
     return sha256(dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode()).hexdigest()
 

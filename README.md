@@ -263,6 +263,10 @@ Use `publish(plan, request_key=...)` when a host request can be retried. Store t
 key together. A retry returns the original publication even after a later publication. Reusing its
 key with a different plan raises `ReleaseRequestConflict`.
 `RelationContract.inspect` compares candidate column names, types and declared nullability using the DuckDB catalog.
+`RevisionDifference(connection, previous, current, key=..., columns=...)` compares two registered
+relations with matching column types and a BIGINT key. Build both revisions from the same inputs.
+The result separates added, removed and changed rows, NULL keys and duplicate keys. Pass
+`example_limit` to retrieve bounded, ordered examples alongside the per-column counts.
 `JsonProjector(connection, fields)` projects registered paths and reports malformed documents, missing keys,
 JSON nulls and incompatible values per row. `VariantEventLog` stores events in typed columns and a VARIANT
 attribute object on DuckDB builds with VARIANT support. Register a frequent text key to project it at ingest.
