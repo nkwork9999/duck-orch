@@ -511,3 +511,214 @@ class FingerprintStore:
         return {name: ModelFingerprint(definition, tuple(tuple(pair) for pair in loads(upstream)),
                                        macros, settings, engine)
                 for name, definition, upstream, macros, settings, engine in rows}
+
+
+@dataclass(frozen=True)
+class ReleaseModel:
+    physical_version: str
+    contract: str
+
+    def __post_init__(self):
+        if any(type(value) is not str or not value for value in (self.physical_version, self.contract)):
+            raise ValueError("provide a physical version and contract for each model")
+
+
+@dataclass(frozen=True)
+class ReleasePlan:
+    environment_id: UUID
+    revision: str
+    base_epoch: int
+    input_epoch: int
+
+
+@dataclass(frozen=True)
+class PublishedGeneration:
+    revision: str
+    epoch: int
+    models: tuple[tuple[str, ReleaseModel], ...]
+    inputs: tuple[tuple[str, str], ...]
+
+
+class StaleReleasePlan(ValueError):
+    """The active generation or source inputs changed since preparation."""
+
+
+class GenerationCatalog:
+    """Publish immutable checked manifests through one DuckDB transaction per environment."""
+
+    def __init__(self, connection: DuckDBPyConnection, environment: str, model_ids: set[str]):
+        if type(environment) is not str or not environment:
+            raise ValueError("environment must be a nonempty string")
+        models = frozenset(model_ids)
+        if not models or any(type(model) is not str or not model for model in models):
+            raise ValueError("register at least one model ID")
+        self._db = connection
+        self._environment = environment
+        self._models = models
+
+        def initialize(tx):
+            tx.execute("CREATE SCHEMA IF NOT EXISTS __orch__")
+            tx.execute("""
+                CREATE TABLE IF NOT EXISTS __orch__.release_environments (
+                    environment VARCHAR PRIMARY KEY, id UUID NOT NULL, active VARCHAR,
+                    epoch BIGINT NOT NULL, input_epoch BIGINT NOT NULL, observed_inputs JSON NOT NULL,
+                    model_ids JSON NOT NULL
+                )
+            """)
+            tx.execute("""
+                CREATE TABLE IF NOT EXISTS __orch__.release_manifests (
+                    environment VARCHAR, revision VARCHAR, models JSON NOT NULL,
+                    inputs JSON NOT NULL, checks JSON NOT NULL, published BOOLEAN NOT NULL,
+                    PRIMARY KEY (environment, revision)
+                )
+            """)
+            tx.execute("""
+                INSERT INTO __orch__.release_environments VALUES (?, uuid(), NULL, 0, 0, '{}', ?)
+                ON CONFLICT DO NOTHING
+            """, [self._environment, dumps(sorted(self._models))])
+            registered, = tx.execute("""
+                SELECT model_ids FROM __orch__.release_environments WHERE environment = ?
+            """, [self._environment]).fetchone()
+            if set(loads(registered)) != self._models:
+                raise ValueError("model IDs do not match the existing environment")
+        _write_transaction(self._db, initialize)
+
+    @staticmethod
+    def _input_json(inputs):
+        values = dict(inputs)
+        if any(type(key) is not str or not key or type(version) is not str or not version
+               for key, version in values.items()):
+            raise ValueError("source versions must map nonempty strings to nonempty strings")
+        return dumps(values, sort_keys=True, separators=(",", ":"))
+
+    def set_inputs(self, inputs: Mapping[str, str]) -> None:
+        """Record the currently visible source versions without changing the active release."""
+        encoded = self._input_json(inputs)
+        def update(tx):
+            tx.execute("""
+                UPDATE __orch__.release_environments SET observed_inputs = ?, input_epoch = input_epoch + 1
+                WHERE environment = ? AND observed_inputs IS DISTINCT FROM ?::JSON
+            """, [encoded, self._environment, encoded])
+        _write_transaction(self._db, update)
+
+    def stage(self, revision: str, models: Mapping[str, ReleaseModel], *,
+              inputs: Mapping[str, str], checks: Mapping[str, bool]) -> None:
+        """Record all already-prepared physical versions and their passed checks."""
+        if type(revision) is not str or not revision:
+            raise ValueError("revision must be a nonempty string")
+        if models.keys() != self._models or any(type(model) is not ReleaseModel for model in models.values()):
+            raise ValueError("stage must include a physical version for every registered model")
+        if not checks or any(type(key) is not str or not key or value is not True for key, value in checks.items()):
+            raise ValueError("all registered checks must pass before staging")
+        manifest = {name: [model.physical_version, model.contract] for name, model in models.items()}
+        args = [self._environment, revision, dumps(manifest, sort_keys=True), self._input_json(inputs),
+                dumps(dict(checks), sort_keys=True)]
+        self._db.execute("INSERT INTO __orch__.release_manifests VALUES (?, ?, ?, ?, ?, false)", args)
+
+    def prepare(self, revision: str) -> ReleasePlan:
+        if type(revision) is not str or not revision:
+            raise ValueError("revision must be a nonempty string")
+        current = self._db.execute("""
+            SELECT e.id, e.epoch, e.input_epoch, e.observed_inputs, m.inputs
+            FROM __orch__.release_environments e JOIN __orch__.release_manifests m USING (environment)
+            WHERE e.environment = ? AND m.revision = ?
+        """, [self._environment, revision]).fetchone()
+        if current is None:
+            raise KeyError(revision)
+        identity, epoch, input_epoch, observed, staged = current
+        if loads(observed) != loads(staged):
+            raise StaleReleasePlan("staged source versions differ from current sources")
+        return ReleasePlan(identity, revision, epoch, input_epoch)
+
+    def validate(self, plan: ReleasePlan) -> None:
+        """Verify the plan before applying work. Publication checks the same versions again."""
+        if type(plan) is not ReleasePlan:
+            raise TypeError("expected a ReleasePlan")
+        if self.prepare(plan.revision) != plan:
+            raise StaleReleasePlan("active generation or source version changed")
+
+    def publish(self, plan: ReleasePlan) -> PublishedGeneration:
+        if type(plan) is not ReleasePlan:
+            raise TypeError("expected a ReleasePlan")
+        def switch(tx):
+            manifest = self._manifest(tx, plan.revision, published_only=False)
+            epoch = tx.execute("""
+                UPDATE __orch__.release_environments AS e SET active = ?, epoch = epoch + 1
+                WHERE environment = ? AND id = ? AND epoch = ? AND input_epoch = ?
+                    AND observed_inputs = ?::JSON
+                RETURNING epoch
+            """, [plan.revision, self._environment, plan.environment_id, plan.base_epoch,
+                  plan.input_epoch, manifest[1]]).fetchone()
+            if epoch is None:
+                raise StaleReleasePlan("active generation or source version changed")
+            tx.execute("""
+                UPDATE __orch__.release_manifests SET published = true WHERE environment = ? AND revision = ?
+            """, [self._environment, plan.revision])
+            return self._snapshot(plan.revision, epoch[0], *manifest)
+        return _write_transaction(self._db, switch)
+
+    def rollback(self, revision: str, *, expected_epoch: int) -> PublishedGeneration:
+        """Repoint the active release to an already published manifest."""
+        if type(expected_epoch) is not int or expected_epoch < 0:
+            raise ValueError("expected_epoch must be nonnegative")
+        def switch(tx):
+            models, inputs = self._manifest(tx, revision, published_only=True)
+            found = tx.execute("""
+                UPDATE __orch__.release_environments SET active = ?, epoch = epoch + 1
+                WHERE environment = ? AND epoch = ? RETURNING epoch
+            """, [revision, self._environment, expected_epoch]).fetchone()
+            if found is None:
+                raise StaleReleasePlan("active generation changed before rollback")
+            return self._snapshot(revision, found[0], models, inputs)
+        return _write_transaction(self._db, switch)
+
+    def _manifest(self, tx, revision, *, published_only):
+        if type(revision) is not str or not revision:
+            raise ValueError("revision must be a nonempty string")
+        row = tx.execute("""
+            SELECT models, inputs FROM __orch__.release_manifests
+            WHERE environment = ? AND revision = ? AND (published OR NOT ?)
+        """, [self._environment, revision, published_only]).fetchone()
+        if row is None:
+            raise KeyError(revision)
+        return row
+
+    def active(self) -> PublishedGeneration | None:
+        row = self._db.execute("""
+            SELECT e.active, e.epoch, m.models, m.inputs
+            FROM __orch__.release_environments e JOIN __orch__.release_manifests m
+                ON e.environment = m.environment AND e.active = m.revision
+            WHERE e.environment = ?
+        """, [self._environment]).fetchone()
+        return self._snapshot(*row) if row is not None else None
+
+    def fork(self, target_environment: str) -> "GenerationCatalog":
+        """Create a trial environment pinned to the current immutable references."""
+        if type(target_environment) is not str or not target_environment:
+            raise ValueError("target environment must be a nonempty string")
+        def branch(tx):
+            if tx.execute("SELECT 1 FROM __orch__.release_environments WHERE environment = ?",
+                          [target_environment]).fetchone():
+                raise ValueError("target environment already exists")
+            copied = tx.execute("""
+                INSERT INTO __orch__.release_environments
+                SELECT ?, uuid(), source.active, 1, 0, m.inputs, source.model_ids
+                FROM __orch__.release_environments AS source JOIN __orch__.release_manifests AS m
+                     ON m.environment = source.environment AND m.revision = source.active
+                WHERE source.environment = ? RETURNING active
+            """, [target_environment, self._environment]).fetchone()
+            if copied is None:
+                raise ValueError("publish a generation before forking its environment")
+            tx.execute("""
+                INSERT INTO __orch__.release_manifests
+                SELECT ?, revision, models, inputs, checks, true
+                FROM __orch__.release_manifests WHERE environment = ? AND revision = ?
+            """, [target_environment, self._environment, copied[0]])
+        _write_transaction(self._db, branch)
+        return GenerationCatalog(self._db, target_environment, self._models)
+
+    @staticmethod
+    def _snapshot(revision, epoch, models, inputs):
+        return PublishedGeneration(revision, epoch,
+                                   tuple((name, ReleaseModel(*value)) for name, value in sorted(loads(models).items())),
+                                   tuple(sorted(loads(inputs).items())))

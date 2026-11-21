@@ -237,6 +237,11 @@ Use `ChangeLedger(connection, models)` to record durable source intervals by rev
 and its `ChangeWindowPlanner` to `plan`. Open a separate database file for each tenant.
 `ModelFingerprint.capture` records definition, upstream versions, macros, settings and engine version.
 `FingerprintStore` keeps named revisions, and `FingerprintPlanner` returns reasons for invalidation.
+`GenerationCatalog` keeps checked manifests and a versioned active pointer in DuckDB. Stage all required
+model references and their passed checks, prepare a plan, and call `validate` before running work.
+`publish` checks the source and active epochs again before switching the entire manifest.
+`rollback` restores a previously published manifest and its input baseline. `fork` can create an
+isolated trial environment with the same immutable physical references.
 
 Give each active caller its own connection with the matching extension loaded. With Python 3.10+,
 the `duckdb` package and the matching installed extension, run the integration tests from the repository root:
