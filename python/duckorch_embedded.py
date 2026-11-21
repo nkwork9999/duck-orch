@@ -1,5 +1,5 @@
 """Read-side planning for a host-provisioned, tenant-scoped duckOrch connection."""
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import date, timedelta
 from enum import Enum
@@ -70,6 +70,18 @@ class PartitionGrain(Enum):
     DAY = "day"
     MONTH = "month"
     ALL = "all"
+
+
+@dataclass(frozen=True)
+class RollingDependency:
+    """Days before and after an output date that its calculation reads."""
+
+    lookback: int = 0
+    lookahead: int = 0
+
+    def __post_init__(self):
+        if any(type(value) is not int or value < 0 for value in (self.lookback, self.lookahead)):
+            raise ValueError("rolling dependency widths must be nonnegative integer days")
 
 
 @dataclass(frozen=True)
@@ -177,13 +189,13 @@ class GenerationCoverage:
 
 
 class ChangeWindowPlanner:
-    """Read-side plan for one changed input in a host-registered calendar DAG.
+    """Read-side change plan for a host-registered calendar DAG.
 
     The caller supplies a tenant-specific graph and retained date horizon at
     construction. Use ALL when an edge has no established partition mapping.
     """
 
-    def __init__(self, dependencies: Mapping[str, Mapping[str, PartitionGrain]],
+    def __init__(self, dependencies: Mapping[str, Mapping[str, PartitionGrain | RollingDependency]],
                  horizon: DateWindow):
         if type(horizon) is not DateWindow:
             raise TypeError("horizon must be a DateWindow")
@@ -192,14 +204,18 @@ class ChangeWindowPlanner:
         for parents in self._dependencies.values():
             if not parents.keys() <= self._dependencies.keys():
                 raise ValueError("all upstream models must be registered")
-            if any(type(grain) is not PartitionGrain for grain in parents.values()):
-                raise TypeError("dependencies must use PartitionGrain")
+            if any(type(grain) not in (PartitionGrain, RollingDependency) for grain in parents.values()):
+                raise TypeError("dependencies must use PartitionGrain or RollingDependency")
         try:
             self._order = tuple(TopologicalSorter(self._dependencies).static_order())
         except CycleError as exc:
             raise ValueError("model dependencies contain a cycle") from exc
 
-    def _expand(self, window: DateWindow, grain: PartitionGrain) -> DateWindow:
+    def _expand(self, window: DateWindow, grain: PartitionGrain | RollingDependency) -> DateWindow:
+        if type(grain) is RollingDependency:
+            before = min(grain.lookahead, (window.start - self._horizon.start).days)
+            after = min(grain.lookback, (self._horizon.end - window.end).days)
+            return DateWindow(window.start - timedelta(days=before), window.end + timedelta(days=after))
         if grain is PartitionGrain.DAY:
             return window
         if grain is PartitionGrain.ALL:
@@ -218,28 +234,100 @@ class ChangeWindowPlanner:
 
     def affected(self, source_id: str, changed: DateWindow) -> dict[str, tuple[DateWindow, ...]]:
         """Propagate one changed window to downstream models in topological order."""
-        if source_id not in self._dependencies:
-            raise KeyError(source_id)
-        if type(changed) is not DateWindow:
-            raise TypeError("changed must be a DateWindow")
-        start = max(changed.start, self._horizon.start)
-        end = min(changed.end, self._horizon.end)
-        if start >= end:
-            return {}
+        return self.affected_many({source_id: (changed,)})
 
-        windows = {source_id: DateWindow(start, end)}
+    @staticmethod
+    def _merge(windows: Iterable[DateWindow]) -> tuple[DateWindow, ...]:
+        result = []
+        for window in sorted(windows, key=lambda span: (span.start, span.end)):
+            if result and window.start <= result[-1].end:
+                prev = result[-1]
+                result[-1] = DateWindow(prev.start, max(prev.end, window.end))
+            else:
+                result.append(window)
+        return tuple(result)
+
+    def affected_many(self, changes: Mapping[str, Iterable[DateWindow]]) -> dict[str, tuple[DateWindow, ...]]:
+        """Propagate disjoint source changes and merge touching output intervals."""
+        direct = {}
+        for model, changes_for_model in changes.items():
+            if model not in self._dependencies:
+                raise KeyError(model)
+            clipped = []
+            for changed in changes_for_model:
+                if type(changed) is not DateWindow:
+                    raise TypeError("changed must be a DateWindow")
+                start = max(changed.start, self._horizon.start)
+                end = min(changed.end, self._horizon.end)
+                if start < end:
+                    clipped.append(DateWindow(start, end))
+            direct[model] = self._merge(clipped)
+
+        propagated = {}
+        outputs = {}
         for model in self._order:
-            if model == source_id:
-                continue
-            candidates = [
-                self._expand(windows[parent], grain)
+            incoming = self._merge(
+                self._expand(window, grain)
                 for parent, grain in self._dependencies[model].items()
-                if parent in windows
-            ]
-            if candidates:
-                # Each mapping contains the original changed window, so the
-                # incoming windows overlap and their union is contiguous.
-                windows[model] = DateWindow(min(w.start for w in candidates),
-                                            max(w.end for w in candidates))
-        del windows[source_id]
-        return {model: (window,) for model, window in windows.items()}
+                for window in propagated.get(parent, ())
+            )
+            if incoming:
+                outputs[model] = incoming
+            propagated[model] = self._merge((*incoming, *direct.get(model, ())))
+        return outputs
+
+
+class QualityCheckSelector:
+    """Choose registered checks from changes to their model and column inputs."""
+
+    def __init__(self, checks: Mapping[str, Mapping[str, Iterable[str] | None] | None]):
+        self._unresolved = set()
+        self._dependencies = {}
+        for check_id, inputs in checks.items():
+            if inputs is None or not inputs:
+                self._unresolved.add(check_id)
+                continue
+            for model, columns in inputs.items():
+                dependencies = self._dependencies.setdefault(model, [])
+                dependencies.append((check_id, None if columns is None else frozenset(columns)))
+
+    def select(self, changes: Mapping[str, Iterable[str] | None]) -> tuple[str, ...]:
+        """None marks a whole-model change or a dependency with unknown columns."""
+        if not changes:
+            return ()
+        selected = set(self._unresolved)
+        for model, columns in changes.items():
+            changed = None if columns is None else frozenset(columns)
+            for check_id, referenced in self._dependencies.get(model, ()):
+                if changed is None or referenced is None or not referenced.isdisjoint(changed):
+                    selected.add(check_id)
+        return tuple(sorted(selected))
+
+
+@dataclass(frozen=True)
+class ForeignKeyCheck:
+    """Count non-null child keys missing from a registered parent relation."""
+
+    child: str
+    child_key: str
+    parent: str
+    parent_key: str
+
+    def __post_init__(self):
+        for name in (self.child, self.child_key, self.parent, self.parent_key):
+            if type(name) is not str or not name or "\0" in name:
+                raise ValueError("check identifiers must be nonempty strings without NUL")
+
+    def violation_count(self, connection: DuckDBPyConnection) -> int:
+        def quote(identifier):
+            return '"' + identifier.replace('"', '""') + '"'
+
+        child, child_key, parent, parent_key = (quote(name) for name in (
+            self.child, self.child_key, self.parent, self.parent_key,
+        ))
+        missing, = connection.execute(f"""
+            SELECT count(*) FROM main.{child} AS c
+            ANTI JOIN main.{parent} AS p ON c.{child_key} = p.{parent_key}
+            WHERE c.{child_key} IS NOT NULL
+        """).fetchone()
+        return missing

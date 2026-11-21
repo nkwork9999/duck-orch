@@ -6,6 +6,46 @@ from duckorch_embedded import ChangeWindowPlanner, DateWindow, PartitionGrain
 
 
 class ChangeWindowTests(unittest.TestCase):
+    def test_rolling_windows_merge_by_model_and_match_full_rebuild(self):
+        from duckorch_embedded import RollingDependency
+
+        horizon = DateWindow(date(2026, 1, 1), date(2026, 4, 1))
+        planner = ChangeWindowPlanner({
+            "raw": {},
+            "trailing": {"raw": RollingDependency(lookback=6, lookahead=0)},
+            "centered": {"raw": RollingDependency(lookback=3, lookahead=3)},
+            "cumulative": {"raw": PartitionGrain.ALL},
+        }, horizon)
+        changes = [DateWindow(date(2026, 1, 31), date(2026, 2, 1)),
+                   DateWindow(date(2026, 2, 2), date(2026, 2, 3)),
+                   DateWindow(date(2026, 3, 29), date(2026, 3, 30))]
+        plan = planner.affected_many({"raw": changes})
+        self.assertEqual(plan["trailing"], (DateWindow(date(2026, 1, 31), date(2026, 2, 9)),
+                                           DateWindow(date(2026, 3, 29), horizon.end)))
+        self.assertEqual(plan["centered"], (DateWindow(date(2026, 1, 28), date(2026, 2, 6)),
+                                           DateWindow(date(2026, 3, 26), horizon.end)))
+        self.assertEqual(plan["cumulative"], (horizon,))
+        with duckdb.connect() as db:
+            db.execute("""
+                CREATE TABLE raw AS SELECT d::DATE AS d, 1 AS v
+                FROM generate_series(DATE '2026-01-01', DATE '2026-03-31', INTERVAL 1 DAY) series(d)
+            """)
+            sql = "SELECT d, sum(v) OVER (ORDER BY d ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS roll FROM raw"
+            db.execute("CREATE TABLE rolling_result AS " + sql)
+            for changed in changes:
+                db.execute("UPDATE raw SET v = 10 WHERE d = ?", [changed.start])
+            for span in plan["trailing"]:
+                # Supply the preceding input rows to compute the boundary output.
+                db.execute("""
+                    UPDATE rolling_result SET roll = replacement.roll FROM (
+                        SELECT d, sum(v) OVER (ORDER BY d ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS roll
+                        FROM raw WHERE d >= ?::DATE - 6 AND d < ?
+                    ) AS replacement
+                    WHERE rolling_result.d = replacement.d AND rolling_result.d >= ?
+                """, [span.start, span.end, span.start])
+            self.assertEqual(db.execute("SELECT * FROM rolling_result ORDER BY d").fetchall(),
+                             db.execute(sql + " ORDER BY d").fetchall())
+
     def test_late_day_correction_equals_full_rebuild(self):
         day = date(2026, 2, 3)
         next_day = date(2026, 2, 4)

@@ -228,6 +228,12 @@ It considers both completed work and outstanding claims for the same asset and g
 Store the claim with the worker's job so it can be settled after restarting. A persistent DuckDB file retains
 the reservations across restarts. An outstanding claim continues to own its interval until explicitly settled.
 
+For daily rolling models, set an edge to `RollingDependency(lookback=6)` for a seven-day trailing window.
+`affected_many({model_id: [window, ...]})` maps several source changes to downstream output ranges and merges
+overlapping or adjacent ranges. Keep the inputs needed for the rolling window when refreshing those outputs.
+`QualityCheckSelector(checks).select(changes)` picks checks by model and column dependencies.
+Register both inputs of a referential check and use `ForeignKeyCheck` to count child keys missing from the parent.
+
 Give each active caller its own connection with the matching extension loaded. With Python 3.10+,
 the `duckdb` package and the matching installed extension, run the integration tests from the repository root:
 
