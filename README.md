@@ -240,6 +240,9 @@ Register both inputs of a referential check and use `ForeignKeyCheck` to count c
 Use `ChangeLedger(connection, models)` to record durable source intervals by revision and pass a revision
 and its `ChangeWindowPlanner` to `plan`. Use `explain` to iterate through source and parent-edge reasons
 with optional per-model byte estimates. Open a separate database file for each tenant.
+`FileIngestionLedger(connection, input_id).pending(files)` returns only immutable file revisions without
+a completion record. Supply `FileRevision(uri, version)` values from the host's inventory, and call
+`complete(files)` after those revisions have been committed to the destination.
 `GroupDelta(connection, source, target).refresh(revision, changes)` recomputes sums and counts for affected
 regions, including both sides of a move. The registered source has `region` and `amount` columns. The target
 has `region`, `value` and `n` columns. Pass `MembershipChange` values from the same committed source revision.

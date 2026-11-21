@@ -452,6 +452,71 @@ class ChangeLedger:
         return planner.explain(changes, tenant_id=tenant_id, bytes_per_day=bytes_per_day)
 
 
+@dataclass(frozen=True)
+class FileRevision:
+    uri: str
+    version: str
+
+    def __post_init__(self):
+        if any(type(value) is not str or not value or "\0" in value for value in (self.uri, self.version)):
+            raise ValueError("provide the URI and immutable version or verified content digest")
+
+
+class FileIngestionLedger:
+    """Track immutable file revisions for one registered input on a tenant database."""
+
+    def __init__(self, connection: DuckDBPyConnection, input_id: str):
+        if type(input_id) is not str or not input_id:
+            raise ValueError("input_id must be a nonempty string")
+        self._db = connection
+        self._input = input_id
+
+        def initialize(tx):
+            tx.execute("CREATE SCHEMA IF NOT EXISTS __orch__")
+            tx.execute("""
+                CREATE TABLE IF NOT EXISTS __orch__.ingested_files (
+                    input_id VARCHAR, uri VARCHAR, version VARCHAR,
+                    completed_at TIMESTAMPTZ NOT NULL DEFAULT current_timestamp,
+                    PRIMARY KEY (input_id, uri, version)
+                )
+            """)
+
+        _write_transaction(connection, initialize)
+
+    @staticmethod
+    def _parameters(files):
+        if type(files) is not list or any(type(file) is not FileRevision for file in files):
+            raise TypeError("expected a list of FileRevision values")
+        return [{"uri": file.uri, "version": file.version} for file in dict.fromkeys(files)]
+
+    def pending(self, files: list[FileRevision]) -> list[FileRevision]:
+        """Return distinct, unprocessed revisions in inventory order."""
+        with self._db.cursor() as reader:
+            missing = reader.execute("""
+                WITH inventory AS (
+                    SELECT f.uri AS uri, f.version AS version, ord
+                    FROM unnest(?::STRUCT(uri VARCHAR, version VARCHAR)[]) WITH ORDINALITY AS t(f, ord)
+                ), complete AS (
+                    SELECT uri, version FROM __orch__.ingested_files WHERE input_id = ?
+                )
+                SELECT uri, version FROM inventory ANTI JOIN complete USING (uri, version) ORDER BY ord
+            """, [self._parameters(files), self._input]).fetchall()
+        return [FileRevision(uri, version) for uri, version in missing]
+
+    def complete(self, files: list[FileRevision]) -> int:
+        """Confirm file revisions after their ingest output has committed."""
+        params = [self._input, self._parameters(files)]
+
+        def commit(tx):
+            return len(tx.execute("""
+                INSERT INTO __orch__.ingested_files(input_id, uri, version)
+                SELECT ?, f.uri, f.version FROM unnest(?::STRUCT(uri VARCHAR, version VARCHAR)[]) AS t(f)
+                ON CONFLICT DO NOTHING RETURNING 1
+            """, params).fetchall())
+
+        return _write_transaction(self._db, commit)
+
+
 class QualityCheckSelector:
     """Choose registered checks from changes to their model and column inputs."""
 
