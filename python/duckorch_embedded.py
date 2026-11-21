@@ -715,19 +715,13 @@ class RevisionDifference:
         self._projection = ", ".join(selected)
 
         aliases = [name_of(alias) for alias in self._aliases]
-        sides = ("old", "new")
-        self._values = ", ".join(f"{side}.col_{i} AS {side}_{i}"
-                                 for side in sides for i in range(len(aliases)))
         self._diffs = ", ".join(f"old.col_{i} IS DISTINCT FROM new.col_{i} AS diff_{i}"
                                 for i in range(len(aliases)))
         self._changed = " OR ".join(f"diff_{i}" for i in range(len(aliases)))
         self._digest = ", ".join(f"count(*) FILTER (WHERE kind = 'changed' AND diff_{i})"
                                  for i in range(len(aliases)))
-        self._snapshots = [
-            "to_json(struct_pack(" +
-            ", ".join(f"{alias} := {side}_{i}" for i, alias in enumerate(aliases)) + "))"
-            for side in sides
-        ]
+        self._snapshot = ", ".join(f"{alias} := col_{i}" for i, alias in enumerate(aliases))
+        self._key = key
 
     def compare(self, *, example_limit: int = 20) -> RevisionComparison:
         if type(example_limit) is not int or not 0 <= example_limit <= 10_000:
@@ -739,61 +733,67 @@ class RevisionDifference:
             if schemas[0] != schemas[1] or schemas[0][0] != "BIGINT":
                 raise ValueError("use matching column types and a BIGINT key in both relations")
             row = self._compare(db, example_limit)
+            counts, differs, identifiers = row[:8], row[8:-1], row[-1]
+            examples = self._examples(db, identifiers or [])
             db.execute("COMMIT")
-        counts, differs, examples = row[:8], row[8:-1], row[-1]
-        return RevisionComparison(*counts, dict(zip(self._aliases, differs)), tuple(
-            RevisionExample(e["id"], e["kind"],
-                            loads(e["previous"]) if e["previous"] is not None else None,
-                            loads(e["current"]) if e["current"] is not None else None)
-            for e in (examples or [])
-        ))
+        return RevisionComparison(*counts, dict(zip(self._aliases, differs)), examples)
 
     def _compare(self, db, example_limit):
         previous, current = self._sources
-        left, right = self._snapshots
         return db.execute(f"""
-            WITH previous AS MATERIALIZED (
-                SELECT {self._projection}, count(*) OVER (PARTITION BY row_id) AS copies FROM {previous}
-            ), candidate AS MATERIALIZED (
-                SELECT {self._projection}, count(*) OVER (PARTITION BY row_id) AS copies FROM {current}
+            WITH old_issues AS MATERIALIZED (
+                SELECT {self._key} AS row_id, count(*) AS copies FROM {previous}
+                GROUP BY row_id HAVING row_id IS NULL OR count(*) > 1
+            ), new_issues AS MATERIALIZED (
+                SELECT {self._key} AS row_id, count(*) AS copies FROM {current}
+                GROUP BY row_id HAVING row_id IS NULL OR count(*) > 1
             ), bad_keys AS MATERIALIZED (
-                SELECT row_id FROM previous WHERE copies > 1 AND row_id IS NOT NULL
+                SELECT row_id FROM old_issues WHERE row_id IS NOT NULL
                 UNION
-                SELECT row_id FROM candidate WHERE copies > 1 AND row_id IS NOT NULL
+                SELECT row_id FROM new_issues WHERE row_id IS NOT NULL
             ), old AS (
-                SELECT * FROM previous ANTI JOIN bad_keys USING (row_id) WHERE row_id IS NOT NULL
+                SELECT * FROM (SELECT {self._projection} FROM {previous})
+                ANTI JOIN bad_keys USING (row_id) WHERE row_id IS NOT NULL
             ), new AS (
-                SELECT * FROM candidate ANTI JOIN bad_keys USING (row_id) WHERE row_id IS NOT NULL
+                SELECT * FROM (SELECT {self._projection} FROM {current})
+                ANTI JOIN bad_keys USING (row_id) WHERE row_id IS NOT NULL
             ), paired AS (
                 SELECT coalesce(old.row_id, new.row_id) AS row_id,
-                       old.row_id IS NULL AS added, new.row_id IS NULL AS removed,
-                       {self._values}, {self._diffs}
+                       old.row_id IS NULL AS added, new.row_id IS NULL AS removed, {self._diffs}
                 FROM old FULL OUTER JOIN new USING (row_id)
-            ), classified AS MATERIALIZED (
+            ), classified AS (
                 SELECT *, CASE WHEN added THEN 'added' WHEN removed THEN 'removed'
                                WHEN {self._changed} THEN 'changed' ELSE 'unchanged' END AS kind
                 FROM paired
-            ), counts AS (
-                SELECT count(*) FILTER (WHERE kind = 'added'),
-                       count(*) FILTER (WHERE kind = 'removed'),
-                       count(*) FILTER (WHERE kind = 'changed'),
-                       count(*) FILTER (WHERE kind = 'unchanged'),
-                       (SELECT count(DISTINCT row_id) FROM previous WHERE copies > 1),
-                       (SELECT count(DISTINCT row_id) FROM candidate WHERE copies > 1),
-                       (SELECT count(*) FROM previous WHERE row_id IS NULL),
-                       (SELECT count(*) FROM candidate WHERE row_id IS NULL),
-                       {self._digest}
-                FROM classified
-            ), limited AS (
-                SELECT * FROM classified WHERE kind <> 'unchanged' ORDER BY row_id LIMIT ?
-            ), samples AS (
-                SELECT list(struct_pack(id := row_id, kind := kind,
-                             previous := CASE WHEN NOT added THEN {left} END,
-                             current := CASE WHEN NOT removed THEN {right} END) ORDER BY row_id)
-                FROM limited
             )
-            SELECT counts.*, samples.* FROM counts CROSS JOIN samples
-        """, [example_limit]).fetchone()
+            SELECT count(*) FILTER (WHERE kind = 'added'),
+                   count(*) FILTER (WHERE kind = 'removed'),
+                   count(*) FILTER (WHERE kind = 'changed'),
+                   count(*) FILTER (WHERE kind = 'unchanged'),
+                   (SELECT count(row_id) FROM old_issues),
+                   (SELECT count(row_id) FROM new_issues),
+                   coalesce((SELECT copies FROM old_issues WHERE row_id IS NULL), 0),
+                   coalesce((SELECT copies FROM new_issues WHERE row_id IS NULL), 0),
+                   {self._digest},
+                   min(row_id, greatest(?::BIGINT, 1)) FILTER (WHERE kind <> 'unchanged' AND ? > 0)
+            FROM classified
+        """, [example_limit, example_limit]).fetchone()
+
+    def _examples(self, db, identifiers: list[int]) -> tuple[RevisionExample, ...]:
+        if not identifiers:
+            return ()
+        snapshots = []
+        for source in self._sources:
+            rows = db.execute(f"""
+                SELECT row_id, to_json(struct_pack({self._snapshot}))
+                FROM (SELECT {self._projection} FROM {source}) AS values_by_id
+                WHERE row_id IN (SELECT unnest(?::BIGINT[]))
+            """, [identifiers]).fetchall()
+            snapshots.append({key: loads(values) for key, values in rows})
+        previous, current = snapshots
+        return tuple(RevisionExample(key, "added" if key not in previous else
+                                     "removed" if key not in current else "changed",
+                                     previous.get(key), current.get(key)) for key in identifiers)
 
 
 def _fingerprint(value):
