@@ -10,7 +10,7 @@
 <a class="skip" href="#main">本文へ移動</a>
 <header class="masthead"><a href="index.html" class="product">duckOrch</a>
 <a href="https://github.com/nkwork9999/duck-orch">GitHub ↗</a></header>
-<div class="layout"><nav aria-label="ドキュメント"><a href="index.html">概要</a><a href="functions.html">SQL リファレンス</a><a href="python.html">Python 組み込み API</a><a href="guide.html">利用ガイド</a><a href="architecture.html">設計・実行モデル</a><a href="mcp.html" aria-current="page">MCP サーバー</a></nav>
+<div class="layout"><nav aria-label="ドキュメント"><a href="index.html">概要</a><a href="functions.html">SQL リファレンス</a><a href="settings.html">設定</a><a href="python.html">Python 組み込み API</a><a href="guide.html">利用ガイド</a><a href="architecture.html">設計・実行モデル</a><a href="mcp.html" aria-current="page">MCP サーバー</a></nav>
 <main id="main"><details class="toc" open><summary>このページの目次</summary><ul><li class="h2"><a href="#what-it-exposes">What it exposes</a></li><li class="h3"><a href="#read-only">Read-only</a></li><li class="h3"><a href="#write-safety-defaulted">Write (safety-defaulted)</a></li><li class="h2"><a href="#build">Build</a></li><li class="h2"><a href="#configure-via-env">Configure via env</a></li><li class="h2"><a href="#wire-into-claude-code">Wire into Claude Code</a></li><li class="h2"><a href="#smoke-test-outside-claude">Smoke-test outside Claude</a></li></ul></details><h1 id="orch_mcp--duckorch-mcp-server">orch_mcp — duckOrch MCP server</h1>
 <p>A thin <a href="https://modelcontextprotocol.io">MCP (Model Context Protocol)</a> server
 that wraps the existing <code>duck-orch</code> CLI so Claude Code (or any MCP client) can
