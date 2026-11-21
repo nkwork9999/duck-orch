@@ -312,6 +312,10 @@ Use <code>publish(plan, request_key=...)</code> when a host request can be retri
 key together. A retry returns the original publication even after a later publication. Reusing its
 key with a different plan raises <code>ReleaseRequestConflict</code>.
 <code>RelationContract.inspect</code> compares candidate column names, types and declared nullability using the DuckDB catalog.
+<code>RevisionDifference(connection, previous, current, key=..., columns=...)</code> compares two registered
+relations with matching column types and a BIGINT key. Build both revisions from the same inputs.
+The result separates added, removed and changed rows, NULL keys and duplicate keys. Pass
+<code>example_limit</code> to retrieve bounded, ordered examples alongside the per-column counts.
 <code>JsonProjector(connection, fields)</code> projects registered paths and reports malformed documents, missing keys,
 JSON nulls and incompatible values per row. <code>VariantEventLog</code> stores events in typed columns and a VARIANT
 attribute object on DuckDB builds with VARIANT support. Register a frequent text key to project it at ingest.
@@ -564,7 +568,7 @@ Same pattern as <code>ducksmiles</code>.</p>
 <p>See <a href="architecture.html">DESIGN.md</a> for the full design.</p>
 <hr />
 <h2 id="status">Status</h2>
-<p>All ROADMAP phases (0–17) shipped. See <a href="https://github.com/nkwork9999/duck-orch/blob/fd1c38fa7a4a19e8095ce1348f78cde0261cb245/ROADMAP.md">ROADMAP.md</a> for the design
+<p>All ROADMAP phases (0–17) shipped. See <a href="https://github.com/nkwork9999/duck-orch/blob/2fdc68e6cb2a36a7ad18ee0b23e2e1f7d27f5ddd/ROADMAP.md">ROADMAP.md</a> for the design
 of Phase 11–17 (Asset-centric, sensor-driven evolution).</p>
 <table>
 <thead>
@@ -691,7 +695,7 @@ cargo build -p duckorch_cli --release
 When upgrading, bump both together.</p>
 <hr />
 <h2 id="license">License</h2>
-<p>MIT. See <a href="https://github.com/nkwork9999/duck-orch/blob/fd1c38fa7a4a19e8095ce1348f78cde0261cb245/LICENSE">LICENSE</a>.</p>
+<p>MIT. See <a href="https://github.com/nkwork9999/duck-orch/blob/2fdc68e6cb2a36a7ad18ee0b23e2e1f7d27f5ddd/LICENSE">LICENSE</a>.</p>
 <h2 id="credits">Credits</h2>
 <p>All code in duckOrch is original. Design ideas (only — no code copied)
 were drawn from:</p>
@@ -709,5 +713,5 @@ semantics</strong>.&quot; It is not trying to replace Airflow / Dagster / Snowfl
 enterprise scale; it is trying to deliver their best ideas in a single
 <code>LOAD duckorch;</code> you can run on a plane.</p>
 
-<footer>Source revision <a href="https://github.com/nkwork9999/duck-orch/tree/fd1c38fa7a4a19e8095ce1348f78cde0261cb245"><code>fd1c38fa7a4a</code></a> · DuckDB 2.0.0</footer>
+<footer>Source revision <a href="https://github.com/nkwork9999/duck-orch/tree/2fdc68e6cb2a36a7ad18ee0b23e2e1f7d27f5ddd"><code>2fdc68e6cb2a</code></a> · DuckDB 2.0.0</footer>
 </main></div></body></html>
